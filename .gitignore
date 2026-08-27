@@ -10,10 +10,18 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # Build output
 dist/
 build/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Vercel
+.vercel
 
 # OS / editor
 .DS_Store
