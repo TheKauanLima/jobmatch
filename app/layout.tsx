@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
+import { Nav } from "@/components/Nav";
+import { getSession } from "@/lib/auth/session";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -18,7 +20,18 @@ export const metadata: Metadata = {
   description: "Match your resume against job descriptions with AI-powered analysis.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  // Best-effort session read for the nav's logged-in state. Falls back to
+  // "logged out" rendering rather than crashing the whole app if Supabase
+  // isn't reachable/configured (e.g. no env vars set locally yet).
+  let userEmail: string | null = null;
+  try {
+    const session = await getSession();
+    userEmail = session?.user.email ?? null;
+  } catch {
+    userEmail = null;
+  }
+
   return (
     <html
       lang="en"
@@ -30,12 +43,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             <Link href="/" className="text-lg font-semibold tracking-tight text-zinc-900">
               JobMatch
             </Link>
-            {/* Nav links (Dashboard, Resumes, Jobs, sign in/out) land with the auth milestone. */}
-            <div className="flex items-center gap-6 text-sm font-medium text-zinc-600">
-              <span className="cursor-default text-zinc-400">Dashboard</span>
-              <span className="cursor-default text-zinc-400">Resumes</span>
-              <span className="cursor-default text-zinc-400">Jobs</span>
-            </div>
+            <Nav userEmail={userEmail} />
           </nav>
         </header>
         <main className="flex flex-1 flex-col">{children}</main>
