@@ -32,7 +32,9 @@ export function Nav({ userEmail }: NavProps) {
           <Link href="/dashboard" className="hover:text-zinc-900">
             Dashboard
           </Link>
-          <span className="cursor-default text-zinc-400">Resumes</span>
+          <Link href="/resumes" className="hover:text-zinc-900">
+            Resumes
+          </Link>
           <span className="cursor-default text-zinc-400">Jobs</span>
           <button
             type="button"

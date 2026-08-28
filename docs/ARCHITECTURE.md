@@ -211,8 +211,9 @@ are validated against shared `zod` schemas in `lib/validation/schemas.ts`.
 
 **`GET /api/resumes/:id`** — resume detail, owner only.
 - Auth: required.
-- Response `200`: full resume row including `extracted_text`. `404` if not found or
-  not owned by caller.
+- Response `200`: the resume row including `extracted_text`, minus internal-only
+  fields with no client use (`storage_path`, `user_id` — see `types/domain.ts`'s
+  `ResumeDetail`). `404` if not found or not owned by caller.
 
 **`DELETE /api/resumes/:id`** — delete a resume (and its storage object, analyses,
 matches via cascade).
@@ -348,6 +349,8 @@ description.
     schemas.ts                     -- zod schemas for every API request body, imported by both route handlers (server-side parsing) and frontend forms (client-side validation) — single source of truth for shape
   /auth/
     session.ts                     -- getSession()/requireSession() helpers used by route handlers to get the current user or throw a 401
+  /api/
+    serverFetch.ts                 -- authenticated server-side fetch helper for Server Components calling our own /api/** routes; forwards the incoming request's cookies
 
 /types
   database.ts                      -- generated via `supabase gen types typescript`, regenerated whenever the schema changes
