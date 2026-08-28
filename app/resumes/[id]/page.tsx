@@ -3,7 +3,9 @@ import Link from "next/link";
 import { getSession } from "@/lib/auth/session";
 import { serverFetch } from "@/lib/api/serverFetch";
 import { DeleteResumeButton } from "@/components/resumes/DeleteResumeButton";
-import type { ResumeDetail, ResumeStatus } from "@/types/domain";
+import { AnalyzeResumeButton } from "@/components/resumes/AnalyzeResumeButton";
+import { AnalysisPanel } from "@/components/resumes/AnalysisPanel";
+import type { ResumeAnalysis, ResumeDetail, ResumeStatus } from "@/types/domain";
 
 const STATUS_LABELS: Record<ResumeStatus, string> = {
   uploaded: "Uploaded",
@@ -40,6 +42,48 @@ async function getResume(id: string): Promise<GetResumeResult> {
   }
 }
 
+type GetAnalysisResult =
+  | { kind: "ok"; analysis: ResumeAnalysis }
+  | { kind: "none" }
+  | { kind: "error" };
+
+/**
+ * Fetches the latest analysis via `GET /api/resumes/:id/analysis`. A `404`
+ * means no analysis has been run yet — treated as the empty state, not an
+ * error (see docs/ARCHITECTURE.md §2).
+ *
+ * The route contract doesn't show an example response body for this
+ * endpoint (unlike `GET /api/resumes/:id`'s documented `{ "resume": ... }`
+ * wrapper), so this accepts either `{ "analysis": {...} }` or the row
+ * returned directly at the top level — confirm the actual shape with
+ * backend-dev once `/api/resumes/:id/analysis` exists.
+ */
+async function getAnalysis(id: string): Promise<GetAnalysisResult> {
+  try {
+    const response = await serverFetch(`/api/resumes/${id}/analysis`);
+
+    if (response.status === 404) {
+      return { kind: "none" };
+    }
+
+    if (!response.ok) {
+      return { kind: "error" };
+    }
+
+    const body = await response.json();
+    const analysis: ResumeAnalysis | undefined =
+      body?.analysis ?? (body?.id ? body : undefined);
+
+    if (!analysis) {
+      return { kind: "error" };
+    }
+
+    return { kind: "ok", analysis };
+  } catch {
+    return { kind: "error" };
+  }
+}
+
 interface ResumeDetailPageProps {
   params: Promise<{ id: string }>;
 }
@@ -53,7 +97,10 @@ export default async function ResumeDetailPage({
   }
 
   const { id } = await params;
-  const result = await getResume(id);
+  const [result, analysisResult] = await Promise.all([
+    getResume(id),
+    getAnalysis(id),
+  ]);
 
   if (result.kind === "not_found") {
     notFound();
@@ -76,6 +123,8 @@ export default async function ResumeDetailPage({
   }
 
   const { resume } = result;
+  const analysis = analysisResult.kind === "ok" ? analysisResult.analysis : null;
+  const analysisLoadFailed = analysisResult.kind === "error";
 
   return (
     <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
@@ -131,14 +180,21 @@ export default async function ResumeDetailPage({
       <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-6">
         <div className="flex items-center justify-between gap-4">
           <h2 className="text-base font-semibold text-zinc-900">Analysis</h2>
-          <span className="shrink-0 cursor-default rounded-md bg-zinc-100 px-3 py-1.5 text-sm font-medium text-zinc-400">
-            Analyze resume (coming soon)
-          </span>
+          <AnalyzeResumeButton resumeId={resume.id} hasAnalysis={!!analysis} />
         </div>
-        <p className="mt-2 text-sm text-zinc-600">
-          No analysis yet. Run an AI analysis to see strengths, weaknesses,
-          and suggested roles for this resume.
-        </p>
+        <div className="mt-4">
+          {analysisLoadFailed ? (
+            <p
+              role="alert"
+              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            >
+              Couldn&apos;t load this resume&apos;s analysis. Please refresh
+              the page.
+            </p>
+          ) : (
+            <AnalysisPanel analysis={analysis} />
+          )}
+        </div>
       </section>
 
       <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-6">

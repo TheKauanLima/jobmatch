@@ -122,6 +122,47 @@ export async function createResume(
 }
 
 /**
+ * Updates a resume row's mutable fields, scoped to its owner. Used by
+ * `POST /api/resumes/:id/analyze` to flip `status` between
+ * `'processing'` / `'analyzed'` / `'failed'` and to persist text extracted
+ * from the stored file on first analysis (see
+ * docs/ARCHITECTURE.md §2). Only the fields present in `patch` are sent to
+ * Postgres, so e.g. passing `{ status: 'processing' }` never clobbers
+ * `extracted_text`.
+ */
+export async function updateResume(
+  supabase: Client,
+  userId: string,
+  id: string,
+  patch: { status?: ResumeStatus; extractedText?: string | null },
+): Promise<ResumeRow> {
+  const update: Database["public"]["Tables"]["resumes"]["Update"] = {};
+  if (patch.status !== undefined) {
+    update.status = patch.status;
+  }
+  if (patch.extractedText !== undefined) {
+    update.extracted_text = patch.extractedText;
+  }
+
+  const { data, error } = await supabase
+    .from("resumes")
+    .update(update)
+    .eq("id", id)
+    .eq("user_id", userId)
+    .select("*")
+    .single();
+
+  if (error || !data) {
+    throw new ResumeQueryError(
+      `Failed to update resume ${id}: ${error?.message ?? "no row returned"}`,
+      error,
+    );
+  }
+
+  return data;
+}
+
+/**
  * Deletes a resume row, scoped to its owner. Does **not** touch the
  * Storage object — callers must delete that separately via
  * `lib/storage/resumeFiles.ts#deleteResumeFile` (see

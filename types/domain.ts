@@ -57,3 +57,51 @@ export function toResumeDetail(row: ResumeRow): ResumeDetail {
     extracted_text: row.extracted_text,
   };
 }
+
+// ---------------------------------------------------------------------
+// Resume analyses — POST /api/resumes/:id/analyze, GET /api/resumes/:id/analysis
+// ---------------------------------------------------------------------
+
+export type ResumeAnalysisRow =
+  Database["public"]["Tables"]["resume_analyses"]["Row"];
+
+/** A single strength or weakness point extracted from a resume analysis. */
+export type AnalysisPoint = { label: string; detail: string };
+
+/**
+ * Public shape of a resume analysis as returned by `POST
+ * /api/resumes/:id/analyze` and `GET /api/resumes/:id/analysis` (see
+ * docs/ARCHITECTURE.md §2). Mirrors `resume_analyses`' jsonb columns decoded
+ * into typed arrays; omits `user_id` (redundant — caller is always the
+ * owner).
+ */
+export type ResumeAnalysis = {
+  id: string;
+  resume_id: string;
+  strengths: AnalysisPoint[];
+  weaknesses: AnalysisPoint[];
+  summary: string | null;
+  suggested_roles: string[];
+  model: string;
+  created_at: string;
+};
+
+/**
+ * Shapes a full `resume_analyses` DB row into the public response
+ * representation. `strengths`/`weaknesses`/`suggested_roles` are stored as
+ * `jsonb` — rows only get inserted via
+ * `lib/supabase/queries/analyses.ts#createAnalysis` from a
+ * `lib/claude/parse.ts`-validated result, so the cast here is safe.
+ */
+export function toResumeAnalysis(row: ResumeAnalysisRow): ResumeAnalysis {
+  return {
+    id: row.id,
+    resume_id: row.resume_id,
+    strengths: (row.strengths as AnalysisPoint[] | null) ?? [],
+    weaknesses: (row.weaknesses as AnalysisPoint[] | null) ?? [],
+    summary: row.summary,
+    suggested_roles: (row.suggested_roles as string[] | null) ?? [],
+    model: row.model,
+    created_at: row.created_at,
+  };
+}
