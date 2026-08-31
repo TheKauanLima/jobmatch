@@ -145,3 +145,22 @@ export const jobDescriptionCreateSchema = z.object({
 export type JobDescriptionCreateInput = z.infer<
   typeof jobDescriptionCreateSchema
 >;
+
+// ---------------------------------------------------------------------
+// Matches — POST /api/matches
+// ---------------------------------------------------------------------
+
+/**
+ * Request body for `POST /api/matches`, per docs/ARCHITECTURE.md §2:
+ * `{ resume_id, job_description_id }`. Both are validated as well-formed
+ * uuids up front so a malformed id gets a clean `400` here rather than
+ * surfacing as a raw Postgres "invalid input syntax for type uuid" error
+ * further down the request-handling chain — the actual ownership/existence
+ * checks (404s) happen in the route handler against the query layer.
+ */
+export const matchCreateSchema = z.object({
+  resume_id: z.string().uuid("resume_id must be a valid id."),
+  job_description_id: z.string().uuid("job_description_id must be a valid id."),
+});
+
+export type MatchCreateInput = z.infer<typeof matchCreateSchema>;

@@ -145,3 +145,55 @@ export function toJobDescription(row: JobDescriptionRow): JobDescription {
     updated_at: row.updated_at,
   };
 }
+
+// ---------------------------------------------------------------------
+// Matches — POST /api/matches, GET /api/matches, GET /api/matches/:id
+// ---------------------------------------------------------------------
+
+export type MatchRow = Database["public"]["Tables"]["matches"]["Row"];
+
+/** The joined `job_descriptions` summary inlined on every match response, per docs/ARCHITECTURE.md §2. */
+export type MatchJobDescriptionSummary = {
+  id: string;
+  title: string;
+  company: string | null;
+};
+
+/**
+ * Public shape of a match as returned by `POST /api/matches`,
+ * `GET /api/matches`, and `GET /api/matches/:id` (see docs/ARCHITECTURE.md
+ * §2 — all three use the exact same shape, per the documented example
+ * response body). Omits `resume_id` (redundant — callers always know which
+ * resume they queried/matched), `user_id` (redundant — caller is always the
+ * owner), and `model` (an internal audit detail with no client use, unlike
+ * `ResumeAnalysis`; kept out here strictly to match §2's documented example
+ * response for matches, which does not include it).
+ */
+export type Match = {
+  id: string;
+  score: number;
+  rationale: string;
+  matched_strengths: string[];
+  gaps: string[];
+  created_at: string;
+  job_description: MatchJobDescriptionSummary;
+};
+
+/**
+ * Shapes a full `matches` DB row plus its joined job description summary
+ * into the public response representation. `matched_strengths`/`gaps` are
+ * stored as `jsonb` — rows only get inserted via
+ * `lib/supabase/queries/matches.ts#createMatch` from a
+ * `lib/claude/parse.ts`-validated result, so the cast here is safe.
+ */
+export function toMatch(row: MatchRow, jobDescription: MatchJobDescriptionSummary): Match {
+  return {
+    id: row.id,
+    score: row.score,
+    rationale: row.rationale,
+    matched_strengths: (row.matched_strengths as string[] | null) ?? [],
+    gaps: (row.gaps as string[] | null) ?? [],
+    created_at: row.created_at,
+    job_description: jobDescription,
+  };
+}

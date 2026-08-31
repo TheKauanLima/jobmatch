@@ -5,6 +5,7 @@ import {
   decodeJobDescriptionCursor,
   encodeJobDescriptionCursor,
   getJobDescriptionById,
+  getJobDescriptionsByIds,
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JobDescriptionQueryError,
   listJobDescriptions,
@@ -29,6 +30,7 @@ function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
   builder.select = record("select");
   builder.insert = record("insert");
   builder.eq = record("eq");
+  builder.in = record("in");
   builder.order = record("order");
   builder.limit = record("limit");
   builder.lt = record("lt");
@@ -248,6 +250,48 @@ describe("getJobDescriptionById", () => {
     const client = makeClient(builder);
 
     await expect(getJobDescriptionById(client, "jd-1")).rejects.toThrow(
+      JobDescriptionQueryError,
+    );
+  });
+});
+
+describe("getJobDescriptionsByIds", () => {
+  it("filters with .in() and no user_id (shared data), used by matches.ts for join shaping", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [makeRow()], error: null });
+    const client = makeClient(builder);
+
+    await getJobDescriptionsByIds(client, [TEST_UUID]);
+
+    expect(calls).toContainEqual({ method: "in", args: ["id", [TEST_UUID]] });
+    expect(calls.some((c) => c.method === "eq")).toBe(false);
+  });
+
+  it("returns [] immediately without querying when ids is empty", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    const result = await getJobDescriptionsByIds(client, []);
+
+    expect(result).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it("returns [] when data is null", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await getJobDescriptionsByIds(client, [TEST_UUID]);
+    expect(result).toEqual([]);
+  });
+
+  it("throws JobDescriptionQueryError on a Postgres error", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { message: "boom" },
+    });
+    const client = makeClient(builder);
+
+    await expect(getJobDescriptionsByIds(client, [TEST_UUID])).rejects.toThrow(
       JobDescriptionQueryError,
     );
   });

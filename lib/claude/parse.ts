@@ -16,6 +16,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 
 import { ANALYZE_RESUME_TOOL_NAME } from "@/lib/claude/prompts/analyzeResume";
+import { MATCH_RESUME_TO_JOB_TOOL_NAME } from "@/lib/claude/prompts/matchResumeToJob";
 
 /**
  * Thrown when Claude's response either doesn't contain the expected
@@ -92,6 +93,45 @@ export function parseResumeAnalysisResponse(
   if (!result.success) {
     throw new ClaudeResponseValidationError(
       `Claude's resume analysis response failed schema validation: ${result.error.message}`,
+      result.error,
+    );
+  }
+
+  return result.data;
+}
+
+/**
+ * Expected shape of the `record_match_assessment` tool's input, mirroring
+ * the `matches` table columns (`score`, `rationale`, `matched_strengths`,
+ * `gaps`) in docs/ARCHITECTURE.md §1. `score` is strictly validated as an
+ * integer clamped to 0-100 (matching the `matches.score` Postgres check
+ * constraint) — a response with an out-of-range or non-integer score is
+ * rejected, not silently clamped, since silently "fixing" an
+ * out-of-schema value is itself a way an injection attempt could sneak a
+ * plausible-looking but untrusted value past validation.
+ */
+export const matchResultSchema = z.object({
+  score: z.number().int().min(0).max(100),
+  rationale: z.string().min(1),
+  matched_strengths: z.array(z.string().min(1)),
+  gaps: z.array(z.string().min(1)),
+});
+
+export type MatchResult = z.infer<typeof matchResultSchema>;
+
+/**
+ * Extracts and validates the `record_match_assessment` tool call from a
+ * Claude response. Throws `ClaudeResponseValidationError` if the tool call
+ * is missing or its input doesn't match `matchResultSchema` — callers must
+ * not persist or trust the response otherwise.
+ */
+export function parseMatchResponse(message: Anthropic.Message): MatchResult {
+  const input = extractToolUseInput(message, MATCH_RESUME_TO_JOB_TOOL_NAME);
+
+  const result = matchResultSchema.safeParse(input);
+  if (!result.success) {
+    throw new ClaudeResponseValidationError(
+      `Claude's match assessment response failed schema validation: ${result.error.message}`,
       result.error,
     );
   }

@@ -169,6 +169,37 @@ export async function getJobDescriptionById(
 }
 
 /**
+ * Batch-fetches job descriptions by id, used by
+ * `lib/supabase/queries/matches.ts` to join `title`/`company` summaries
+ * onto a list of `matches` rows without an N+1 query per match. No
+ * ownership scoping (shared data, same as `getJobDescriptionById`). Returns
+ * `[]` immediately for an empty `ids` array rather than issuing a query with
+ * an empty `.in()` filter.
+ */
+export async function getJobDescriptionsByIds(
+  supabase: Client,
+  ids: string[],
+): Promise<JobDescriptionRow[]> {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .select("*")
+    .in("id", ids);
+
+  if (error) {
+    throw new JobDescriptionQueryError(
+      `Failed to fetch job descriptions by id: ${error.message}`,
+      error,
+    );
+  }
+
+  return data ?? [];
+}
+
+/**
  * Inserts a new `job_descriptions` row. `submittedBy` is always the caller
  * (`auth.uid()`), matching the `job_descriptions_insert_own` RLS policy —
  * never trust a client-supplied owner.

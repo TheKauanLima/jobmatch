@@ -113,6 +113,25 @@ describe("checkRateLimit", () => {
     expect(match.from).toHaveBeenCalledWith("matches");
   });
 
+  it("allows the 20th match call (count 19, one under the limit) — kind-specific boundary check", async () => {
+    const { client } = makeCountClient({ count: 19, error: null });
+
+    const result = await checkRateLimit(client, "user-1", { kind: "match", limit: 20 }, NOW);
+
+    expect(result).toEqual({ allowed: true, count: 19, limit: 20 });
+  });
+
+  it("blocks the 21st match call (count 20, exactly at the limit) — kind-specific boundary check", async () => {
+    const { client } = makeCountClient({ count: 20, error: null });
+
+    const result = await checkRateLimit(client, "user-1", { kind: "match", limit: 20 }, NOW);
+
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.count).toBe(20);
+    }
+  });
+
   it("respects a caller-supplied limit different from the default", async () => {
     const { client } = makeCountClient({ count: 3, error: null });
 

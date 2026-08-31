@@ -22,7 +22,12 @@
  *      by fake instructions, attempting to trick the model into thinking
  *      the data block ended early). Without this, delimiters alone are
  *      only a labeling convention the model could be tricked into
- *      misreading.
+ *      misreading. The actual escaping logic lives in the shared
+ *      `lib/claude/promptEscaping.ts#escapeDelimitedText()` (factored out in
+ *      M5 so `matchResumeToJob.ts` can reuse the identical, audited
+ *      implementation for its own delimiter tags rather than duplicating
+ *      it) — this function is a thin wrapper fixing the tag word to
+ *      "resume_text".
  *   3. Structured output via forced tool use: Claude is required
  *      (`tool_choice: { type: "tool", name: ... }`) to respond by calling
  *      the `record_resume_analysis` tool with a fixed JSON schema, rather
@@ -43,6 +48,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 
 import { CLAUDE_MODEL, createMessage } from "@/lib/claude/client";
+import { escapeDelimitedText } from "@/lib/claude/promptEscaping";
 
 export const ANALYZE_RESUME_TOOL_NAME = "record_resume_analysis";
 
@@ -50,66 +56,16 @@ const RESUME_TEXT_OPEN_TAG = "<resume_text>";
 const RESUME_TEXT_CLOSE_TAG = "</resume_text>";
 
 /**
- * Code points of zero-width/invisible Unicode characters an adversary could
- * splice into the literal word "resume_text" to defeat a naive
- * whitespace-only tolerant regex — `\s` does not match any of these in
- * JavaScript. Built from numeric code points (via `String.fromCharCode`)
- * rather than embedding the literal invisible characters in this file's
- * source, so the exact set is unambiguous to read/audit and can't be
- * silently mangled by an editor/encoding round-trip:
- *   - U+200B zero-width space
- *   - U+200C zero-width non-joiner
- *   - U+200D zero-width joiner
- *   - U+2060 word joiner
- *   - U+FEFF zero-width no-break space / BOM
- *   - U+00AD soft hyphen
- * Stripped from the resume text entirely before tag-matching, since none of
- * these carry legitimate meaning in resume content.
- */
-const INVISIBLE_CHAR_CODE_POINTS = [0x200b, 0x200c, 0x200d, 0x2060, 0xfeff, 0x00ad];
-const INVISIBLE_CHARS = new RegExp(
-  `[${INVISIBLE_CHAR_CODE_POINTS.map((code) => String.fromCharCode(code)).join("")}]`,
-  "g",
-);
-
-/**
- * Builds a regex fragment matching the literal word "resume_text" that
- * tolerates arbitrary whitespace *between every character* (not just
- * around the whole tag) — e.g. `res\nume_text` or `resume_te xt` must still
- * match. Without this, splitting the word itself (rather than just padding
- * around the tag) bypasses escaping entirely, since an attacker fully
- * controls the exact bytes of a resume.
- */
-const RESUME_TEXT_WORD_PATTERN = "resume_text"
-  .split("")
-  .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-  .join("\\s*");
-
-const RESUME_TEXT_TAG_PATTERN = new RegExp(
-  `<\\s*(\\/)?\\s*${RESUME_TEXT_WORD_PATTERN}\\s*>`,
-  "gi",
-);
-
-/**
  * Neutralizes any literal occurrence of the `<resume_text>` /
  * `</resume_text>` delimiter tags inside user-supplied content, so a resume
  * cannot forge a premature close tag (or a fake open tag) to break out of
- * the data block. Matching is case-insensitive and tolerant of whitespace
- * both around the tag (e.g. `</ resume_text >`) AND *within* the literal
- * word itself (e.g. `</resume_\ntext>`, `</resume_te xt>`), plus zero-width/
- * invisible Unicode characters spliced into the word (e.g. a zero-width
- * space between letters), since an attacker controls the exact bytes.
- * Replaces matches with full-width look-alike characters so the text
- * remains readable in the analysis if quoted back, but is no longer
- * parseable as our delimiter.
+ * the data block. See `lib/claude/promptEscaping.ts#escapeDelimitedText` for
+ * the full behavior (case-insensitivity, internal-whitespace tolerance,
+ * invisible-character stripping) — this is a thin wrapper fixing the tag
+ * word to "resume_text".
  */
 export function escapeResumeText(raw: string): string {
-  const withoutInvisibles = raw.replace(INVISIBLE_CHARS, "");
-  return withoutInvisibles.replace(
-    RESUME_TEXT_TAG_PATTERN,
-    (_match, closing: string | undefined) =>
-      closing ? "＜/resume_text＞" : "＜resume_text＞",
-  );
+  return escapeDelimitedText(raw, "resume_text");
 }
 
 const SYSTEM_PROMPT = `You are a resume analysis assistant inside JobMatch, a job-search tool. Your only job in this call is to read the resume text a user submitted and produce an honest, professional strengths/weaknesses analysis by calling the "${ANALYZE_RESUME_TOOL_NAME}" tool exactly once.

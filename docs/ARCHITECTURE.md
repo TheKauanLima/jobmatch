@@ -342,7 +342,7 @@ description.
     queries/
       resumes.ts                   -- getResumeById, listResumesForUser, createResume, deleteResume (all rely on the RLS-scoped server client, not admin)
       analyses.ts                  -- getLatestAnalysis, createAnalysis
-      jobDescriptions.ts           -- listJobDescriptions, getJobDescriptionById, createJobDescription
+      jobDescriptions.ts           -- listJobDescriptions, getJobDescriptionById, getJobDescriptionsByIds, createJobDescription
       matches.ts                   -- listMatchesForResume, getMatchById, createMatch
   /claude/
     client.ts                      -- Anthropic SDK client instantiation (reads ANTHROPIC_API_KEY)
@@ -350,6 +350,7 @@ description.
       analyzeResume.ts             -- prompt template + expected-output schema for strengths/weaknesses extraction
       matchResumeToJob.ts          -- prompt template + expected-output schema for match scoring
     parse.ts                       -- shared zod-based validation of Claude's JSON output; throws a typed error the route handlers turn into 502s
+    promptEscaping.ts              -- shared delimiter-tag escaping (escapeDelimitedText/escapeBothDelimiterTags) used by every prompt builder to neutralize forged closing tags (including whitespace/zero-width-character splitting tricks) in untrusted user-supplied text before it's interpolated into a prompt
   /storage/
     resumeFiles.ts                 -- upload/download/delete against the `resumes` Storage bucket; owns the `{user_id}/{id}.{ext}` path convention; text extraction (PDF/DOCX → plain text) also lives here
   /validation/
