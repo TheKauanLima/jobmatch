@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH,
+  JOB_DESCRIPTION_TITLE_MAX_LENGTH,
+  jobDescriptionCreateSchema,
   RESUME_MAX_FILE_SIZE_BYTES,
   resumeUploadFileSchema,
 } from "@/lib/validation/schemas";
@@ -92,6 +95,208 @@ describe("resumeUploadFileSchema", () => {
   it("rejects an empty-string MIME type (some browsers/clients omit it)", () => {
     const file = makeFile("hello", "resume", "");
     const result = resumeUploadFileSchema.safeParse(file);
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("jobDescriptionCreateSchema", () => {
+  it("accepts a minimal valid payload (title + description only)", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts a full payload including optional company and source_url", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      company: "Acme",
+      description: "Build things.",
+      source_url: "https://example.com/jobs/1",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a missing title", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      description: "Build things.",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an empty-string title", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "",
+      description: "Build things.",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a whitespace-only title (trimmed before the min-length check)", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "   ",
+      description: "Build things.",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a missing description", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an empty-string description", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a malformed source_url", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      source_url: "not-a-url",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an empty-string company when explicitly provided", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      company: "",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("allows company and source_url to be omitted entirely", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.company).toBeUndefined();
+      expect(result.data.source_url).toBeUndefined();
+    }
+  });
+
+  it("rejects a whitespace-only description (trimmed before the min-length check)", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "   \n\t  ",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // Fixed: title/description are now capped (see
+  // JOB_DESCRIPTION_TITLE_MAX_LENGTH / JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH
+  // in lib/validation/schemas.ts) since this text is fed whole into the
+  // Claude matching prompt for every user who matches against it — a
+  // cost/DoS and prompt-injection-surface concern, not just a storage one.
+  it("rejects a title over the max length", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "A".repeat(JOB_DESCRIPTION_TITLE_MAX_LENGTH + 1),
+      description: "Build things.",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/at most/i);
+    }
+  });
+
+  it("accepts a title exactly at the max length", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "A".repeat(JOB_DESCRIPTION_TITLE_MAX_LENGTH),
+      description: "Build things.",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a description over the max length", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "B".repeat(JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH + 1),
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/at most/i);
+    }
+  });
+
+  it("accepts a description exactly at the max length", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "B".repeat(JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH),
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a hugely oversized title and description together (formerly accepted unbounded)", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "A".repeat(100_000),
+      description: "B".repeat(500_000),
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // Fixed: source_url is now restricted to http(s) schemes since it's
+  // shared/public data expected to eventually render as a raw `<a href>` on
+  // the frontend — a `javascript:` (or other non-http(s)) scheme is a
+  // stored-XSS vector otherwise.
+  it("rejects non-http(s) URL schemes for source_url (e.g. javascript:)", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      source_url: "javascript:alert(1)",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/http/i);
+    }
+  });
+
+  it("rejects other non-http(s) schemes too (e.g. ftp, data, mailto)", () => {
+    for (const url of [
+      "ftp://example.com/job.pdf",
+      "data:text/html,<script>alert(1)</script>",
+      "mailto:jobs@example.com",
+    ]) {
+      const result = jobDescriptionCreateSchema.safeParse({
+        title: "Software Engineer",
+        description: "Build things.",
+        source_url: url,
+      });
+      expect(result.success).toBe(false);
+    }
+  });
+
+  it("still accepts http and https source_url values", () => {
+    for (const url of [
+      "https://example.com/jobs/1",
+      "http://example.com/jobs/1",
+    ]) {
+      const result = jobDescriptionCreateSchema.safeParse({
+        title: "Software Engineer",
+        description: "Build things.",
+        source_url: url,
+      });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it("rejects a source_url over the max length", () => {
+    const hugePath = "a".repeat(2100);
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      source_url: `https://example.com/${hugePath}`,
+    });
     expect(result.success).toBe(false);
   });
 });

@@ -53,3 +53,95 @@ export const resumeUploadFileSchema = z
     message:
       "Unsupported file type. Accepted types: PDF, DOCX, or plain text.",
   });
+
+// ---------------------------------------------------------------------
+// Job descriptions — POST /api/job-descriptions
+// ---------------------------------------------------------------------
+
+/**
+ * Max lengths for job description text fields. `title`/`description` are
+ * fed whole into the Claude matching prompt for every user who matches
+ * against them (see docs/ARCHITECTURE.md §2, `/api/matches`, M5) — an
+ * unbounded length is both a Claude cost/abuse concern (an attacker could
+ * submit a multi-hundred-KB "job description" and force every future match
+ * call against it to pay for those tokens) and a prompt-injection surface
+ * that's cheaper to pad out with unbounded input. Caps chosen generously
+ * for legitimate use, not tightly:
+ * - `title`: 200 chars — comfortably covers even long real-world job titles
+ *   ("Senior Staff Software Engineer, Platform Infrastructure (Remote,
+ *   US)").
+ * - `description`: 20,000 chars (~3,000-4,000 words) — comfortably covers
+ *   even long real-world postings (base pay, benefits, multiple sections)
+ *   while bounding per-match Claude token cost to a known ceiling.
+ * - `company`: 200 chars — same order as `title`, no real company name
+ *   approaches this.
+ * - `source_url`: 2048 chars — the de facto max URL length supported by
+ *   most browsers/servers.
+ */
+export const JOB_DESCRIPTION_TITLE_MAX_LENGTH = 200;
+export const JOB_DESCRIPTION_COMPANY_MAX_LENGTH = 200;
+export const JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH = 20_000;
+export const JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH = 2048;
+
+/** URL schemes accepted for `source_url`. */
+const JOB_DESCRIPTION_ALLOWED_URL_SCHEMES = new Set(["http:", "https:"]);
+
+function isHttpOrHttpsUrl(value: string): boolean {
+  try {
+    return JOB_DESCRIPTION_ALLOWED_URL_SCHEMES.has(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Request body for submitting a job description, per
+ * docs/ARCHITECTURE.md §2: `title` and `description` are required and must
+ * be non-empty (not just present); `company` and `source_url` are optional.
+ * `source_url` is validated as a well-formed URL restricted to `http`/
+ * `https` schemes — this data is shared/public and `source_url` is expected
+ * to eventually render as a plain `<a href>` on the frontend, so a
+ * `javascript:`-or-similar scheme is rejected here rather than trusted to
+ * the renderer to sanitize later.
+ */
+export const jobDescriptionCreateSchema = z.object({
+  title: z
+    .string()
+    .trim()
+    .min(1, "title must not be empty.")
+    .max(
+      JOB_DESCRIPTION_TITLE_MAX_LENGTH,
+      `title must be at most ${JOB_DESCRIPTION_TITLE_MAX_LENGTH} characters.`,
+    ),
+  company: z
+    .string()
+    .trim()
+    .min(1, "company must not be empty when provided.")
+    .max(
+      JOB_DESCRIPTION_COMPANY_MAX_LENGTH,
+      `company must be at most ${JOB_DESCRIPTION_COMPANY_MAX_LENGTH} characters.`,
+    )
+    .optional(),
+  description: z
+    .string()
+    .trim()
+    .min(1, "description must not be empty.")
+    .max(
+      JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH,
+      `description must be at most ${JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH} characters.`,
+    ),
+  source_url: z
+    .string()
+    .trim()
+    .max(
+      JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH,
+      `source_url must be at most ${JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH} characters.`,
+    )
+    .url("source_url must be a valid URL.")
+    .refine(isHttpOrHttpsUrl, "source_url must use the http or https scheme.")
+    .optional(),
+});
+
+export type JobDescriptionCreateInput = z.infer<
+  typeof jobDescriptionCreateSchema
+>;

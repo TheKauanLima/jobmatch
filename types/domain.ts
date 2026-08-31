@@ -105,3 +105,43 @@ export function toResumeAnalysis(row: ResumeAnalysisRow): ResumeAnalysis {
     created_at: row.created_at,
   };
 }
+
+// ---------------------------------------------------------------------
+// Job descriptions — POST /api/job-descriptions, GET /api/job-descriptions,
+// GET /api/job-descriptions/:id
+// ---------------------------------------------------------------------
+
+export type JobDescriptionRow =
+  Database["public"]["Tables"]["job_descriptions"]["Row"];
+
+/**
+ * Public shape of a job description as returned by all three
+ * `/api/job-descriptions` endpoints (per docs/ARCHITECTURE.md §2 — the
+ * create/list/detail responses all use the same full-row shape, unlike
+ * resumes which split list vs. detail). Omits nothing internal: unlike
+ * `resumes`, there is no `storage_path`-style internal field, and
+ * `submitted_by` has no client use (the submitter isn't otherwise exposed
+ * in the UI per the folder structure in §3) so it's dropped too.
+ */
+export type JobDescription = {
+  id: string;
+  title: string;
+  company: string | null;
+  description: string;
+  source_url: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Shapes a full DB row into the public response representation. */
+export function toJobDescription(row: JobDescriptionRow): JobDescription {
+  return {
+    id: row.id,
+    title: row.title,
+    company: row.company,
+    description: row.description,
+    source_url: row.source_url,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}

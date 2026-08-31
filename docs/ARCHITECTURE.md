@@ -247,9 +247,16 @@ matches via cascade).
 
 **`GET /api/job-descriptions`** — list shared job descriptions.
 - Auth: required.
-- Query params: `?limit=20&cursor=<created_at ISO or id>` (cursor pagination on
-  `created_at desc`).
-- Response `200`: `{ "job_descriptions": [...], "next_cursor": string | null }`.
+- Query params: `?limit=20&cursor=<opaque token>` — keyset pagination ordered
+  `created_at desc, id desc`. `cursor` is an opaque compound token (currently
+  `<created_at>_<id>`, encoded/decoded by `encodeJobDescriptionCursor`/
+  `decodeJobDescriptionCursor` in `lib/supabase/queries/jobDescriptions.ts`) —
+  a single `created_at` value alone isn't sufficient to paginate correctly
+  when rows share a timestamp, so treat this as opaque rather than
+  constructing it manually. A malformed cursor is treated as "no cursor"
+  (first page) rather than erroring.
+- Response `200`: `{ "job_descriptions": [...], "next_cursor": string | null }`
+  — pass `next_cursor` back verbatim as the next request's `cursor`.
 
 **`GET /api/job-descriptions/:id`** — single job description detail.
 - Auth: required.
