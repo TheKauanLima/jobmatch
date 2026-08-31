@@ -40,10 +40,10 @@ export default async function ResumesPage() {
 
   return (
     <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-      <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+      <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Your resumes
       </h1>
-      <p className="mt-2 text-sm text-zinc-600">
+      <p className="mt-2 text-sm text-fg-muted">
         Upload a resume to get an AI-powered strengths/weaknesses breakdown
         and match it against job descriptions.
       </p>
@@ -56,7 +56,7 @@ export default async function ResumesPage() {
         {error ? (
           <p
             role="alert"
-            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
           >
             {error}
           </p>

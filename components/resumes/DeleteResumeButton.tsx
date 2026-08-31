@@ -67,11 +67,11 @@ export function DeleteResumeButton({
         type="button"
         onClick={handleDelete}
         disabled={deleting}
-        className="shrink-0 rounded-md border border-red-200 px-3 py-1.5 text-sm font-medium text-red-700 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+        className="shrink-0 rounded-md border border-danger-border px-3 py-1.5 text-sm font-medium text-danger-fg transition-colors hover:bg-danger-bg disabled:cursor-not-allowed disabled:opacity-60"
       >
         {deleting ? "Deleting…" : "Delete"}
       </button>
-      {error && <p className="max-w-[16rem] text-right text-xs text-red-700">{error}</p>}
+      {error && <p className="max-w-[16rem] text-right text-xs text-danger-fg">{error}</p>}
     </div>
   );
 }

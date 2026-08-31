@@ -42,10 +42,10 @@ export default function LoginPage() {
 
   return (
     <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
-      <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+      <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Log in
       </h1>
-      <p className="mt-2 text-sm text-zinc-600">
+      <p className="mt-2 text-sm text-fg-muted">
         Welcome back. Log in to view your resumes and matches.
       </p>
 
@@ -72,7 +72,7 @@ export default function LoginPage() {
         {error && (
           <p
             role="alert"
-            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
           >
             {error}
           </p>
@@ -83,9 +83,9 @@ export default function LoginPage() {
         </Button>
       </form>
 
-      <p className="mt-6 text-sm text-zinc-600">
+      <p className="mt-6 text-sm text-fg-muted">
         Don&apos;t have an account?{" "}
-        <Link href="/signup" className="font-medium text-zinc-900 underline underline-offset-2">
+        <Link href="/signup" className="font-medium text-fg underline underline-offset-2">
           Sign up
         </Link>
       </p>

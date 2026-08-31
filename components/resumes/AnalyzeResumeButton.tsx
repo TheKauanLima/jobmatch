@@ -83,14 +83,14 @@ export function AnalyzeResumeButton({
             : "Analyze resume"}
       </Button>
       {analyzing && (
-        <p className="max-w-[16rem] text-right text-xs text-zinc-500">
+        <p className="max-w-[16rem] text-right text-xs text-fg-subtle">
           This can take up to a minute — the AI is reading your resume.
         </p>
       )}
       {error && (
         <p
           role="alert"
-          className="max-w-[16rem] text-right text-xs text-red-700"
+          className="max-w-[16rem] text-right text-xs text-danger-fg"
         >
           {error}
         </p>

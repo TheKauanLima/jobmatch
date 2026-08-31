@@ -116,12 +116,12 @@ export default async function ResumeDetailPage({
   if (result.kind === "error") {
     return (
       <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-        <Link href="/resumes" className="text-sm text-zinc-500 hover:text-zinc-700">
+        <Link href="/resumes" className="text-sm text-fg-subtle hover:text-fg-muted">
           &larr; All resumes
         </Link>
         <p
           role="alert"
-          className="mt-6 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+          className="mt-6 rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
         >
           Couldn&apos;t load this resume. Please try again.
         </p>
@@ -139,11 +139,11 @@ export default async function ResumeDetailPage({
         <div className="min-w-0">
           <Link
             href="/resumes"
-            className="text-sm text-zinc-500 hover:text-zinc-700"
+            className="text-sm text-fg-subtle hover:text-fg-muted"
           >
             &larr; All resumes
           </Link>
-          <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight text-zinc-900">
+          <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight text-fg">
             {resume.file_name}
           </h1>
         </div>
@@ -154,46 +154,46 @@ export default async function ResumeDetailPage({
         />
       </div>
 
-      <section className="mt-8 rounded-lg border border-zinc-200 bg-white p-6">
-        <h2 className="text-base font-semibold text-zinc-900">
+      <section className="mt-8 rounded-lg border border-border bg-surface p-6">
+        <h2 className="text-base font-semibold text-fg">
           File details
         </h2>
         <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
           <div>
-            <dt className="text-zinc-500">Status</dt>
-            <dd className="font-medium text-zinc-900">
+            <dt className="text-fg-subtle">Status</dt>
+            <dd className="font-medium text-fg">
               {STATUS_LABELS[resume.status]}
             </dd>
           </div>
           <div>
-            <dt className="text-zinc-500">Type</dt>
-            <dd className="font-medium text-zinc-900">{resume.file_type}</dd>
+            <dt className="text-fg-subtle">Type</dt>
+            <dd className="font-medium text-fg">{resume.file_type}</dd>
           </div>
           <div>
-            <dt className="text-zinc-500">Size</dt>
-            <dd className="font-medium text-zinc-900">
+            <dt className="text-fg-subtle">Size</dt>
+            <dd className="font-medium text-fg">
               {formatFileSize(resume.file_size_bytes)}
             </dd>
           </div>
           <div>
-            <dt className="text-zinc-500">Uploaded</dt>
-            <dd className="font-medium text-zinc-900">
+            <dt className="text-fg-subtle">Uploaded</dt>
+            <dd className="font-medium text-fg">
               {new Date(resume.created_at).toLocaleString()}
             </dd>
           </div>
         </dl>
       </section>
 
-      <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
         <div className="flex items-center justify-between gap-4">
-          <h2 className="text-base font-semibold text-zinc-900">Analysis</h2>
+          <h2 className="text-base font-semibold text-fg">Analysis</h2>
           <AnalyzeResumeButton resumeId={resume.id} hasAnalysis={!!analysis} />
         </div>
         <div className="mt-4">
           {analysisLoadFailed ? (
             <p
               role="alert"
-              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+              className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
             >
               Couldn&apos;t load this resume&apos;s analysis. Please refresh
               the page.
@@ -204,14 +204,14 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
         <div className="flex items-center justify-between gap-4">
-          <h2 className="text-base font-semibold text-zinc-900">Matches</h2>
-          <span className="shrink-0 cursor-default rounded-md bg-zinc-100 px-3 py-1.5 text-sm font-medium text-zinc-400">
+          <h2 className="text-base font-semibold text-fg">Matches</h2>
+          <span className="shrink-0 cursor-default rounded-md bg-neutral-bg px-3 py-1.5 text-sm font-medium text-fg-disabled">
             Match against a job (coming soon)
           </span>
         </div>
-        <p className="mt-2 text-sm text-zinc-600">
+        <p className="mt-2 text-sm text-fg-muted">
           No matches yet. Once this resume is analyzed, match it against a
           job description to see how it stacks up.
         </p>

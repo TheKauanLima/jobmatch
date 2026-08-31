@@ -7,12 +7,12 @@ interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
 export function Input({ label, id, className = "", ...props }: InputProps) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label htmlFor={id} className="text-sm font-medium text-zinc-700">
+      <label htmlFor={id} className="text-sm font-medium text-fg-muted">
         {label}
       </label>
       <input
         id={id}
-        className={`rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500 disabled:bg-zinc-100 disabled:text-zinc-500 ${className}`}
+        className={`rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-disabled focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle ${className}`}
         {...props}
       />
     </div>

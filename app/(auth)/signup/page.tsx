@@ -53,16 +53,16 @@ export default function SignupPage() {
   if (confirmationSent) {
     return (
       <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
-        <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+        <h1 className="text-2xl font-semibold tracking-tight text-fg">
           Check your email
         </h1>
-        <p className="mt-3 text-sm leading-6 text-zinc-600">
-          We sent a confirmation link to <span className="font-medium text-zinc-900">{email}</span>.
+        <p className="mt-3 text-sm leading-6 text-fg-muted">
+          We sent a confirmation link to <span className="font-medium text-fg">{email}</span>.
           Follow the link to activate your account, then log in.
         </p>
         <Link
           href="/login"
-          className="mt-6 text-sm font-medium text-zinc-900 underline underline-offset-2"
+          className="mt-6 text-sm font-medium text-fg underline underline-offset-2"
         >
           Back to log in
         </Link>
@@ -72,10 +72,10 @@ export default function SignupPage() {
 
   return (
     <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
-      <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+      <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Sign up
       </h1>
-      <p className="mt-2 text-sm text-zinc-600">
+      <p className="mt-2 text-sm text-fg-muted">
         Create an account to upload your resume and start matching.
       </p>
 
@@ -103,7 +103,7 @@ export default function SignupPage() {
         {error && (
           <p
             role="alert"
-            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
           >
             {error}
           </p>
@@ -114,9 +114,9 @@ export default function SignupPage() {
         </Button>
       </form>
 
-      <p className="mt-6 text-sm text-zinc-600">
+      <p className="mt-6 text-sm text-fg-muted">
         Already have an account?{" "}
-        <Link href="/login" className="font-medium text-zinc-900 underline underline-offset-2">
+        <Link href="/login" className="font-medium text-fg underline underline-offset-2">
           Log in
         </Link>
       </p>

@@ -475,3 +475,259 @@ unilaterally. Flagging them rather than silently picking an answer:
   as data (not instructions), and `lib/claude/parse.ts` must reject any Claude response
   that doesn't validate against the expected output schema. `reviewer` treats a missing
   or weak version of this as a blocking finding on any change touching `lib/claude/`.
+
+---
+
+## 6. Design system / theming (2026-08-31)
+
+### Why
+The app currently has one real, user-visible bug: `app/globals.css` flips
+`--background`/`--foreground` under `@media (prefers-color-scheme: dark)`, applied
+only to `body`, while every component (`Button`, `Input`, `Nav`, page cards, error
+banners) uses hardcoded Tailwind utilities (`bg-white`, `text-zinc-900`,
+`border-zinc-300`, `bg-red-50`, etc.) that assume a permanent light theme. In dark OS
+mode the page background goes dark but component text/borders don't adapt →
+unreadable, low/no-contrast UI. This section replaces the hardcoded-color pattern with
+a token system so the fix is structural (works for M4/M5 UI too), not a one-off patch.
+This is a design-system decision, not a one-off color swap — treat token names below as
+final API surface for all future components, same status as the folder structure in §3.
+
+### 6.1 Token list
+All tokens are CSS custom properties, redefined per theme (see §6.2), then re-exposed
+to Tailwind v4 via `@theme inline` (see §6.3) so components consume them as plain
+utility classes — never a raw hex value, never a raw `zinc-*`/`red-*`/`white`/`black`
+Tailwind class, from this point forward.
+
+| Token (CSS var) | Role | Tailwind utility | Light value | Dark value |
+|---|---|---|---|---|
+| `--bg` | Page background | `bg-bg` | `#fafafa` (zinc-50) | `#09090b` (zinc-950) |
+| `--surface` | Card / header / footer / input background — one step "up" from page bg | `bg-surface` | `#ffffff` | `#18181b` (zinc-900) |
+| `--surface-hover` | Hover state for elements sitting on `surface` (secondary button hover, nav item hover) | `bg-surface-hover` | `#fafafa` (zinc-50) | `#27272a` (zinc-800) |
+| `--fg` | Primary text, headings | `text-fg` | `#18181b` (zinc-900) | `#fafafa` (zinc-50) — **≈17:1** on `surface` |
+| `--fg-muted` | Secondary text: descriptions, labels, nav links | `text-fg-muted` | `#52525b` (zinc-600) — **≈7.7:1** on white | `#d4d4d8` (zinc-300) — **≈12:1** on zinc-900 |
+| `--fg-subtle` | Tertiary text: timestamps, hint text, empty-state copy | `text-fg-subtle` | `#71717a` (zinc-500) — **≈4.8:1** on white (AA) | `#a1a1aa` (zinc-400) — **≈6.9:1** on zinc-900 |
+| `--fg-disabled` | Placeholder text, disabled input text — intentionally low contrast, decorative only, not required to hit AA (matches current placeholder behavior) | `text-fg-disabled` | `#a1a1aa` (zinc-400) — ≈2.6:1 | `#52525b` (zinc-600) — ≈2.3:1 |
+| `--border` | Default dividers/card borders | `border-border` | `#e4e4e7` (zinc-200) | `#27272a` (zinc-800) |
+| `--border-strong` | Input borders, secondary-button borders, dashed upload area | `border-border-strong` | `#d4d4d8` (zinc-300) | `#3f3f46` (zinc-700) |
+| `--accent` | Primary button / brand background, focus ring, links-as-buttons | `bg-accent`, `outline-accent` | `#18181b` (zinc-900) | `#fafafa` (zinc-50) |
+| `--accent-hover` | Primary button hover | `hover:bg-accent-hover` | `#3f3f46` (zinc-700) | `#e4e4e7` (zinc-200) |
+| `--accent-fg` | Text/icon on top of `accent` | `text-accent-fg` | `#ffffff` | `#18181b` (zinc-900) |
+| `--danger-bg` | Error banner background (`role="alert"` boxes) | `bg-danger-bg` | `#fef2f2` (red-50) | `#450a0a` (red-950) |
+| `--danger-border` | Error banner border | `border-danger-border` | `#fecaca` (red-200) | `#991b1b` (red-800) |
+| `--danger-fg` | Error banner/text/icon color, destructive button text | `text-danger-fg` | `#b91c1c` (red-700) — ≈6:1 | `#fca5a5` (red-300) — ≈8.5:1 |
+| `--success-bg` / `--success-border` / `--success-fg` | "analyzed" status badge, future success states | `bg-success-bg` / `border-success-border` / `text-success-fg` | `#d1fae5` / `#a7f3d0` / `#065f46` (emerald 100/200/800) | `#022c22` / `#065f46` / `#6ee7b7` (emerald 950/800/300) |
+| `--warning-bg` / `--warning-border` / `--warning-fg` | "processing" status badge, future warning states | `bg-warning-bg` / `border-warning-border` / `text-warning-fg` | `#fef3c7` / `#fde68a` / `#92400e` (amber 100/200/800) | `#451a03` / `#92400e` / `#fcd34d` (amber 950/800/300) |
+| `--neutral-bg` / `--neutral-fg` | "uploaded" status badge, tag/chip backgrounds (e.g. suggested-role tags) | `bg-neutral-bg` / `text-neutral-fg` | `#f4f4f5` / `#3f3f46` (zinc 100/700) | `#27272a` / `#d4d4d8` (zinc 800/300) |
+
+Rules for reuse (so this list doesn't grow unbounded as M4/M5 land):
+- Any grey/neutral shade → one of `bg`, `surface`, `surface-hover`, `fg`, `fg-muted`,
+  `fg-subtle`, `fg-disabled`, `border`, `border-strong`, `neutral-bg`/`neutral-fg`. Do
+  not invent a new grey token without updating this table.
+- Any semantic status color (success/warning/danger, e.g. match-score bands in M5) →
+  reuse `success-*`/`warning-*`/`danger-*`. If M5's match-score UI needs more bands
+  than good/warn/bad, that's a product question for the orchestrator, not a reason to
+  add ad hoc colors.
+- `accent`/`accent-hover`/`accent-fg` are the only brand color — this stays monochrome
+  (black-on-white light, white-on-black dark) per CLAUDE.md's "clarity over flourish,
+  trust" design direction. No blue/purple "primary" color is introduced.
+
+### 6.2 Mechanism: explicit theme, system fallback, no flash
+- **Attribute:** `<html data-theme="light">` or `<html data-theme="dark">`. All token
+  values are scoped under `:root[data-theme="light"]` / `:root[data-theme="dark"]`
+  selectors in `app/globals.css` (replacing the current `@media
+  (prefers-color-scheme: dark)` block entirely — that block is deleted).
+- **Persistence:** localStorage key `jobmatch-theme`, value exactly `"light"` or
+  `"dark"`. **Absence of the key** means "no explicit choice yet" → follow OS
+  preference (`prefers-color-scheme`). The key is only ever written by the
+  `ThemeToggle` component (§6.4) when the user picks a mode explicitly; nothing else
+  writes it.
+- **Anti-flash:** a blocking inline `<script>` (not `next/script`, which defers/loads
+  async — must be a synchronous, render-blocking `<script>`) placed as the **first
+  child of `<head>`**, in the root layout `app/layout.tsx`. Next.js App Router permits
+  an explicit `<head>` element returned from the root layout for exactly this case
+  (scripts that must run before first paint). Root layout stays a Server Component;
+  this is inline static markup, not a client hook, so it doesn't change that. Exact
+  contract for the script (frontend-dev implements verbatim, do not swap in a
+  `next/script` variant or move it below other head content):
+  ```html
+  <script
+    dangerouslySetInnerHTML={{
+      __html: `(function(){try{var s=localStorage.getItem('jobmatch-theme');var t=s==='light'||s==='dark'?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();`,
+    }}
+  />
+  ```
+  Add `suppressHydrationWarning` to the `<html>` element in the root layout — the
+  `data-theme` attribute is set by this script before React hydrates, which would
+  otherwise trigger a hydration-mismatch warning on an attribute React doesn't control.
+- **Known limitation (accepted, not silently ignored):** if JavaScript is disabled,
+  this script never runs and the page falls back to whatever `:root` defaults to
+  (light) regardless of OS preference. No `@media` CSS fallback is layered on top,
+  because a CSS-only fallback can't be overridden by the explicit-choice logic without
+  conflicting specificity rules. This is an acceptable v1 tradeoff (JS-required is
+  already true for the rest of the app — auth, forms, everything is client-rendered
+  interaction) but is flagged here rather than assumed.
+
+### 6.3 Tailwind v4 integration
+`app/globals.css` structure (replaces the current file in full):
+```css
+@import "tailwindcss";
+
+:root[data-theme="light"],
+:root:not([data-theme]) {
+  --bg: #fafafa; --surface: #ffffff; --surface-hover: #fafafa;
+  --fg: #18181b; --fg-muted: #52525b; --fg-subtle: #71717a; --fg-disabled: #a1a1aa;
+  --border: #e4e4e7; --border-strong: #d4d4d8;
+  --accent: #18181b; --accent-hover: #3f3f46; --accent-fg: #ffffff;
+  --danger-bg: #fef2f2; --danger-border: #fecaca; --danger-fg: #b91c1c;
+  --success-bg: #d1fae5; --success-border: #a7f3d0; --success-fg: #065f46;
+  --warning-bg: #fef3c7; --warning-border: #fde68a; --warning-fg: #92400e;
+  --neutral-bg: #f4f4f5; --neutral-fg: #3f3f46;
+}
+
+:root[data-theme="dark"] {
+  --bg: #09090b; --surface: #18181b; --surface-hover: #27272a;
+  --fg: #fafafa; --fg-muted: #d4d4d8; --fg-subtle: #a1a1aa; --fg-disabled: #52525b;
+  --border: #27272a; --border-strong: #3f3f46;
+  --accent: #fafafa; --accent-hover: #e4e4e7; --accent-fg: #18181b;
+  --danger-bg: #450a0a; --danger-border: #991b1b; --danger-fg: #fca5a5;
+  --success-bg: #022c22; --success-border: #065f46; --success-fg: #6ee7b7;
+  --warning-bg: #451a03; --warning-border: #92400e; --warning-fg: #fcd34d;
+  --neutral-bg: #27272a; --neutral-fg: #d4d4d8;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-fg-disabled: var(--fg-disabled);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-border: var(--danger-border);
+  --color-danger-fg: var(--danger-fg);
+  --color-success-bg: var(--success-bg);
+  --color-success-border: var(--success-border);
+  --color-success-fg: var(--success-fg);
+  --color-warning-bg: var(--warning-bg);
+  --color-warning-border: var(--warning-border);
+  --color-warning-fg: var(--warning-fg);
+  --color-neutral-bg: var(--neutral-bg);
+  --color-neutral-fg: var(--neutral-fg);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: Arial, Helvetica, sans-serif;
+}
+```
+The `@theme inline` block is what makes this work with Tailwind v4: it re-exposes each
+runtime CSS variable as a `--color-*` design token, so Tailwind generates ordinary
+utilities (`bg-bg`, `text-fg`, `border-border-strong`, `bg-accent`, `text-accent-fg`,
+`bg-danger-bg`, `border-danger-border`, `text-danger-fg`, `bg-success-bg`,
+`text-success-fg`, `bg-warning-bg`, `text-warning-fg`, `bg-neutral-bg`,
+`text-neutral-fg`, etc.) that resolve at **paint time** against whichever
+`[data-theme]` block is active — no rebuild, no JS re-render needed to reflect a theme
+switch, only the DOM attribute changes. This is the same pattern the file already uses
+for `--color-background`/`--color-foreground`, just extended to the full token set and
+switched from a `prefers-color-scheme` media query to a `data-theme` attribute
+selector.
+
+### 6.4 `ThemeToggle` component contract
+New file: `components/ThemeToggle.tsx` (client component), rendered in `Nav.tsx`
+(visible for both logged-in and logged-out states — theme is a device preference, not
+an account setting, so it doesn't require auth). Behavior contract:
+- **Initial render:** on mount, read the current value from
+  `document.documentElement.getAttribute('data-theme')` (already set correctly by the
+  anti-flash script — do not re-derive from `matchMedia`/localStorage independently, or
+  the toggle's displayed state can disagree with what's actually rendered). Render a
+  neutral/unknown state for the very first server-rendered paint (before the
+  `useEffect` that reads the attribute runs) to avoid a hydration mismatch — e.g. the
+  toggle can render as disabled/empty until mounted, then populate.
+- **Minimum UI:** two options, Light and Dark (explicit, not implicit) — e.g. a
+  two-segment control or icon button that cycles. **Nice-to-have, not required for
+  v1:** a third "System" option that removes the `jobmatch-theme` localStorage key
+  (falls back to OS preference) instead of writing an explicit value, and — if
+  implemented — subscribes to
+  `window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', …)`
+  while "System" is active so the theme updates live if the OS preference changes
+  without a page reload; unsubscribe on unmount or when the user picks an explicit
+  mode.
+- **On selecting Light/Dark:** (1) `localStorage.setItem('jobmatch-theme', value)`,
+  (2) `document.documentElement.setAttribute('data-theme', value)` immediately (no
+  reload, no router refresh needed — this is a pure DOM/CSS change).
+- **Accessibility:** use a real `<button>`/toggle-group with visible text or
+  `aria-label`, not color/icon alone, per the "clarity/trust" design direction in
+  CLAUDE.md.
+
+### 6.5 Migration checklist
+Every file below has hardcoded light-only Tailwind color utilities
+(`zinc-*`/`red-*`/`amber-*`/`emerald-*`/`white`/`black`) that must be replaced with the
+tokens from §6.1. This is the full list found by reading the current tree — treat it as
+exhaustive for the pre-existing codebase, not illustrative:
+
+- `app/globals.css` — replaced wholesale per §6.3.
+- `app/layout.tsx` — `bg-zinc-50`, `bg-white` (header/footer), `border-zinc-200`,
+  `text-zinc-900`, `text-zinc-500`; also add `suppressHydrationWarning` on `<html>` and
+  the anti-flash `<script>` in `<head>` per §6.2.
+- `components/Nav.tsx` — `text-zinc-600`, `text-zinc-900`, `text-zinc-400`,
+  `border-zinc-300`, `hover:bg-zinc-50`, `bg-zinc-900`, `text-white`,
+  `hover:bg-zinc-700`; also add the `ThemeToggle` per §6.4.
+- `components/ui/Button.tsx` — `bg-zinc-900`, `text-white`, `hover:bg-zinc-700`,
+  `bg-white`, `text-zinc-900`, `border-zinc-300`, `hover:bg-zinc-50`,
+  `focus-visible:outline-zinc-900`.
+- `components/ui/Input.tsx` — `text-zinc-700`, `border-zinc-300`, `bg-white`,
+  `text-zinc-900`, `placeholder:text-zinc-400`, `focus:border-zinc-500`,
+  `focus:ring-zinc-500`, `disabled:bg-zinc-100`, `disabled:text-zinc-500`.
+- `app/(auth)/login/page.tsx` — `text-zinc-900`, `text-zinc-600`,
+  `border-red-200 bg-red-50 text-red-700`.
+- `app/(auth)/signup/page.tsx` — same pattern as login (`text-zinc-900`,
+  `text-zinc-600`, `border-red-200 bg-red-50 text-red-700`).
+- `app/resumes/page.tsx` — `text-zinc-900`, `text-zinc-600`,
+  `border-red-200 bg-red-50 text-red-700`.
+- `app/resumes/[id]/page.tsx` — `text-zinc-500`, `text-zinc-900`, `border-zinc-200`,
+  `bg-white`, `border-red-200 bg-red-50 text-red-700`, `bg-zinc-100 text-zinc-400`.
+- `app/dashboard/page.tsx` — `text-zinc-900`, `text-zinc-600`, `border-zinc-200`,
+  `bg-white`, `border-red-200 bg-red-50 text-red-700`, `bg-zinc-900 text-white
+  hover:bg-zinc-700`.
+- `app/page.tsx` — `text-zinc-900`, `text-zinc-600`.
+- `components/resumes/ResumeCard.tsx` — `STATUS_STYLES` map (`bg-zinc-100
+  text-zinc-700`, `bg-amber-100 text-amber-800`, `bg-emerald-100 text-emerald-800`,
+  `bg-red-100 text-red-700` → map to `neutral-*`/`warning-*`/`success-*`/`danger-*`
+  respectively), plus `border-zinc-200`, `bg-white`, `text-zinc-900`, `text-zinc-500`,
+  `border-zinc-300`, `hover:bg-zinc-50`, `text-zinc-700`.
+- `components/resumes/AnalysisPanel.tsx` — `text-zinc-600`, `text-zinc-700`,
+  `bg-emerald-100 text-emerald-800`, `bg-amber-100 text-amber-800`, `text-zinc-900`,
+  `bg-zinc-100 text-zinc-700`, `text-zinc-400`, `text-zinc-500`.
+- `components/resumes/ResumeUploadForm.tsx` — `border-zinc-200`, `bg-white`,
+  `text-zinc-900`, `text-zinc-600`, `text-zinc-700`, `border-zinc-300`,
+  `file:bg-zinc-100 file:text-zinc-700 hover:file:bg-zinc-200`, `text-zinc-500`,
+  `border-red-200 bg-red-50 text-red-700`.
+- `components/resumes/AnalyzeResumeButton.tsx` — `text-zinc-500`, `text-red-700`.
+- `components/resumes/DeleteResumeButton.tsx` — `border-red-200 text-red-700
+  hover:bg-red-50`, `text-red-700`.
+- `components/resumes/ResumeList.tsx` — `border-dashed border-zinc-300`, `bg-white`,
+  `text-zinc-600`.
+
+Mapping guidance while migrating: `zinc-900`/`zinc-700` text → `fg`/`fg-muted`;
+`zinc-600`/`zinc-500` text → `fg-muted`/`fg-subtle`; `zinc-400` placeholder/hint →
+`fg-disabled`; `white` component backgrounds → `surface`; `zinc-50` hover backgrounds →
+`surface-hover`; `zinc-100`/`zinc-200`/`zinc-300` borders and chip backgrounds →
+`border`/`border-strong`/`neutral-bg`; `zinc-900` primary-button background → `accent`;
+`red-*`/`amber-*`/`emerald-*` triples → `danger-*`/`warning-*`/`success-*`.
+
+### 6.6 Open question for the user
+None blocking — this is a self-contained visual fix with no schema/API impact. One
+product note worth confirming later, not now: whether `ThemeToggle`'s choice should
+ever sync across devices (would require a `user_preferences` table or a column on a
+future profile table) versus staying a per-browser `localStorage` setting as designed
+here. Per-browser is the right default for v1 (no schema change, no new endpoint) —
+flagging only so it isn't silently assumed to be account-level later.

@@ -38,22 +38,22 @@ export default async function DashboardPage() {
 
   return (
     <div className="mx-auto w-full max-w-5xl flex-1 px-6 py-12">
-      <h1 className="text-2xl font-semibold tracking-tight text-zinc-900">
+      <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Welcome back{user.email ? `, ${user.email}` : ""}
       </h1>
-      <p className="mt-2 text-sm text-zinc-600">
+      <p className="mt-2 text-sm text-fg-muted">
         Here&apos;s an overview of your resumes and recent matches.
       </p>
 
       <div className="mt-10 grid gap-6 sm:grid-cols-2">
-        <section className="rounded-lg border border-zinc-200 bg-white p-6">
+        <section className="rounded-lg border border-border bg-surface p-6">
           <div className="flex items-center justify-between gap-4">
-            <h2 className="text-base font-semibold text-zinc-900">
+            <h2 className="text-base font-semibold text-fg">
               Your resumes
             </h2>
             <Link
               href="/resumes"
-              className="text-sm font-medium text-zinc-600 hover:text-zinc-900"
+              className="text-sm font-medium text-fg-muted hover:text-fg"
             >
               View all
             </Link>
@@ -62,19 +62,19 @@ export default async function DashboardPage() {
           {error ? (
             <p
               role="alert"
-              className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+              className="mt-3 rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
             >
               {error}
             </p>
           ) : resumes.length === 0 ? (
             <>
-              <p className="mt-2 text-sm text-zinc-600">
+              <p className="mt-2 text-sm text-fg-muted">
                 You haven&apos;t uploaded a resume yet. Upload one to get an
                 AI-powered strengths/weaknesses breakdown.
               </p>
               <Link
                 href="/resumes"
-                className="mt-4 inline-block rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-700"
+                className="mt-4 inline-block rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg transition-colors hover:bg-accent-hover"
               >
                 Upload a resume
               </Link>
@@ -88,11 +88,11 @@ export default async function DashboardPage() {
           )}
         </section>
 
-        <section className="rounded-lg border border-zinc-200 bg-white p-6">
-          <h2 className="text-base font-semibold text-zinc-900">
+        <section className="rounded-lg border border-border bg-surface p-6">
+          <h2 className="text-base font-semibold text-fg">
             Recent matches
           </h2>
-          <p className="mt-2 text-sm text-zinc-600">
+          <p className="mt-2 text-sm text-fg-muted">
             No matches yet. Once you&apos;ve uploaded and analyzed a resume,
             match it against a job description to see how it stacks up.
           </p>

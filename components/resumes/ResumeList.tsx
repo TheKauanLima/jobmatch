@@ -9,8 +9,8 @@ interface ResumeListProps {
 export function ResumeList({ resumes }: ResumeListProps) {
   if (resumes.length === 0) {
     return (
-      <div className="rounded-lg border border-dashed border-zinc-300 bg-white p-8 text-center">
-        <p className="text-sm text-zinc-600">
+      <div className="rounded-lg border border-dashed border-border-strong bg-surface p-8 text-center">
+        <p className="text-sm text-fg-muted">
           No resumes yet. Upload one above to get started.
         </p>
       </div>

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 interface NavProps {
   userEmail: string | null;
@@ -26,33 +27,35 @@ export function Nav({ userEmail }: NavProps) {
   }
 
   return (
-    <div className="flex items-center gap-6 text-sm font-medium text-zinc-600">
+    <div className="flex items-center gap-6 text-sm font-medium text-fg-muted">
       {userEmail ? (
         <>
-          <Link href="/dashboard" className="hover:text-zinc-900">
+          <Link href="/dashboard" className="hover:text-fg">
             Dashboard
           </Link>
-          <Link href="/resumes" className="hover:text-zinc-900">
+          <Link href="/resumes" className="hover:text-fg">
             Resumes
           </Link>
-          <span className="cursor-default text-zinc-400">Jobs</span>
+          <span className="cursor-default text-fg-disabled">Jobs</span>
+          <ThemeToggle />
           <button
             type="button"
             onClick={handleSignOut}
             disabled={signingOut}
-            className="rounded-md border border-zinc-300 px-3 py-1.5 text-zinc-700 transition-colors hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded-md border border-border-strong px-3 py-1.5 text-fg-muted transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60"
           >
             {signingOut ? "Signing out…" : "Sign out"}
           </button>
         </>
       ) : (
         <>
-          <Link href="/login" className="hover:text-zinc-900">
+          <Link href="/login" className="hover:text-fg">
             Log in
           </Link>
+          <ThemeToggle />
           <Link
             href="/signup"
-            className="rounded-md bg-zinc-900 px-3 py-1.5 text-white transition-colors hover:bg-zinc-700"
+            className="rounded-md bg-accent px-3 py-1.5 text-accent-fg transition-colors hover:bg-accent-hover"
           >
             Sign up
           </Link>

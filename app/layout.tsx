@@ -35,20 +35,28 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
+      suppressHydrationWarning
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-zinc-50 text-zinc-900">
-        <header className="border-b border-zinc-200 bg-white">
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var s=localStorage.getItem('jobmatch-theme');var t=s==='light'||s==='dark'?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();`,
+          }}
+        />
+      </head>
+      <body className="min-h-full flex flex-col bg-bg text-fg">
+        <header className="border-b border-border bg-surface">
           <nav className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
-            <Link href="/" className="text-lg font-semibold tracking-tight text-zinc-900">
+            <Link href="/" className="text-lg font-semibold tracking-tight text-fg">
               JobMatch
             </Link>
             <Nav userEmail={userEmail} />
           </nav>
         </header>
         <main className="flex flex-1 flex-col">{children}</main>
-        <footer className="border-t border-zinc-200 bg-white py-6">
-          <div className="mx-auto max-w-5xl px-6 text-sm text-zinc-500">
+        <footer className="border-t border-border bg-surface py-6">
+          <div className="mx-auto max-w-5xl px-6 text-sm text-fg-subtle">
             JobMatch
           </div>
         </footer>
