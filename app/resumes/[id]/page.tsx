@@ -14,6 +14,13 @@ const STATUS_LABELS: Record<ResumeStatus, string> = {
   failed: "Failed",
 };
 
+function formatFileSize(bytes: number): string {
+  const kb = bytes / 1024;
+  if (kb < 1) return "< 1 KB";
+  if (kb < 10) return `${kb.toFixed(1)} KB`;
+  return `${Math.round(kb)} KB`;
+}
+
 type GetResumeResult =
   | { kind: "ok"; resume: ResumeDetail }
   | { kind: "not_found" }
@@ -165,7 +172,7 @@ export default async function ResumeDetailPage({
           <div>
             <dt className="text-zinc-500">Size</dt>
             <dd className="font-medium text-zinc-900">
-              {(resume.file_size_bytes / 1024).toFixed(0)} KB
+              {formatFileSize(resume.file_size_bytes)}
             </dd>
           </div>
           <div>
