@@ -331,7 +331,7 @@ description.
 /components
   /ui/                             -- generic building blocks: Button, Card, Input, Badge, etc.
   /resumes/                        -- ResumeUploadForm, ResumeCard, ResumeList, AnalysisPanel
-  /jobs/                           -- JobDescriptionForm, JobDescriptionCard
+  /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList
   /matches/                        -- MatchScoreBadge, MatchRationale, MatchList
 
 /lib

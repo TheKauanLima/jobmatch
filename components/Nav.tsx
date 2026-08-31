@@ -36,7 +36,9 @@ export function Nav({ userEmail }: NavProps) {
           <Link href="/resumes" className="hover:text-fg">
             Resumes
           </Link>
-          <span className="cursor-default text-fg-disabled">Jobs</span>
+          <Link href="/jobs" className="hover:text-fg">
+            Jobs
+          </Link>
           <ThemeToggle />
           <button
             type="button"
