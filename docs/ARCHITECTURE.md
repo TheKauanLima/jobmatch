@@ -311,8 +311,10 @@ description.
   /jobs/
     page.tsx                       -- list + submit form
     [id]/page.tsx                  -- job description detail
-  /matches/
-    [id]/page.tsx                  -- match detail: score, rationale, strengths/gaps
+  (no standalone /matches/ pages — match results are inlined into
+   /resumes/[id]/page.tsx's Matches section rather than given their own
+   route; GET /api/matches/:id exists and is tested but has no direct UI
+   consumer in v1, kept for API completeness/future use)
   /api/
     resumes/
       route.ts                     -- GET (list), POST (upload)
@@ -332,7 +334,7 @@ description.
   /ui/                             -- generic building blocks: Button, Card, Input, Badge, etc.
   /resumes/                        -- ResumeUploadForm, ResumeCard, ResumeList, AnalysisPanel
   /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList
-  /matches/                        -- MatchScoreBadge, MatchRationale, MatchList
+  /matches/                        -- MatchScoreBadge, MatchRationale, MatchList, RunMatchForm
 
 /lib
   /supabase/
@@ -391,6 +393,10 @@ Rules of thumb for where new code goes:
 ---
 
 ## 4. Open questions for the user
+
+**Status: all seven items below were resolved on 2026-08-27 — see §5.** Kept here
+for the original reasoning/context behind each decision; §5 is the current answer,
+not this section.
 
 These have real cost, privacy, or migration consequences and shouldn't be decided
 unilaterally. Flagging them rather than silently picking an answer:
