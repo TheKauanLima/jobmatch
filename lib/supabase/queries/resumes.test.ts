@@ -118,6 +118,35 @@ describe("getResumeById — privacy boundary", () => {
       ResumeQueryError,
     );
   });
+
+  // Bug fix: a malformed (non-uuid) :id — e.g. from a hand-edited URL like
+  // /resumes/not-a-real-id — previously propagated Postgres's `22P02
+  // invalid input syntax for type uuid` error as a generic ResumeQueryError,
+  // which route handlers turned into a misleading 500 ("please try again",
+  // which retrying can never fix). It must now collapse into the same
+  // `null` (-> 404) as any other nonexistent id.
+  it("returns null (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await getResumeById(client, "user-1", "not-a-real-id");
+    expect(result).toBeNull();
+  });
+
+  it("still throws ResumeQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(getResumeById(client, "user-1", "some-id")).rejects.toThrow(
+      ResumeQueryError,
+    );
+  });
 });
 
 describe("deleteResume — privacy boundary", () => {

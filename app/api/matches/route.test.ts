@@ -383,7 +383,7 @@ describe("POST /api/matches", () => {
     expect(body.match.score).toBe(82);
   });
 
-  it("returns 502 when the Claude API call fails", async () => {
+  it("returns 502 when the Claude API call fails, WITHOUT retrying (ClaudeApiError is not retried, only schema-validation failures are)", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(ownedResume);
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
@@ -396,9 +396,10 @@ describe("POST /api/matches", () => {
     );
     expect(res.status).toBe(502);
     expect(mockCreateMatch).not.toHaveBeenCalled();
+    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 502 when Claude's response fails schema validation", async () => {
+  it("returns 502 when Claude's response fails schema validation on every attempt, after retrying up to the bounded max", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(ownedResume);
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
@@ -414,6 +415,44 @@ describe("POST /api/matches", () => {
     );
     expect(res.status).toBe(502);
     expect(mockCreateMatch).not.toHaveBeenCalled();
+    // Bounded retry: 1 initial attempt + up to 3 retries = 4 total calls,
+    // not an unbounded retry loop.
+    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(4);
+    expect(mockParseMatchResponse).toHaveBeenCalledTimes(4);
+  });
+
+  it("recovers via retry: a schema-invalid response on the first attempt followed by a valid response on the second attempt succeeds with 201 (regression test for the QA-reported bug — no retry previously existed)", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResume);
+    mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
+    mockGetJobDescriptionById.mockResolvedValue(jobDescription);
+    mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
+    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
+    mockParseMatchResponse
+      .mockImplementationOnce(() => {
+        // Reproduces the QA-reported non-compliant response: matched_strengths
+        // as a string instead of an array, gaps omitted.
+        throw new ClaudeResponseValidationError(
+          "matched_strengths must be an array, gaps is required",
+        );
+      })
+      .mockImplementationOnce(() => ({
+        score: 82,
+        rationale: "Good fit.",
+        matched_strengths: ["Node.js"],
+        gaps: ["Kubernetes"],
+      }));
+    mockCreateMatch.mockResolvedValue(matchRow);
+
+    const res = await POST(
+      postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
+    );
+    const body = await res.json();
+
+    expect(res.status).toBe(201);
+    expect(body.match.score).toBe(82);
+    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(2);
+    expect(mockCreateMatch).toHaveBeenCalledTimes(1);
   });
 
   it("returns 500 (not a crash) on an unexpected DB failure creating the match", async () => {

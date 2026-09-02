@@ -15,6 +15,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { Database } from "@/types/database";
+import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
 export type JobDescriptionRow =
@@ -146,7 +147,9 @@ export async function listJobDescriptions(
  * Fetches a single job description by id. Returns `null` if it doesn't
  * exist — callers turn that into a `404`. No ownership scoping: this is
  * shared data readable by any authenticated user, per
- * docs/ARCHITECTURE.md §1/§2.
+ * docs/ARCHITECTURE.md §1/§2. Also returns `null` (rather than throwing)
+ * for a malformed (non-uuid) `id` — see `lib/supabase/postgresErrors.ts`
+ * for why that collapses into the same `404` instead of a misleading `500`.
  */
 export async function getJobDescriptionById(
   supabase: Client,
@@ -159,6 +162,9 @@ export async function getJobDescriptionById(
     .maybeSingle();
 
   if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return null;
+    }
     throw new JobDescriptionQueryError(
       `Failed to fetch job description ${id}: ${error.message}`,
       error,

@@ -273,7 +273,16 @@ description.
   also block the insert, but the pre-check gives a clean error), loads the resume's
   latest `resume_analyses` row (400 if none — resume must be analyzed before
   matching) and the job description text, calls Claude (see
-  `lib/claude/prompts/matchResumeToJob.ts`), inserts a `matches` row.
+  `lib/claude/prompts/matchResumeToJob.ts`), inserts a `matches` row. Claude's
+  structured output doesn't always conform to schema on the first attempt (observed
+  live: malformed-string corruption in `matched_strengths`/`gaps` on a meaningful
+  fraction of raw calls); `lib/claude/parse.ts`'s `parseMatchResponse` first tries to
+  repair common malformation shapes deterministically (see its `repairListField`
+  docstring), and if that still fails validation, the route retries the whole Claude
+  call up to `MAX_MATCH_ATTEMPTS` (4) times before giving up. This means worst-case
+  latency for this endpoint is meaningfully higher than a single Claude call — worth
+  weighing against the synchronous-processing/Vercel-timeout tradeoff already flagged
+  in §5.
 - Response `201`: the created `matches` row, with the joined `job_descriptions`
   summary (`title`, `company`) inlined for convenience:
   ```json
@@ -341,6 +350,7 @@ description.
     client.ts                      -- browser client factory (createBrowserClient), used in Client Components
     server.ts                      -- server client factory (createServerClient, reads/writes cookies), used in Server Components + Route Handlers
     admin.ts                       -- service-role client; server-only, imported ONLY where RLS must be intentionally bypassed (none expected in v1 route handlers — reserved for future maintenance scripts)
+    postgresErrors.ts              -- isInvalidInputSyntaxError() — detects Postgres error code 22P02 (a malformed :id path param, e.g. a non-uuid string) so query functions can return null (→ a clean 404) instead of throwing/500ing; used by getResumeById/getJobDescriptionById/getMatchById
     queries/
       resumes.ts                   -- getResumeById, listResumesForUser, createResume, deleteResume (all rely on the RLS-scoped server client, not admin)
       analyses.ts                  -- getLatestAnalysis, createAnalysis
@@ -351,7 +361,7 @@ description.
     prompts/
       analyzeResume.ts             -- prompt template + expected-output schema for strengths/weaknesses extraction
       matchResumeToJob.ts          -- prompt template + expected-output schema for match scoring
-    parse.ts                       -- shared zod-based validation of Claude's JSON output; throws a typed error the route handlers turn into 502s
+    parse.ts                       -- shared zod-based validation of Claude's JSON output; attempts a deterministic repair of known malformation shapes (repairListField) on a non-conforming string field before giving up; throws a typed error the route handlers turn into 502s (after their own retry budget, if any — see POST /api/matches in §2)
     promptEscaping.ts              -- shared delimiter-tag escaping (escapeDelimitedText/escapeBothDelimiterTags) used by every prompt builder to neutralize forged closing tags (including whitespace/zero-width-character splitting tricks) in untrusted user-supplied text before it's interpolated into a prompt
   /storage/
     resumeFiles.ts                 -- upload/download/delete against the `resumes` Storage bucket; owns the `{user_id}/{id}.{ext}` path convention; text extraction (PDF/DOCX → plain text) also lives here

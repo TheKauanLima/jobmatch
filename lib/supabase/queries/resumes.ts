@@ -16,6 +16,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { Database, ResumeStatus } from "@/types/database";
+import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
 export type ResumeRow = Database["public"]["Tables"]["resumes"]["Row"];
@@ -53,7 +54,9 @@ export async function listResumesForUser(
  * Fetches a single resume by id, scoped to its owner. Returns `null` if it
  * doesn't exist or isn't owned by `userId` — callers turn that into a `404`
  * (never a `403`, per docs/ARCHITECTURE.md §2, to avoid leaking existence
- * of other users' rows).
+ * of other users' rows). Also returns `null` (rather than throwing) for a
+ * malformed (non-uuid) `id` — see `lib/supabase/postgresErrors.ts` for why
+ * that collapses into the same `404` instead of a misleading `500`.
  */
 export async function getResumeById(
   supabase: Client,
@@ -68,6 +71,9 @@ export async function getResumeById(
     .maybeSingle();
 
   if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return null;
+    }
     throw new ResumeQueryError(
       `Failed to fetch resume ${id}: ${error.message}`,
       error,

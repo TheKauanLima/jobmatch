@@ -253,6 +253,33 @@ describe("getJobDescriptionById", () => {
       JobDescriptionQueryError,
     );
   });
+
+  // Bug fix: a malformed (non-uuid) :id previously propagated Postgres's
+  // `22P02 invalid input syntax for type uuid` error as a generic
+  // JobDescriptionQueryError (misleading 500), instead of the 404 it
+  // deserves — same fix/rationale as `resumes.test.ts`'s equivalent case.
+  it("returns null (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await getJobDescriptionById(client, "not-a-real-id");
+    expect(result).toBeNull();
+  });
+
+  it("still throws JobDescriptionQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(getJobDescriptionById(client, "jd-1")).rejects.toThrow(
+      JobDescriptionQueryError,
+    );
+  });
 });
 
 describe("getJobDescriptionsByIds", () => {

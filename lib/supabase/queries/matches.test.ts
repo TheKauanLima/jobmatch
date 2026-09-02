@@ -178,6 +178,31 @@ describe("getMatchById — privacy boundary", () => {
 
     await expect(getMatchById(client, "user-1", "match-1")).rejects.toThrow(MatchQueryError);
   });
+
+  // Bug fix: a malformed (non-uuid) :id previously propagated Postgres's
+  // `22P02 invalid input syntax for type uuid` error as a generic
+  // MatchQueryError (misleading 500), instead of the 404 it deserves — same
+  // fix/rationale as `resumes.test.ts`'s equivalent case.
+  it("returns null (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeMultiTableClient({ matches: matchesBuilder });
+
+    const result = await getMatchById(client, "user-1", "not-a-real-id");
+    expect(result).toBeNull();
+  });
+
+  it("still throws MatchQueryError for a Postgres error with a different code", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeMultiTableClient({ matches: matchesBuilder });
+
+    await expect(getMatchById(client, "user-1", "match-1")).rejects.toThrow(MatchQueryError);
+  });
 });
 
 describe("createMatch", () => {
