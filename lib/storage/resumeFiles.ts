@@ -15,13 +15,27 @@
  * IMPORTANT: nothing in this module logs resume file contents or extracted
  * text. Errors are logged with messages only (see callers in
  * app/api/resumes/**).
+ *
+ * IMPORTANT (serverless module-eval safety): `pdf-parse` and `mammoth` are
+ * imported lazily (`await import(...)`) inside the extraction functions
+ * below, never at module top level. `pdf-parse` wraps `pdfjs-dist`, which
+ * references browser-only globals (`DOMMatrix`, `Path2D`, `ImageData`) at
+ * *module-evaluation* time, not just when a PDF is actually parsed. On
+ * Vercel's Node serverless runtime those globals don't exist, so a
+ * top-level import of `pdf-parse` throws `ReferenceError: DOMMatrix is not
+ * defined` the moment this module is loaded — which, since Next.js
+ * evaluates a route file's imports eagerly, took down every handler in
+ * every route file that (transitively) imports this module, not just PDF
+ * upload. Keeping the import inside `extractPdfText` means a crash there
+ * only affects that one call, not `GET`/`DELETE`/non-PDF uploads. See
+ * `extractPdfText` for the accompanying `pdf-parse/worker` polyfill import,
+ * which is the documented fix for the `DOMMatrix` error itself
+ * (https://github.com/mehmet-kozan/pdf-parse/blob/main/docs/troubleshooting.md).
  */
 
 import { randomUUID } from "node:crypto";
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { PDFParse } from "pdf-parse";
-import mammoth from "mammoth";
 
 import type { Database } from "@/types/database";
 import type { ResumeAcceptedMimeType } from "@/lib/validation/schemas";
@@ -164,6 +178,24 @@ export async function extractResumeText(
 }
 
 async function extractPdfText(buffer: Buffer): Promise<string> {
+  let PDFParse: (typeof import("pdf-parse"))["PDFParse"];
+  try {
+    // Must run before `import("pdf-parse")` below: this sets
+    // `globalThis.DOMMatrix`/`Path2D`/`ImageData` from `@napi-rs/canvas`,
+    // which pdf-parse's underlying pdfjs-dist bundle references
+    // unconditionally at its own module-evaluation time. Without this,
+    // the `import("pdf-parse")` line throws `ReferenceError: DOMMatrix is
+    // not defined` in serverless Node environments (confirmed on Vercel).
+    // Documented fix: see module docstring above for the source link.
+    await import("pdf-parse/worker");
+    ({ PDFParse } = await import("pdf-parse"));
+  } catch (err) {
+    throw new ResumeTextExtractionError(
+      "Failed to load the PDF parsing library.",
+      err,
+    );
+  }
+
   const parser = new PDFParse({ data: buffer });
   try {
     const result = await parser.getText();
@@ -180,6 +212,7 @@ async function extractPdfText(buffer: Buffer): Promise<string> {
 
 async function extractDocxText(buffer: Buffer): Promise<string> {
   try {
+    const mammoth = (await import("mammoth")).default;
     const result = await mammoth.extractRawText({ buffer });
     return result.value.trim();
   } catch (err) {
