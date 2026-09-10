@@ -2,7 +2,8 @@ import { notFound, redirect } from "next/navigation";
 import Link from "next/link";
 import { getSession } from "@/lib/auth/session";
 import { serverFetch } from "@/lib/api/serverFetch";
-import type { JobDescription } from "@/types/domain";
+import { MatchFromJobForm } from "@/components/matches/MatchFromJobForm";
+import type { JobDescription, ResumeListItem } from "@/types/domain";
 
 type GetJobDescriptionResult =
   | { kind: "ok"; jobDescription: JobDescription }
@@ -32,6 +33,39 @@ async function getJobDescription(id: string): Promise<GetJobDescriptionResult> {
   }
 }
 
+type GetAnalyzedResumesResult =
+  | { kind: "ok"; resumes: ResumeListItem[] }
+  | { kind: "error" };
+
+/**
+ * Fetches the caller's own analyzed resumes to populate `MatchFromJobForm`'s
+ * picker — added per the 2026-09-10 UX pass so a student can start a match
+ * directly from a job listing instead of only from `/resumes/[id]`. Filters
+ * to `status === "analyzed"` client-side (same proxy `AnalyzeResumeButton`
+ * already uses for "has an analysis") since `GET /api/resumes` doesn't have
+ * a status filter of its own — the caller's resume count is small enough
+ * (v1 has no per-user cap, but realistically dozens at most) that filtering
+ * the full list here is simpler than adding one.
+ */
+async function getAnalyzedResumes(): Promise<GetAnalyzedResumesResult> {
+  try {
+    const response = await serverFetch("/api/resumes");
+
+    if (!response.ok) {
+      return { kind: "error" };
+    }
+
+    const body = await response.json();
+    const resumes: ResumeListItem[] = body?.resumes ?? [];
+    return {
+      kind: "ok",
+      resumes: resumes.filter((resume) => resume.status === "analyzed"),
+    };
+  } catch {
+    return { kind: "error" };
+  }
+}
+
 interface JobDescriptionDetailPageProps {
   params: Promise<{ id: string }>;
 }
@@ -45,7 +79,10 @@ export default async function JobDescriptionDetailPage({
   }
 
   const { id } = await params;
-  const result = await getJobDescription(id);
+  const [result, analyzedResumesResult] = await Promise.all([
+    getJobDescription(id),
+    getAnalyzedResumes(),
+  ]);
 
   if (result.kind === "not_found") {
     notFound();
@@ -128,6 +165,27 @@ export default async function JobDescriptionDetailPage({
         <p className="mt-3 whitespace-pre-wrap text-sm text-fg-muted">
           {jobDescription.description}
         </p>
+      </section>
+
+      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+        <h2 className="text-base font-semibold text-fg">
+          Match against your resume
+        </h2>
+        <div className="mt-4">
+          {analyzedResumesResult.kind === "error" ? (
+            <p
+              role="alert"
+              className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
+            >
+              Couldn&apos;t load your resumes. Please refresh the page.
+            </p>
+          ) : (
+            <MatchFromJobForm
+              jobDescriptionId={jobDescription.id}
+              analyzedResumes={analyzedResumesResult.resumes}
+            />
+          )}
+        </div>
       </section>
     </div>
   );

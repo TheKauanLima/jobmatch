@@ -306,6 +306,21 @@ description.
   other users' resumes against a shared job description, which breaks the privacy
   model even though each individual `matches` row is RLS-protected.
 
+**`GET /api/matches`** (no `resume_id`) — added per the dashboard/UX pass on
+2026-09-10: the caller's own most recent matches **across all** their resumes,
+for the dashboard's "Latest matches" panel.
+- Auth: required. Optional `?limit=` (default 5, max 20).
+- Response `200`: `{ "matches": [ { ...same shape as the `resume_id`-scoped mode,
+  plus "resume": { "id": "...", "file_name": "..." } } ] }` ordered by
+  `created_at desc`. The extra `resume` field exists because, unlike the
+  `resume_id`-scoped mode, the caller doesn't already know which resume each
+  result belongs to.
+- Does **not** reopen the enumeration hole the paragraph above avoids — that hole
+  is specifically a `job_description_id`-only filter (which would expose *other
+  users'* matches against a shared posting). This mode takes no request-supplied
+  filter at all beyond the caller's own session, so it can only ever return rows
+  the caller already owns, exactly like the `resume_id`-scoped mode.
+
 **`GET /api/matches/:id`** — single match detail, owner only.
 - Auth: required. `404` if not found/not owned.
 
@@ -936,3 +951,105 @@ live Supabase project exists, per that file's existing TODO.
 4. Optionally trigger `GET /api/cron/sync-jobs` once by hand (with the
    `Authorization: Bearer <CRON_SECRET>` header) after deploying, rather than
    waiting for the first scheduled run, so the board isn't empty on day one.
+
+---
+
+## 8. UX/quality-of-life pass — 2026-09-10
+
+Done autonomously (per the user's request, without waiting for sign-off) as a
+follow-up to §7, after using a planning pass to survey the actual current code
+(not just this document) for friction points once the job board had real
+volume. **No schema changes in this section** — everything here runs against
+the schema exactly as it stood after §7's migration, so it carries none of
+that migration's "must run before deploy" constraint.
+
+- **Dashboard "Recent matches" was a hardcoded placeholder, not real data.**
+  `app/dashboard/page.tsx` rendered a static "No matches yet" paragraph
+  unconditionally — there was no fetch backing it at all, so a user who'd
+  already run matches was told they had none. Fixed by adding a second mode to
+  `GET /api/matches`: called *without* `resume_id`, it returns the caller's own
+  most recent matches **across all** their resumes (optional `?limit=`,
+  default 5/max 20), via `lib/supabase/queries/matches.ts#listRecentMatchesForUser`
+  — see §2's updated `GET /api/matches` entry for the exact contract and why
+  this doesn't reopen the enumeration hole the `resume_id`-scoped mode's own
+  docs warn against (it takes no request-supplied filter beyond the caller's
+  own session). Each result also joins in a `resume` summary (`id`,
+  `file_name`) via the new `lib/supabase/queries/resumes.ts#getResumesByIds`,
+  since — unlike the `resume_id`-scoped mode — the caller doesn't already know
+  which resume a given result belongs to. Rendered via the new
+  `components/matches/RecentMatchCard.tsx`, linking to `/resumes/[id]`.
+- **No way to start a match from the jobs side.** The only entry point into
+  matching was `RunMatchForm` on `/resumes/[id]`, which lists just the first
+  50 job descriptions with no search — increasingly impractical once §7's
+  ingestion started adding up to ~200 listings/day. Added
+  `components/matches/MatchFromJobForm.tsx`, rendered on `/jobs/[id]`: picks
+  one of the caller's own *analyzed* resumes (filtered client-side from
+  `GET /api/resumes` by `status === "analyzed"`, same proxy
+  `AnalyzeResumeButton` already uses) and calls `POST /api/matches` directly
+  with this job's already-known id. On success, navigates to `/resumes/[id]`
+  for the resume just matched, since that's where `MatchList` renders the
+  result — there's still no standalone match page (§3).
+- **The `RunMatchForm` job picker had no search.** A plain `<select>` over up
+  to 50 titles was fine when job descriptions were sparse; with dozens of
+  similarly-named external listings now in the mix, scanning by eye stopped
+  working. Added a client-side title/company text filter over the
+  already-loaded 50-item snapshot (no new endpoint, no server-side search) —
+  narrows the `<select>`'s options and keeps the selection valid as the filter
+  changes.
+- **No loading skeletons anywhere.** Every route was a Server Component that
+  blocked on its full data fetch with literally nothing shown in the
+  meantime — no `loading.tsx` existed in the whole `app/` tree. Added one per
+  route segment (`app/dashboard`, `app/resumes`, `app/resumes/[id]`,
+  `app/jobs`, `app/jobs/[id]`) built from a new
+  `components/ui/Skeleton.tsx` primitive — Next's App Router wires these in
+  automatically via the route's implicit Suspense boundary, no page-component
+  changes needed.
+- **Silent truncation on `JobDescriptionForm`'s capped fields.** `title`
+  (200 chars) and `description` (20,000 chars) had a `maxLength` and zero
+  on-screen indication — a long pasted posting could be silently cut off with
+  no feedback. Added an `x / max` counter (`CharCount`, local to
+  `JobDescriptionForm.tsx`) that shifts to the `warning`/`danger` tokens near
+  and at the cap. Also switched every `maxLength` in that form from a
+  hardcoded number to the corresponding `JOB_DESCRIPTION_*_MAX_LENGTH`
+  constant from `lib/validation/schemas.ts`, closing a drift risk that
+  existed since the form was first built.
+- **No positive confirmation after submitting a job description.** Success
+  silently cleared the form with no on-screen acknowledgment beyond a new row
+  appearing elsewhere on the page. Added a transient banner using the
+  `success-*` tokens (§6.1 had already earmarked them for "future success
+  states"), auto-dismissed after 4s. **Not** added to `ResumeUploadForm` — see
+  the next item, which gives upload a stronger form of confirmation than a
+  banner ever could.
+- **Upload → analyze → match funnel had an avoidable extra click.**
+  `ResumeUploadForm` used to stay on `/resumes` after a successful upload
+  (`router.refresh()`), requiring the user to then find and click into the new
+  row. Since `POST /api/resumes` already returns the new resume's `id`, the
+  form now navigates straight to `/resumes/[id]` instead — landing on the
+  resume's own page doubles as the "yes, that worked" confirmation. (Its dead
+  `onUploaded` prop, unused by its only caller, was deleted in the same
+  change.) **Deliberately not done:** auto-triggering analysis immediately
+  after upload — that would silently spend one of the user's 20/day Claude
+  "analyze" calls (§5) without an explicit request, which is a product
+  decision, not a pure UX one; flagging rather than silently assuming.
+- **Nav had no mobile collapse.** `components/Nav.tsx` rendered every
+  link/button in one un-wrapping flex row with no breakpoint fallback — a
+  real risk on the phone-width screens this audience actually uses. The page
+  links (plus "Log in") now collapse behind a hamburger button below `sm:`,
+  implemented as a real `<button>` toggling a conditionally-rendered menu
+  (keyboard-accessible: Escape closes it, click-outside closes it, Tab reaches
+  every item) — `ThemeToggle` and the primary auth action (Sign out / Sign
+  up) stay visible outside the collapsed menu at every width.
+- **Landing page had no on-page CTA.** `app/page.tsx` only ever offered
+  Sign up/Log in via the header nav. Added both as inline buttons/links on
+  the page itself.
+
+### 8.1 Verification note
+Backend/logic changes in this pass are covered by unit tests (query-layer
+privacy-boundary tests for `listRecentMatchesForUser`/`getResumesByIds`, route
+tests for both `GET /api/matches` modes); `tsc`, `eslint`, and `next build`
+all pass. The new/changed UI itself (loading skeletons, the mobile nav menu,
+the two match-entry-point forms) was **not** verified in an actual browser —
+this repo has no browser-automation tooling available in the environment this
+work was done in, and the live Supabase project's real user accounts weren't
+available to sign in as. Treat the visual/interaction result as reviewed-in-code
+but not click-tested; a quick manual pass after deploying is worth doing.

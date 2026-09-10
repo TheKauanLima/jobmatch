@@ -1,10 +1,46 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { JOB_DESCRIPTION_LEVELS } from "@/lib/validation/schemas";
+import {
+  JOB_DESCRIPTION_COMPANY_MAX_LENGTH,
+  JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH,
+  JOB_DESCRIPTION_LEVELS,
+  JOB_DESCRIPTION_LOCATION_MAX_LENGTH,
+  JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH,
+  JOB_DESCRIPTION_TITLE_MAX_LENGTH,
+} from "@/lib/validation/schemas";
+
+const SUCCESS_MESSAGE_DURATION_MS = 4000;
+
+/**
+ * `x / max` counter for a length-capped field, colored via the shared
+ * success/warning/danger tokens as the value nears/hits the cap — added per
+ * the 2026-09-10 UX pass since `title`/`description` were previously capped
+ * with a silent `maxLength` and no on-screen indication, so a pasted value
+ * over the limit was truncated with zero feedback.
+ */
+function CharCount({ value, max }: { value: string; max: number }) {
+  const remaining = max - value.length;
+  const atCap = remaining <= 0;
+  const nearCap = !atCap && remaining <= Math.max(1, Math.floor(max * 0.05));
+
+  return (
+    <p
+      className={`text-right text-xs ${
+        atCap
+          ? "text-danger-fg"
+          : nearCap
+            ? "text-warning-fg"
+            : "text-fg-subtle"
+      }`}
+    >
+      {value.length.toLocaleString()} / {max.toLocaleString()}
+    </p>
+  );
+}
 
 /**
  * Submits a job description to `POST /api/job-descriptions` (see
@@ -33,10 +69,21 @@ export function JobDescriptionForm() {
   const [level, setLevel] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showSuccess, setShowSuccess] = useState(false);
+  const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (successTimeoutRef.current) {
+        clearTimeout(successTimeoutRef.current);
+      }
+    };
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
+    setShowSuccess(false);
 
     if (!title.trim()) {
       setError("Title is required.");
@@ -77,6 +124,15 @@ export function JobDescriptionForm() {
       setLocation("");
       setLevel("");
       router.refresh();
+
+      setShowSuccess(true);
+      if (successTimeoutRef.current) {
+        clearTimeout(successTimeoutRef.current);
+      }
+      successTimeoutRef.current = setTimeout(
+        () => setShowSuccess(false),
+        SUCCESS_MESSAGE_DURATION_MS,
+      );
     } catch {
       setError(
         "Something went wrong submitting this job description. Please try again.",
@@ -102,16 +158,19 @@ export function JobDescriptionForm() {
         </p>
       </div>
 
-      <Input
-        id="job-title"
-        label="Title"
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder="e.g. Senior Backend Engineer"
-        maxLength={200}
-        required
-        disabled={submitting}
-      />
+      <div>
+        <Input
+          id="job-title"
+          label="Title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="e.g. Senior Backend Engineer"
+          maxLength={JOB_DESCRIPTION_TITLE_MAX_LENGTH}
+          required
+          disabled={submitting}
+        />
+        <CharCount value={title} max={JOB_DESCRIPTION_TITLE_MAX_LENGTH} />
+      </div>
 
       <Input
         id="job-company"
@@ -119,7 +178,7 @@ export function JobDescriptionForm() {
         value={company}
         onChange={(e) => setCompany(e.target.value)}
         placeholder="e.g. Acme Corp"
-        maxLength={200}
+        maxLength={JOB_DESCRIPTION_COMPANY_MAX_LENGTH}
         disabled={submitting}
       />
 
@@ -154,7 +213,7 @@ export function JobDescriptionForm() {
             value={location}
             onChange={(e) => setLocation(e.target.value)}
             placeholder="e.g. Remote, or New York, NY"
-            maxLength={200}
+            maxLength={JOB_DESCRIPTION_LOCATION_MAX_LENGTH}
             disabled={submitting}
           />
         </div>
@@ -173,10 +232,14 @@ export function JobDescriptionForm() {
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Paste the full job description here."
           rows={8}
-          maxLength={20000}
+          maxLength={JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH}
           required
           disabled={submitting}
           className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-disabled focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
+        />
+        <CharCount
+          value={description}
+          max={JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH}
         />
       </div>
 
@@ -187,7 +250,7 @@ export function JobDescriptionForm() {
         value={sourceUrl}
         onChange={(e) => setSourceUrl(e.target.value)}
         placeholder="https://example.com/careers/123"
-        maxLength={2048}
+        maxLength={JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH}
         disabled={submitting}
       />
 
@@ -197,6 +260,12 @@ export function JobDescriptionForm() {
           className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
         >
           {error}
+        </p>
+      )}
+
+      {showSuccess && (
+        <p className="rounded-md border border-success-border bg-success-bg px-3 py-2 text-sm text-success-fg">
+          Job description submitted.
         </p>
       )}
 

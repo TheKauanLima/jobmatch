@@ -32,6 +32,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/types/database";
 import type { MatchResult } from "@/lib/claude/parse";
 import { getJobDescriptionById, getJobDescriptionsByIds } from "@/lib/supabase/queries/jobDescriptions";
+import { getResumesByIds } from "@/lib/supabase/queries/resumes";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -62,6 +63,22 @@ export type MatchWithJobDescription = MatchRow & {
 function fallbackJobDescriptionSummary(jobDescriptionId: string): MatchJobDescriptionSummary {
   return { id: jobDescriptionId, title: "(job description unavailable)", company: null };
 }
+
+export type MatchResumeSummary = { id: string; file_name: string };
+
+/** Fallback summary attached if a match's resume is unexpectedly missing (see module docstring). */
+function fallbackResumeSummary(resumeId: string): MatchResumeSummary {
+  return { id: resumeId, file_name: "(resume unavailable)" };
+}
+
+export type RecentMatchWithContext = MatchRow & {
+  job_description: MatchJobDescriptionSummary;
+  resume: MatchResumeSummary;
+};
+
+/** Default/maximum result count for `listRecentMatchesForUser`. */
+export const RECENT_MATCHES_DEFAULT_LIMIT = 5;
+export const RECENT_MATCHES_MAX_LIMIT = 20;
 
 /**
  * Lists the caller's own matches for a single resume, scoped by both
@@ -106,6 +123,71 @@ export async function listMatchesForResume(
       job_description: jd
         ? { id: jd.id, title: jd.title, company: jd.company }
         : fallbackJobDescriptionSummary(row.job_description_id),
+    };
+  });
+}
+
+/**
+ * Lists the caller's own most recent matches **across all of their
+ * resumes**, ordered by `created_at desc`, joined with both a
+ * `job_description` and a `resume` summary. Used by `GET /api/matches` when
+ * called *without* `resume_id` (see that route's docstring) to power the
+ * dashboard's "Latest matches" panel.
+ *
+ * This is safe in the way `listMatchesForResume`'s `resume_id`-scoped
+ * listing already is, and does NOT reopen the enumeration hole
+ * docs/ARCHITECTURE.md §2 deliberately avoids: that hole is specifically a
+ * `job_description_id`-only mode with no `resume_id`, which would let a
+ * caller ask "who else matched against this shared job posting" and learn
+ * about *other users'* match results. This function takes no caller-supplied
+ * filter at all beyond `userId` (never taken from a request param — always
+ * `requireSession()`'s own `user.id`) — it can only ever return the caller's
+ * own rows, exactly like every other function in this module.
+ */
+export async function listRecentMatchesForUser(
+  supabase: Client,
+  userId: string,
+  limit: number,
+): Promise<RecentMatchWithContext[]> {
+  const { data, error } = await supabase
+    .from("matches")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    throw new MatchQueryError(
+      `Failed to list recent matches for user ${userId}: ${error.message}`,
+      error,
+    );
+  }
+
+  const rows = data ?? [];
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const jobDescriptionIds = Array.from(new Set(rows.map((row) => row.job_description_id)));
+  const resumeIds = Array.from(new Set(rows.map((row) => row.resume_id)));
+  const [jobDescriptions, resumes] = await Promise.all([
+    getJobDescriptionsByIds(supabase, jobDescriptionIds),
+    getResumesByIds(supabase, userId, resumeIds),
+  ]);
+  const jobDescriptionById = new Map(jobDescriptions.map((jd) => [jd.id, jd]));
+  const resumeById = new Map(resumes.map((r) => [r.id, r]));
+
+  return rows.map((row) => {
+    const jd = jobDescriptionById.get(row.job_description_id);
+    const resume = resumeById.get(row.resume_id);
+    return {
+      ...row,
+      job_description: jd
+        ? { id: jd.id, title: jd.title, company: jd.company }
+        : fallbackJobDescriptionSummary(row.job_description_id),
+      resume: resume
+        ? { id: resume.id, file_name: resume.file_name }
+        : fallbackResumeSummary(row.resume_id),
     };
   });
 }

@@ -4,7 +4,9 @@ import {
   createMatch,
   getMatchById,
   listMatchesForResume,
+  listRecentMatchesForUser,
   MatchQueryError,
+  RECENT_MATCHES_DEFAULT_LIMIT,
 } from "@/lib/supabase/queries/matches";
 
 /**
@@ -30,6 +32,7 @@ function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
   builder.eq = record("eq");
   builder.in = record("in");
   builder.order = record("order");
+  builder.limit = record("limit");
   builder.maybeSingle = vi.fn().mockResolvedValue(resolvedValue);
   builder.single = vi.fn().mockResolvedValue(resolvedValue);
   builder.then = (resolve: (v: unknown) => unknown) =>
@@ -133,6 +136,116 @@ describe("listMatchesForResume — privacy boundary", () => {
     await expect(listMatchesForResume(client, "user-1", "resume-1")).rejects.toThrow(
       MatchQueryError,
     );
+  });
+});
+
+const RESUME_ROW = {
+  id: "resume-1",
+  user_id: "user-1",
+  storage_path: "user-1/resume-1.pdf",
+  file_name: "resume.pdf",
+  file_type: "application/pdf",
+  file_size_bytes: 1234,
+  extracted_text: "text",
+  status: "analyzed",
+  created_at: "2026-01-01T00:00:00.000Z",
+  updated_at: "2026-01-01T00:00:00.000Z",
+};
+
+describe("listRecentMatchesForUser — privacy boundary", () => {
+  it("scopes the query by user_id only (no other request-supplied filter — see the function's docstring)", async () => {
+    const { builder: matchesBuilder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeMultiTableClient({ matches: matchesBuilder });
+
+    await listRecentMatchesForUser(client, "user-1", RECENT_MATCHES_DEFAULT_LIMIT);
+
+    expect(calls).toContainEqual({ method: "eq", args: ["user_id", "user-1"] });
+    expect(calls.filter((c) => c.method === "eq")).toHaveLength(1);
+    expect(calls).toContainEqual({ method: "limit", args: [RECENT_MATCHES_DEFAULT_LIMIT] });
+  });
+
+  it("returns [] without querying job_descriptions/resumes when there are no matches", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({ data: [], error: null });
+    const jobDescriptionsFrom = vi.fn();
+    const resumesFrom = vi.fn();
+    const client = makeMultiTableClient({
+      matches: matchesBuilder,
+      job_descriptions: jobDescriptionsFrom,
+      resumes: resumesFrom,
+    });
+
+    const result = await listRecentMatchesForUser(client, "user-1", 5);
+
+    expect(result).toEqual([]);
+    expect(jobDescriptionsFrom).not.toHaveBeenCalled();
+    expect(resumesFrom).not.toHaveBeenCalled();
+  });
+
+  it("joins in both job_description and resume summaries for each match", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({ data: [MATCH_ROW], error: null });
+    const { builder: jdBuilder } = makeQueryBuilder({ data: [JOB_DESCRIPTION_ROW], error: null });
+    const { builder: resumesBuilder } = makeQueryBuilder({ data: [RESUME_ROW], error: null });
+    const client = makeMultiTableClient({
+      matches: matchesBuilder,
+      job_descriptions: jdBuilder,
+      resumes: resumesBuilder,
+    });
+
+    const result = await listRecentMatchesForUser(client, "user-1", 5);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].job_description).toEqual({
+      id: "jd-1",
+      title: "Backend Engineer",
+      company: "Acme",
+    });
+    expect(result[0].resume).toEqual({ id: "resume-1", file_name: "resume.pdf" });
+  });
+
+  it("scopes the resume join by the caller's own user_id too (never another user's resume)", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({ data: [MATCH_ROW], error: null });
+    const { builder: jdBuilder } = makeQueryBuilder({ data: [JOB_DESCRIPTION_ROW], error: null });
+    const { builder: resumesBuilder, calls: resumeCalls } = makeQueryBuilder({
+      data: [RESUME_ROW],
+      error: null,
+    });
+    const client = makeMultiTableClient({
+      matches: matchesBuilder,
+      job_descriptions: jdBuilder,
+      resumes: resumesBuilder,
+    });
+
+    await listRecentMatchesForUser(client, "user-1", 5);
+
+    expect(resumeCalls).toContainEqual({ method: "eq", args: ["user_id", "user-1"] });
+  });
+
+  it("falls back to a placeholder resume summary if unexpectedly missing", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({ data: [MATCH_ROW], error: null });
+    const { builder: jdBuilder } = makeQueryBuilder({ data: [JOB_DESCRIPTION_ROW], error: null });
+    const { builder: resumesBuilder } = makeQueryBuilder({ data: [], error: null });
+    const client = makeMultiTableClient({
+      matches: matchesBuilder,
+      job_descriptions: jdBuilder,
+      resumes: resumesBuilder,
+    });
+
+    const result = await listRecentMatchesForUser(client, "user-1", 5);
+
+    expect(result[0].resume.id).toBe("resume-1");
+    expect(result[0].resume.file_name).toMatch(/unavailable/i);
+  });
+
+  it("throws MatchQueryError on a Postgres error", async () => {
+    const { builder: matchesBuilder } = makeQueryBuilder({
+      data: null,
+      error: { message: "connection reset" },
+    });
+    const client = makeMultiTableClient({ matches: matchesBuilder });
+
+    await expect(
+      listRecentMatchesForUser(client, "user-1", 5),
+    ).rejects.toThrow(MatchQueryError);
   });
 });
 

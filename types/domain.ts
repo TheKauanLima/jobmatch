@@ -214,3 +214,26 @@ export function toMatch(row: MatchRow, jobDescription: MatchJobDescriptionSummar
     job_description: jobDescription,
   };
 }
+
+/** The joined resume summary inlined on the cross-resume "recent matches" response (see `toRecentMatch`). */
+export type MatchResumeSummary = { id: string; file_name: string };
+
+/**
+ * Public shape of a match as returned by `GET /api/matches` when called
+ * *without* `resume_id` — the caller's own most recent matches across every
+ * resume (see that route's docstring and
+ * `lib/supabase/queries/matches.ts#listRecentMatchesForUser`). Adds `resume`
+ * on top of `Match`'s shape specifically because, unlike the `resume_id`-
+ * scoped listing, the caller doesn't already know which resume each result
+ * belongs to.
+ */
+export type RecentMatch = Match & { resume: MatchResumeSummary };
+
+/** Shapes a full `matches` DB row plus its joined job description and resume summaries. */
+export function toRecentMatch(
+  row: MatchRow,
+  jobDescription: MatchJobDescriptionSummary,
+  resume: MatchResumeSummary,
+): RecentMatch {
+  return { ...toMatch(row, jobDescription), resume };
+}

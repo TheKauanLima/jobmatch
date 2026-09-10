@@ -7,6 +7,7 @@ const {
   mockGetLatestAnalysis,
   mockGetJobDescriptionById,
   mockListMatchesForResume,
+  mockListRecentMatchesForUser,
   mockCreateMatch,
   mockCheckRateLimit,
   mockMatchResumeToJob,
@@ -18,6 +19,7 @@ const {
   mockGetLatestAnalysis: vi.fn(),
   mockGetJobDescriptionById: vi.fn(),
   mockListMatchesForResume: vi.fn(),
+  mockListRecentMatchesForUser: vi.fn(),
   mockCreateMatch: vi.fn(),
   mockCheckRateLimit: vi.fn(),
   mockMatchResumeToJob: vi.fn(),
@@ -63,6 +65,7 @@ vi.mock("@/lib/supabase/queries/matches", async () => {
   return {
     ...actual,
     listMatchesForResume: mockListMatchesForResume,
+    listRecentMatchesForUser: mockListRecentMatchesForUser,
     createMatch: mockCreateMatch,
   };
 });
@@ -173,13 +176,6 @@ describe("GET /api/matches — privacy boundary", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns 400 when resume_id is missing (no listing mode without it)", async () => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-    const res = await GET(getRequest(""));
-    expect(res.status).toBe(400);
-    expect(mockListMatchesForResume).not.toHaveBeenCalled();
-  });
-
   it("returns 404 when the resume doesn't exist or isn't owned by the caller — never leaking other users' match data", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(null);
@@ -219,6 +215,69 @@ describe("GET /api/matches — privacy boundary", () => {
     mockListMatchesForResume.mockRejectedValue(new Error("db down"));
 
     const res = await GET(getRequest(`?resume_id=${RESUME_UUID}`));
+    expect(res.status).toBe(500);
+  });
+});
+
+describe("GET /api/matches (no resume_id) — cross-resume recent matches", () => {
+  it("returns 401 when unauthenticated", async () => {
+    mockRequireSession.mockRejectedValue(new UnauthorizedError());
+    const res = await GET(getRequest(""));
+    expect(res.status).toBe(401);
+  });
+
+  it("lists the caller's recent matches across resumes, with job_description and resume inlined", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListRecentMatchesForUser.mockResolvedValue([
+      {
+        ...matchRow,
+        job_description: { id: JOB_DESCRIPTION_UUID, title: "Backend Engineer", company: "Acme" },
+        resume: { id: RESUME_UUID, file_name: "resume.pdf" },
+      },
+    ]);
+
+    const res = await GET(getRequest(""));
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.matches).toHaveLength(1);
+    expect(body.matches[0].resume).toEqual({ id: RESUME_UUID, file_name: "resume.pdf" });
+    expect(mockGetResumeById).not.toHaveBeenCalled();
+    expect(mockListMatchesForResume).not.toHaveBeenCalled();
+  });
+
+  it("defaults to RECENT_MATCHES_DEFAULT_LIMIT and clamps a huge limit to RECENT_MATCHES_MAX_LIMIT", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListRecentMatchesForUser.mockResolvedValue([]);
+
+    await GET(getRequest(""));
+    expect(mockListRecentMatchesForUser).toHaveBeenCalledWith(
+      expect.anything(),
+      "user-1",
+      5,
+    );
+
+    await GET(getRequest("?limit=9999"));
+    expect(mockListRecentMatchesForUser).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "user-1",
+      20,
+    );
+  });
+
+  it("returns 400 for a non-positive-integer limit", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+
+    const res = await GET(getRequest("?limit=abc"));
+    expect(res.status).toBe(400);
+    expect(mockListRecentMatchesForUser).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 (not a crash) when the query layer throws", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListRecentMatchesForUser.mockRejectedValue(new Error("db down"));
+
+    const res = await GET(getRequest(""));
     expect(res.status).toBe(500);
   });
 });

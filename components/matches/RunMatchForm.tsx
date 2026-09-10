@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
+import { Input } from "@/components/ui/Input";
 import type { JobDescription } from "@/types/domain";
 
 interface RunMatchFormProps {
@@ -33,9 +34,13 @@ const NETWORK_ERROR_MESSAGE =
  * defensively.
  *
  * `jobDescriptions` is a first-page snapshot (see `RunMatchForm`'s caller —
- * `GET /api/job-descriptions?limit=50`, no search UI for v1) fetched
- * server-side and passed as props; read directly, no local copy, since this
- * list is never mutated from within the form itself.
+ * `GET /api/job-descriptions?limit=50`) fetched server-side and passed as
+ * props; read directly, no local copy, since this list is never mutated from
+ * within the form itself. A client-side title/company text filter narrows
+ * this fixed 50-item snapshot (added per the 2026-09-10 UX pass, once the
+ * board's real volume from external ingestion — docs/ARCHITECTURE.md §7 —
+ * made scanning a plain `<select>` by eye impractical); it is NOT a
+ * server-side search over the full board, which stays out of scope here.
  *
  * This call is synchronous server-side and can take several seconds (same
  * pattern as `AnalyzeResumeButton`), so the button shows an explicit
@@ -45,14 +50,34 @@ const NETWORK_ERROR_MESSAGE =
  */
 export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
   const router = useRouter();
+  const [filter, setFilter] = useState("");
   const [jobDescriptionId, setJobDescriptionId] = useState(
     jobDescriptions[0]?.id ?? "",
   );
   const [matching, setMatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const filteredJobDescriptions = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    if (!needle) return jobDescriptions;
+    return jobDescriptions.filter((jd) =>
+      `${jd.title} ${jd.company ?? ""}`.toLowerCase().includes(needle),
+    );
+  }, [jobDescriptions, filter]);
+
+  // Keep the selection valid as the filter narrows/widens the options —
+  // falls back to the first still-visible option rather than leaving a
+  // filtered-out id selected (which would silently match against a job the
+  // dropdown no longer shows).
+  const selectedStillVisible = filteredJobDescriptions.some(
+    (jd) => jd.id === jobDescriptionId,
+  );
+  const effectiveJobDescriptionId = selectedStillVisible
+    ? jobDescriptionId
+    : (filteredJobDescriptions[0]?.id ?? "");
+
   async function handleMatch() {
-    if (!jobDescriptionId) return;
+    if (!effectiveJobDescriptionId) return;
 
     setError(null);
     setMatching(true);
@@ -62,7 +87,7 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           resume_id: resumeId,
-          job_description_id: jobDescriptionId,
+          job_description_id: effectiveJobDescriptionId,
         }),
       });
 
@@ -104,6 +129,15 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
 
   return (
     <div className="flex flex-col gap-3">
+      <Input
+        id="match-job-filter"
+        label="Filter by title or company"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        placeholder="e.g. intern, or a company name"
+        disabled={matching}
+      />
+
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
         <div className="flex flex-1 flex-col gap-1.5">
           <label
@@ -112,25 +146,31 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
           >
             Job description
           </label>
-          <select
-            id="match-job-description"
-            value={jobDescriptionId}
-            onChange={(event) => setJobDescriptionId(event.target.value)}
-            disabled={matching}
-            className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
-          >
-            {jobDescriptions.map((jobDescription) => (
-              <option key={jobDescription.id} value={jobDescription.id}>
-                {jobDescription.title}
-                {jobDescription.company ? ` — ${jobDescription.company}` : ""}
-              </option>
-            ))}
-          </select>
+          {filteredJobDescriptions.length === 0 ? (
+            <p className="text-sm text-fg-subtle">
+              No job descriptions match &ldquo;{filter}&rdquo;.
+            </p>
+          ) : (
+            <select
+              id="match-job-description"
+              value={effectiveJobDescriptionId}
+              onChange={(event) => setJobDescriptionId(event.target.value)}
+              disabled={matching}
+              className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
+            >
+              {filteredJobDescriptions.map((jobDescription) => (
+                <option key={jobDescription.id} value={jobDescription.id}>
+                  {jobDescription.title}
+                  {jobDescription.company ? ` — ${jobDescription.company}` : ""}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <Button
           type="button"
           onClick={handleMatch}
-          disabled={matching || !jobDescriptionId}
+          disabled={matching || !effectiveJobDescriptionId}
           className="shrink-0"
         >
           {matching ? "Matching…" : "Match"}

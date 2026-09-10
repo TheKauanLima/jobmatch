@@ -4,10 +4,12 @@ import { getSession } from "@/lib/auth/session";
 import { serverFetch } from "@/lib/api/serverFetch";
 import { ResumeCard } from "@/components/resumes/ResumeCard";
 import { JobDescriptionCard } from "@/components/jobs/JobDescriptionCard";
-import type { JobDescription, ResumeListItem } from "@/types/domain";
+import { RecentMatchCard } from "@/components/matches/RecentMatchCard";
+import type { JobDescription, RecentMatch, ResumeListItem } from "@/types/domain";
 
 const RECENT_RESUMES_LIMIT = 3;
 const LATEST_JOB_DESCRIPTIONS_LIMIT = 3;
+const RECENT_MATCHES_LIMIT = 3;
 
 async function getRecentResumes(): Promise<{
   resumes: ResumeListItem[];
@@ -56,6 +58,33 @@ async function getLatestJobDescriptions(): Promise<{
   }
 }
 
+/**
+ * Fetches the caller's own most recent matches across all resumes via
+ * `GET /api/matches` (no `resume_id` — see that route's docstring and
+ * docs/ARCHITECTURE.md §2) for the dashboard's "Latest matches" panel. This
+ * replaced a previously hardcoded "No matches yet" placeholder that never
+ * reflected real data regardless of whether the user actually had matches.
+ */
+async function getRecentMatches(): Promise<{
+  matches: RecentMatch[];
+  error: string | null;
+}> {
+  try {
+    const response = await serverFetch(
+      `/api/matches?limit=${RECENT_MATCHES_LIMIT}`,
+    );
+
+    if (!response.ok) {
+      return { matches: [], error: "Couldn't load your matches." };
+    }
+
+    const body = await response.json();
+    return { matches: body.matches ?? [], error: null };
+  } catch {
+    return { matches: [], error: "Couldn't load your matches." };
+  }
+}
+
 export default async function DashboardPage() {
   const session = await getSession();
 
@@ -64,9 +93,15 @@ export default async function DashboardPage() {
   }
 
   const { user } = session;
-  const { resumes, error } = await getRecentResumes();
-  const { jobDescriptions, error: jobDescriptionsError } =
-    await getLatestJobDescriptions();
+  const [
+    { resumes, error },
+    { jobDescriptions, error: jobDescriptionsError },
+    { matches, error: matchesError },
+  ] = await Promise.all([
+    getRecentResumes(),
+    getLatestJobDescriptions(),
+    getRecentMatches(),
+  ]);
 
   return (
     <div className="mx-auto w-full max-w-5xl flex-1 px-6 py-12">
@@ -124,10 +159,26 @@ export default async function DashboardPage() {
           <h2 className="text-base font-semibold text-fg">
             Recent matches
           </h2>
-          <p className="mt-2 text-sm text-fg-muted">
-            No matches yet. Once you&apos;ve uploaded and analyzed a resume,
-            match it against a job description to see how it stacks up.
-          </p>
+
+          {matchesError ? (
+            <p
+              role="alert"
+              className="mt-3 rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
+            >
+              {matchesError}
+            </p>
+          ) : matches.length === 0 ? (
+            <p className="mt-2 text-sm text-fg-muted">
+              No matches yet. Once you&apos;ve uploaded and analyzed a resume,
+              match it against a job description to see how it stacks up.
+            </p>
+          ) : (
+            <div className="mt-4 flex flex-col gap-3">
+              {matches.map((match) => (
+                <RecentMatchCard key={match.id} match={match} />
+              ))}
+            </div>
+          )}
         </section>
       </div>
 
