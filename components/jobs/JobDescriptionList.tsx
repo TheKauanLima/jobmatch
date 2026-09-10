@@ -8,6 +8,15 @@ import { Button } from "@/components/ui/Button";
 interface JobDescriptionListProps {
   initialJobDescriptions: JobDescription[];
   initialNextCursor: string | null;
+  /**
+   * Level filter currently applied (per docs/ARCHITECTURE.md §7), or `null`
+   * for none. Only used to keep "Load more" fetches on the same filter as
+   * the initial page — the filter UI itself lives in `app/jobs/page.tsx`
+   * (plain navigation links), which remounts this component (via a `key`
+   * keyed on the level) whenever the filter changes, so this component
+   * itself never needs to change the filter mid-lifetime.
+   */
+  level: string | null;
 }
 
 /**
@@ -41,6 +50,7 @@ interface JobDescriptionListProps {
 export function JobDescriptionList({
   initialJobDescriptions,
   initialNextCursor,
+  level,
 }: JobDescriptionListProps) {
   const [additionalJobDescriptions, setAdditionalJobDescriptions] = useState<
     JobDescription[]
@@ -71,9 +81,11 @@ export function JobDescriptionList({
     setError(null);
     setLoadingMore(true);
     try {
-      const response = await fetch(
-        `/api/job-descriptions?cursor=${encodeURIComponent(nextCursor)}`,
-      );
+      const params = new URLSearchParams({ cursor: nextCursor });
+      if (level) {
+        params.set("level", level);
+      }
+      const response = await fetch(`/api/job-descriptions?${params}`);
 
       if (!response.ok) {
         setError("Couldn't load more job descriptions. Please try again.");

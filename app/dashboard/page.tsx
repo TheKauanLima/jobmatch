@@ -3,9 +3,11 @@ import Link from "next/link";
 import { getSession } from "@/lib/auth/session";
 import { serverFetch } from "@/lib/api/serverFetch";
 import { ResumeCard } from "@/components/resumes/ResumeCard";
-import type { ResumeListItem } from "@/types/domain";
+import { JobDescriptionCard } from "@/components/jobs/JobDescriptionCard";
+import type { JobDescription, ResumeListItem } from "@/types/domain";
 
 const RECENT_RESUMES_LIMIT = 3;
+const LATEST_JOB_DESCRIPTIONS_LIMIT = 3;
 
 async function getRecentResumes(): Promise<{
   resumes: ResumeListItem[];
@@ -26,6 +28,34 @@ async function getRecentResumes(): Promise<{
   }
 }
 
+/**
+ * Fetches the newest few shared job listings for the dashboard teaser — per
+ * docs/ARCHITECTURE.md §7, this is the most direct way for a returning user
+ * to see that the board now has real, continually-refreshed content (a mix
+ * of user-submitted and externally-ingested rows, most-recent-first via the
+ * default `GET /api/job-descriptions` ordering), not just an empty "browse
+ * jobs" link.
+ */
+async function getLatestJobDescriptions(): Promise<{
+  jobDescriptions: JobDescription[];
+  error: string | null;
+}> {
+  try {
+    const response = await serverFetch(
+      `/api/job-descriptions?limit=${LATEST_JOB_DESCRIPTIONS_LIMIT}`,
+    );
+
+    if (!response.ok) {
+      return { jobDescriptions: [], error: "Couldn't load job listings." };
+    }
+
+    const body = await response.json();
+    return { jobDescriptions: body.job_descriptions ?? [], error: null };
+  } catch {
+    return { jobDescriptions: [], error: "Couldn't load job listings." };
+  }
+}
+
 export default async function DashboardPage() {
   const session = await getSession();
 
@@ -35,6 +65,8 @@ export default async function DashboardPage() {
 
   const { user } = session;
   const { resumes, error } = await getRecentResumes();
+  const { jobDescriptions, error: jobDescriptionsError } =
+    await getLatestJobDescriptions();
 
   return (
     <div className="mx-auto w-full max-w-5xl flex-1 px-6 py-12">
@@ -98,6 +130,42 @@ export default async function DashboardPage() {
           </p>
         </section>
       </div>
+
+      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="text-base font-semibold text-fg">
+            Latest job listings
+          </h2>
+          <Link
+            href="/jobs"
+            className="text-sm font-medium text-fg-muted hover:text-fg"
+          >
+            View all
+          </Link>
+        </div>
+
+        {jobDescriptionsError ? (
+          <p
+            role="alert"
+            className="mt-3 rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
+          >
+            {jobDescriptionsError}
+          </p>
+        ) : jobDescriptions.length === 0 ? (
+          <p className="mt-2 text-sm text-fg-muted">
+            No job listings yet. Check back soon, or submit one yourself.
+          </p>
+        ) : (
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            {jobDescriptions.map((jobDescription) => (
+              <JobDescriptionCard
+                key={jobDescription.id}
+                jobDescription={jobDescription}
+              />
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }

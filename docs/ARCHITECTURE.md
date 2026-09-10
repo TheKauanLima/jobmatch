@@ -241,9 +241,14 @@ matches via cascade).
 
 **`POST /api/job-descriptions`** — submit a job description.
 - Auth: required (any authenticated user — shared data).
-- Request: `{ "title": string, "company"?: string, "description": string, "source_url"?: string }`
+- Request: `{ "title": string, "company"?: string, "description": string, "source_url"?: string, "location"?: string, "level"?: "Internship" | "Entry Level" | "Mid Level" | "Senior Level" | "Management" }`
+  (`location`/`level` added per §7 — `level` is restricted to the fixed
+  `JOB_DESCRIPTION_LEVELS` set for a manual submission, unlike the free-text
+  `level` an externally-ingested row can carry, so the `/jobs` filter doesn't
+  fragment into near-duplicate values.)
 - Response `201`: the created `job_descriptions` row.
-- Errors: `400` validation failure (empty title/description).
+- Errors: `400` validation failure (empty title/description, or `level` outside
+  the fixed set).
 
 **`GET /api/job-descriptions`** — list shared job descriptions.
 - Auth: required.
@@ -755,3 +760,179 @@ ever sync across devices (would require a `user_preferences` table or a column o
 future profile table) versus staying a per-browser `localStorage` setting as designed
 here. Per-browser is the right default for v1 (no schema change, no new endpoint) —
 flagging only so it isn't silently assumed to be account-level later.
+
+---
+
+## 7. External job ingestion (The Muse) — 2026-09-10
+
+### Why
+v1 as shipped only populates `job_descriptions` from users manually pasting postings
+in. That's a cold-start problem specifically bad for this product's stated goal (a
+great experience for students finding jobs): a brand-new user opens `/jobs` and finds
+nothing to match their resume against until enough other users have contributed. This
+section adds a scheduled ingestion pipeline that pulls real internship/entry-level
+listings from an external source so the board has real content from day one, on top
+of (not replacing) user submissions.
+
+**This work was done autonomously, without the user available to confirm the design
+choices below** (the user explicitly asked for this and said not to wait for
+sign-off). Flagging that here in place of the usual "open questions" section — treat
+the decisions below as the working v1 answer, revisit any of them if they turn out
+wrong in practice.
+
+### 7.1 Data source: The Muse public Jobs API
+Chosen over alternatives considered (Adzuna, USAJOBS, RemoteOK, Greenhouse
+per-company boards):
+- **No signup/API key required for read access.** Adzuna requires registering for an
+  `app_id`/`app_key` pair through a web signup flow — not something completable
+  without a human. The Muse's public endpoint
+  (`https://www.themuse.com/api/public/jobs`) works unauthenticated at 500
+  requests/hour (confirmed live against the API at the time this was written), which
+  is far more than this integration needs.
+- **Has an explicit level taxonomy including "Internship" and "Entry Level".** This
+  lets ingestion target exactly the student-relevant segment without building a
+  classifier — see `THEMUSE_SYNC_LEVELS` in `lib/jobs/themuse.ts`.
+- **Reputable, general-purpose job board** (not a scraped/unofficial source), with a
+  published terms-of-use document
+  (`https://www.themuse.com/developers/api/v2/terms`) whose obligations are
+  compatible with this app's existing shape: content must "link back to The Muse
+  Website" — satisfied by reusing the existing `source_url` field (already rendered
+  as "View original posting" on the job detail page, per §2) — and the API must not
+  be used to "replicate products or services offered by The Muse" — satisfied by
+  JobMatch functioning as a resume-matching tool that surfaces a mix of listings
+  (including user-submitted ones), not a Muse-branded job-search clone.
+
+### 7.2 Schema changes
+`supabase/migrations/0004_external_job_listings.sql` adds five nullable/defaulted
+columns to `job_descriptions` (no change to existing rows or the four
+already-documented tables' relationships):
+
+| column | type | notes |
+|---|---|---|
+| `source` | text not null default `'user'` | `'user' \| 'themuse'` |
+| `external_id` | text | the source's own id for the listing; null for `source='user'` |
+| `level` | text | e.g. `'Internship'`, `'Entry Level'` — free text, source's vocabulary, not an enum |
+| `location` | text | free text, e.g. `'New York, NY'` or `'Remote'` |
+| `posted_at` | timestamptz | when the source says the listing was originally posted, distinct from `created_at` (when JobMatch ingested it) |
+
+A unique constraint on `(source, external_id)` is the upsert/dedup key — re-running
+ingestion for an already-seen listing updates it in place instead of duplicating it.
+Postgres treats every `NULL` as distinct in a unique constraint, so this coexists
+fine with the many `('user', NULL)` rows from manual submissions. A partial index on
+`level where level is not null` supports the new list filter (§7.4) without a full
+scan. No RLS policy changes: reads already go through
+`job_descriptions_select_all_authenticated` (any authenticated user, regardless of
+source), and ingestion writes bypass RLS entirely via the service-role client (§7.3)
+rather than the per-user `job_descriptions_insert_own` policy, which a cron-triggered
+write with no `auth.uid()` could never satisfy anyway.
+
+`types/database.ts` (the hand-authored stand-in for `supabase gen types typescript`,
+per its own header comment) was updated to match by hand — regenerate for real once a
+live Supabase project exists, per that file's existing TODO.
+
+### 7.3 Ingestion pipeline
+- **`lib/supabase/admin.ts`** (new) — the service-role Supabase client that §3's
+  folder-structure table already reserved a slot for ("future maintenance
+  scripts"). This is that maintenance script's first real use.
+- **`lib/jobs/themuse.ts`** — thin fetch client for The Muse's public jobs endpoint,
+  an HTML-to-plain-text stripper for its rich-text `contents` field (a small
+  regex-based stripper, not a new parser dependency — the input is a closed,
+  well-formed source, not arbitrary hostile HTML), and a mapper from Muse's raw job
+  shape to the upsert shape below. Field lengths are clamped to the exact same
+  `JOB_DESCRIPTION_*_MAX_LENGTH` constants `lib/validation/schemas.ts` already
+  enforces for user submissions, so an external listing can never produce a row
+  wider than the rest of the app assumes (in particular, the Claude matching
+  prompt's per-call token-cost ceiling, per §5's original injection-hardening
+  rationale — this also means the prompt-injection hardening already required of
+  `lib/claude/prompts/*` for job-description text applies unchanged to
+  externally-sourced descriptions, which are just as "untrusted, freeform text
+  from outside our control" as a user submission).
+- **`lib/supabase/queries/jobDescriptions.ts`#`upsertExternalJobDescriptions`** —
+  batched (50 rows/request) upsert keyed on `(source, external_id)`, called only
+  with the admin client.
+- **`lib/jobs/sync.ts`#`syncThemuseJobs`** — orchestrates one full pass: for each
+  level in `THEMUSE_SYNC_LEVELS` (`Internship`, `Entry Level`), paginate up to
+  `MAX_PAGES_PER_LEVEL` (5) pages of 20 results **sorted newest-first**
+  (`sort=publication_date&descending=true` — confirmed against the live API that
+  omitting this returns the same fixed, non-date-ordered sample on every call, which
+  would make a daily cron pointless: it'd re-fetch the same ~200 listings forever
+  instead of accumulating new ones), map, and upsert. A fetch failure on one level
+  doesn't abort the other level's sync, and is reported per-level in the result
+  rather than thrown — a daily cron should self-heal from a transient failure on its
+  next run without needing manual intervention.
+- **`app/api/cron/sync-jobs/route.ts`** — the HTTP trigger. No user session; instead
+  a shared-secret check (`Authorization: Bearer $CRON_SECRET`), **failing closed**
+  (500) if `CRON_SECRET` isn't configured at all, rather than ever treating an unset
+  secret as "no auth required" for an endpoint that writes via the service-role key.
+- **`vercel.json`** (new) — schedules the route once/day (`0 13 * * *`, i.e. 13:00
+  UTC) via Vercel Cron. Vercel Cron sends the `CRON_SECRET` bearer token
+  automatically once that env var is set in the project — see the route's docstring
+  and `.env.local.example`. Deliberately once/day rather than more frequent: at 5
+  pages × 2 levels × 20 results, one run already pulls up to 200 listings (well
+  under The Muse's 500 req/hour cap, using only ~10 requests), and daily is
+  comfortably supported even on Vercel's Hobby tier (worth double-checking against
+  current Vercel plan limits at deploy time — cron availability/frequency by plan
+  tier is a Vercel pricing detail, not an architectural one, and could change). The
+  route works identically if triggered by any other scheduler (e.g. a GitHub Actions
+  cron doing `curl` with the secret) — nothing about it is Vercel-specific beyond
+  `vercel.json` itself, which is intentional in case deployment platform changes.
+
+### 7.4 API / UI changes
+- **`GET /api/job-descriptions`** gains an optional `?level=<level>` query param
+  (exact match, e.g. `Internship`); omitted means no filter. Additive — existing
+  callers without the param are unaffected.
+- **`app/jobs/page.tsx`** gained an "All / Internship / Entry Level" filter control,
+  implemented as plain navigation links to `/jobs?level=...` rather than client
+  state — this re-runs the Server Component with a fresh SSR fetch per filter, and
+  `JobDescriptionList` is remounted via `key={level ?? "all"}` so its "Load more"
+  pagination state (`additionalJobDescriptions`, per that component's existing
+  docstring) never leaks between filters.
+- **`JobDescriptionCard`/job detail page** render `level`/`location` as small tags
+  when present, for either source — `JobDescriptionForm` gained matching optional
+  `location` (free text) and `level` (fixed `JOB_DESCRIPTION_LEVELS` dropdown, not
+  free text — see the `POST /api/job-descriptions` note in §2) fields so a manual
+  submission can be tagged the same way and show up under the same `/jobs` filter
+  pills as externally-ingested listings. The detail page's existing "View original
+  posting" link becomes "Apply on The Muse" specifically for `source='themuse'`
+  rows — still the same `source_url` field and the same external-link pattern, just
+  clearer copy for where it goes.
+- `types/domain.ts`'s `JobDescription` gained `source`/`level`/`location`/
+  `posted_at` (mirrors the new columns); `external_id` is intentionally omitted from
+  the client-facing type (internal dedup detail, same reasoning as `submitted_by`).
+- **`app/dashboard/page.tsx`** gained a third "Latest job listings" panel (newest 3
+  via the existing default `GET /api/job-descriptions` ordering, no new query
+  needed) — the most direct way for a returning user to see the board actually has
+  fresh content now, rather than only discovering that by clicking through to
+  `/jobs`.
+
+### 7.5 Deliberately out of scope for this pass
+- **Only The Muse, only Internship/Entry Level.** Broader coverage (more sources, a
+  wider level range) is a natural follow-up if this source's volume/quality turns
+  out to be thin in practice, but adding it now would be scope creep against the
+  specific problem being solved (an empty board for students). `THEMUSE_SYNC_LEVELS`
+  and `MAX_PAGES_PER_LEVEL` are both small, obvious constants to widen later.
+- **No dedicated UI treatment for stale/expired external listings.** The Muse
+  doesn't expose a "this posting closed" signal in the public API; a listing that's
+  no longer live simply stops being returned by future syncs (so it stops being
+  *updated*) but its existing row and any `matches` referencing it are left alone,
+  consistent with the immutability-of-existing-matches stance already taken for
+  user-submitted job descriptions in §4/§5. Revisit if stale external listings turn
+  out to be a real user complaint.
+- **No changes to Claude cost controls (§5) or per-user rate limits.** Ingestion
+  doesn't call Claude at all — it only populates `job_descriptions`; a user still
+  spends their own 20/day `match` quota (§5) when matching against any listing
+  regardless of its `source`.
+
+### 7.6 What the user needs to do before this runs in production
+1. Set `CRON_SECRET` (any long random string) as an env var in the Vercel project
+   settings — this is the only new secret this feature requires.
+2. Confirm the Vercel project's plan supports the cron schedule in `vercel.json`
+   (daily cron has historically been available even on Hobby, but verify at deploy
+   time since Vercel's plan limits can change).
+3. Run `supabase/migrations/0004_external_job_listings.sql` against the live
+   Supabase project (however the other three migrations get applied — this wasn't
+   specified anywhere in the repo as of this writing, so use whatever migration
+   workflow the rest of the project already uses).
+4. Optionally trigger `GET /api/cron/sync-jobs` once by hand (with the
+   `Authorization: Bearer <CRON_SECRET>` header) after deploying, rather than
+   waiting for the first scheduled run, so the board isn't empty on day one.

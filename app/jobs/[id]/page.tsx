@@ -82,8 +82,28 @@ export default async function JobDescriptionDetailPage({
         {jobDescription.company && (
           <p className="mt-1 text-base text-fg-muted">{jobDescription.company}</p>
         )}
-        <p className="mt-1 text-sm text-fg-subtle">
-          Submitted {new Date(jobDescription.created_at).toLocaleString()}
+
+        {(jobDescription.level || jobDescription.location) && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {jobDescription.level && (
+              <span className="rounded-full bg-neutral-bg px-2 py-0.5 text-xs font-medium text-neutral-fg">
+                {jobDescription.level}
+              </span>
+            )}
+            {jobDescription.location && (
+              <span className="text-xs text-fg-subtle">
+                {jobDescription.location}
+              </span>
+            )}
+          </div>
+        )}
+
+        <p className="mt-2 text-sm text-fg-subtle">
+          {jobDescription.source === "themuse"
+            ? `Posted ${new Date(
+                jobDescription.posted_at ?? jobDescription.created_at,
+              ).toLocaleDateString()} · via The Muse`
+            : `Submitted ${new Date(jobDescription.created_at).toLocaleString()}`}
         </p>
       </div>
 
@@ -95,7 +115,10 @@ export default async function JobDescriptionDetailPage({
             rel="noopener noreferrer"
             className="text-fg-muted underline hover:text-fg"
           >
-            View original posting &rarr;
+            {jobDescription.source === "themuse"
+              ? "Apply on The Muse"
+              : "View original posting"}{" "}
+            &rarr;
           </a>
         </p>
       )}

@@ -11,6 +11,9 @@
  * TODO: replace with `supabase gen types typescript --project-id <id> >
  * types/database.ts` once a live project exists, and diff against this file
  * to make sure nothing drifted.
+ *
+ * Updated by hand for supabase/migrations/0004_external_job_listings.sql
+ * (adds source/external_id/level/location/posted_at to job_descriptions).
  */
 
 export type Json =
@@ -22,6 +25,7 @@ export type Json =
   | Json[];
 
 export type ResumeStatus = "uploaded" | "processing" | "analyzed" | "failed";
+export type JobDescriptionSource = "user" | "themuse";
 
 export interface Database {
   public: {
@@ -92,6 +96,11 @@ export interface Database {
           source_url: string | null;
           created_at: string;
           updated_at: string;
+          source: JobDescriptionSource;
+          external_id: string | null;
+          level: string | null;
+          location: string | null;
+          posted_at: string | null;
         };
         Insert: {
           id?: string;
@@ -102,6 +111,11 @@ export interface Database {
           source_url?: string | null;
           created_at?: string;
           updated_at?: string;
+          source?: JobDescriptionSource;
+          external_id?: string | null;
+          level?: string | null;
+          location?: string | null;
+          posted_at?: string | null;
         };
         Update: Partial<
           Database["public"]["Tables"]["job_descriptions"]["Insert"]

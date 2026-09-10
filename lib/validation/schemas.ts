@@ -82,6 +82,26 @@ export const JOB_DESCRIPTION_TITLE_MAX_LENGTH = 200;
 export const JOB_DESCRIPTION_COMPANY_MAX_LENGTH = 200;
 export const JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH = 20_000;
 export const JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH = 2048;
+export const JOB_DESCRIPTION_LOCATION_MAX_LENGTH = 200;
+
+/**
+ * Levels a *user* can tag their own submission with, per
+ * docs/ARCHITECTURE.md §7. `job_descriptions.level` itself is free text (an
+ * externally-ingested row can carry whatever vocabulary its source uses —
+ * see `lib/jobs/themuse.ts`), but a manual submission has no external
+ * source to inherit a value from, so this fixed list is what the submission
+ * form offers. Matches `THEMUSE_SYNC_LEVELS`'s two entries plus the rest of
+ * The Muse's own taxonomy, both because it's a familiar, common-sense set of
+ * levels and so a user's own listings line up with the same filter pills
+ * `/jobs` already offers for externally-ingested ones.
+ */
+export const JOB_DESCRIPTION_LEVELS = [
+  "Internship",
+  "Entry Level",
+  "Mid Level",
+  "Senior Level",
+  "Management",
+] as const;
 
 /** URL schemes accepted for `source_url`. */
 const JOB_DESCRIPTION_ALLOWED_URL_SCHEMES = new Set(["http:", "https:"]);
@@ -140,6 +160,16 @@ export const jobDescriptionCreateSchema = z.object({
     .url("source_url must be a valid URL.")
     .refine(isHttpOrHttpsUrl, "source_url must use the http or https scheme.")
     .optional(),
+  location: z
+    .string()
+    .trim()
+    .min(1, "location must not be empty when provided.")
+    .max(
+      JOB_DESCRIPTION_LOCATION_MAX_LENGTH,
+      `location must be at most ${JOB_DESCRIPTION_LOCATION_MAX_LENGTH} characters.`,
+    )
+    .optional(),
+  level: z.enum(JOB_DESCRIPTION_LEVELS).optional(),
 });
 
 export type JobDescriptionCreateInput = z.infer<

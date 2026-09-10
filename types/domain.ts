@@ -5,9 +5,13 @@
  * contracts") — keep the two in sync.
  */
 
-import type { Database, ResumeStatus } from "@/types/database";
+import type {
+  Database,
+  JobDescriptionSource,
+  ResumeStatus,
+} from "@/types/database";
 
-export type { ResumeStatus };
+export type { JobDescriptionSource, ResumeStatus };
 
 export type ResumeRow = Database["public"]["Tables"]["resumes"]["Row"];
 
@@ -122,6 +126,11 @@ export type JobDescriptionRow =
  * `resumes`, there is no `storage_path`-style internal field, and
  * `submitted_by` has no client use (the submitter isn't otherwise exposed
  * in the UI per the folder structure in §3) so it's dropped too.
+ *
+ * `source`/`level`/`location`/`posted_at` were added per docs/ARCHITECTURE.md
+ * §7 for externally-ingested listings (The Muse). `external_id` is dropped
+ * (internal dedup detail with no client use, same reasoning as
+ * `submitted_by`).
  */
 export type JobDescription = {
   id: string;
@@ -131,6 +140,10 @@ export type JobDescription = {
   source_url: string | null;
   created_at: string;
   updated_at: string;
+  source: JobDescriptionSource;
+  level: string | null;
+  location: string | null;
+  posted_at: string | null;
 };
 
 /** Shapes a full DB row into the public response representation. */
@@ -143,6 +156,10 @@ export function toJobDescription(row: JobDescriptionRow): JobDescription {
     source_url: row.source_url,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    source: row.source,
+    level: row.level,
+    location: row.location,
+    posted_at: row.posted_at,
   };
 }
 

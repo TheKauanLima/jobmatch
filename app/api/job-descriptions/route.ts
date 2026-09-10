@@ -19,8 +19,10 @@ import { toJobDescription } from "@/types/domain";
  * correct when rows share a `created_at` — see
  * `lib/supabase/queries/jobDescriptions.ts`). Query params per
  * docs/ARCHITECTURE.md §2: `?limit=20&cursor=<opaque token from a previous
- * response's next_cursor>`. Auth required (any authenticated user — shared
- * data, not owner-scoped).
+ * response's next_cursor>`, plus `?level=<level>` (added per §7 for the
+ * external-listing ingestion — e.g. `Internship`/`Entry Level`) to filter to
+ * one level; omitted/empty means no filter. Auth required (any authenticated
+ * user — shared data, not owner-scoped).
  */
 export async function GET(request: Request) {
   try {
@@ -30,6 +32,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const limitParam = url.searchParams.get("limit");
     const cursorParam = url.searchParams.get("cursor");
+    const levelParam = url.searchParams.get("level");
 
     let limit = JOB_DESCRIPTIONS_DEFAULT_LIMIT;
     if (limitParam !== null) {
@@ -46,6 +49,7 @@ export async function GET(request: Request) {
     const { items, hasMore } = await listJobDescriptions(supabase, {
       limit,
       cursor: cursorParam,
+      level: levelParam,
     });
 
     const lastItem = items[items.length - 1];
@@ -115,6 +119,8 @@ export async function POST(request: Request) {
       company: parsed.data.company,
       description: parsed.data.description,
       sourceUrl: parsed.data.source_url,
+      location: parsed.data.location,
+      level: parsed.data.level,
     });
 
     return NextResponse.json(

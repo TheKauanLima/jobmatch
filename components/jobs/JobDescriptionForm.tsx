@@ -4,14 +4,24 @@ import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+import { JOB_DESCRIPTION_LEVELS } from "@/lib/validation/schemas";
 
 /**
  * Submits a job description to `POST /api/job-descriptions` (see
  * docs/ARCHITECTURE.md §2). `title` and `description` are required;
- * `company`/`source_url` are optional. Server-side `zod` validation in
- * `lib/validation/schemas.ts` is the source of truth for length caps and URL
- * scheme — this form relies on the API's `error` message rather than
- * re-implementing those rules client-side, so validation stays in one place.
+ * `company`/`source_url`/`location`/`level` are optional. Server-side `zod`
+ * validation in `lib/validation/schemas.ts` is the source of truth for
+ * length caps and URL scheme — this form relies on the API's `error`
+ * message rather than re-implementing those rules client-side, so
+ * validation stays in one place.
+ *
+ * `location`/`level` were added per docs/ARCHITECTURE.md §7 so a
+ * user-submitted listing can carry the same fields externally-ingested ones
+ * do, and so the `/jobs` level filter works uniformly across both. `level`
+ * is a fixed dropdown (`JOB_DESCRIPTION_LEVELS`) rather than free text —
+ * unlike an external source, a manual submission has no existing vocabulary
+ * to inherit, so offering an open text field here would just fragment the
+ * filter with near-duplicate values ("Intern" vs "Internship", etc.).
  */
 export function JobDescriptionForm() {
   const router = useRouter();
@@ -19,6 +29,8 @@ export function JobDescriptionForm() {
   const [company, setCompany] = useState("");
   const [description, setDescription] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
+  const [location, setLocation] = useState("");
+  const [level, setLevel] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,6 +57,8 @@ export function JobDescriptionForm() {
           company: company.trim() || undefined,
           description: description.trim(),
           source_url: sourceUrl.trim() || undefined,
+          location: location.trim() || undefined,
+          level: level || undefined,
         }),
       });
 
@@ -60,6 +74,8 @@ export function JobDescriptionForm() {
       setCompany("");
       setDescription("");
       setSourceUrl("");
+      setLocation("");
+      setLevel("");
       router.refresh();
     } catch {
       setError(
@@ -106,6 +122,43 @@ export function JobDescriptionForm() {
         maxLength={200}
         disabled={submitting}
       />
+
+      <div className="flex flex-col gap-3 sm:flex-row">
+        <div className="flex flex-1 flex-col gap-1.5">
+          <label
+            htmlFor="job-level"
+            className="text-sm font-medium text-fg-muted"
+          >
+            Level (optional)
+          </label>
+          <select
+            id="job-level"
+            value={level}
+            onChange={(e) => setLevel(e.target.value)}
+            disabled={submitting}
+            className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
+          >
+            <option value="">Not specified</option>
+            {JOB_DESCRIPTION_LEVELS.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="flex-1">
+          <Input
+            id="job-location"
+            label="Location (optional)"
+            value={location}
+            onChange={(e) => setLocation(e.target.value)}
+            placeholder="e.g. Remote, or New York, NY"
+            maxLength={200}
+            disabled={submitting}
+          />
+        </div>
+      </div>
 
       <div className="flex flex-col gap-1.5">
         <label

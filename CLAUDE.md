@@ -26,3 +26,13 @@ This project is built by a team of Claude Code subagents, each defined in `.clau
 The **orchestrator** role (setting milestones, sequencing work across the above) is played by the main Claude Code session directly, not a subagent — it delegates to the others via the Agent tool.
 
 Architecture decisions and the data model live in `docs/ARCHITECTURE.md` (written by the architect agent) — read it before making structural changes.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

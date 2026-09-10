@@ -48,6 +48,11 @@ const row = {
   source_url: null,
   created_at: "2026-01-01T00:00:00.000Z",
   updated_at: "2026-01-01T00:00:00.000Z",
+  source: "user",
+  external_id: null,
+  level: null,
+  location: null,
+  posted_at: null,
 };
 
 function makeRequest(url: string, init?: RequestInit) {
@@ -103,6 +108,35 @@ describe("GET /api/job-descriptions", () => {
     expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
       limit: 5,
       cursor: "2026-01-01T00:00:00.000Z",
+      level: null,
+    });
+  });
+
+  it("passes the level query param through to the query layer", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(
+      makeRequest("http://localhost/api/job-descriptions?level=Internship"),
+    );
+
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      limit: 20,
+      cursor: null,
+      level: "Internship",
+    });
+  });
+
+  it("passes level: null through when no level query param is given", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(makeRequest("http://localhost/api/job-descriptions"));
+
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      limit: 20,
+      cursor: null,
+      level: null,
     });
   });
 
@@ -157,6 +191,7 @@ describe("GET /api/job-descriptions", () => {
     expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
       limit: 100,
       cursor: null,
+      level: null,
     });
   });
 
@@ -270,5 +305,44 @@ describe("POST /api/job-descriptions", () => {
       }),
     );
     expect(res.status).toBe(500);
+  });
+
+  it("passes location and level through to the query layer when provided", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockCreateJobDescription.mockResolvedValue(row);
+
+    await POST(
+      makeRequest("http://localhost/api/job-descriptions", {
+        method: "POST",
+        body: JSON.stringify({
+          title: "Software Engineer",
+          description: "Build things.",
+          location: "Remote",
+          level: "Entry Level",
+        }),
+      }),
+    );
+
+    expect(mockCreateJobDescription).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ location: "Remote", level: "Entry Level" }),
+    );
+  });
+
+  it("returns 400 for a level outside the fixed set", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+
+    const res = await POST(
+      makeRequest("http://localhost/api/job-descriptions", {
+        method: "POST",
+        body: JSON.stringify({
+          title: "t",
+          description: "d",
+          level: "Staff",
+        }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(mockCreateJobDescription).not.toHaveBeenCalled();
   });
 });

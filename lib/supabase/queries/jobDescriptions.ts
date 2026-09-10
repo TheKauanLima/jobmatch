@@ -14,7 +14,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import type { Database } from "@/types/database";
+import type { Database, JobDescriptionSource } from "@/types/database";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -105,7 +105,7 @@ export function decodeJobDescriptionCursor(
  */
 export async function listJobDescriptions(
   supabase: Client,
-  params: { limit?: number; cursor?: string | null },
+  params: { limit?: number; cursor?: string | null; level?: string | null },
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
     Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
@@ -118,6 +118,10 @@ export async function listJobDescriptions(
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(limit + 1);
+
+  if (params.level) {
+    query = query.eq("level", params.level);
+  }
 
   if (params.cursor) {
     const decoded = decodeJobDescriptionCursor(params.cursor);
@@ -218,6 +222,8 @@ export async function createJobDescription(
     company?: string | null;
     description: string;
     sourceUrl?: string | null;
+    location?: string | null;
+    level?: string | null;
   },
 ): Promise<JobDescriptionRow> {
   const { data, error } = await supabase
@@ -228,6 +234,8 @@ export async function createJobDescription(
       company: params.company ?? null,
       description: params.description,
       source_url: params.sourceUrl ?? null,
+      location: params.location ?? null,
+      level: params.level ?? null,
     })
     .select("*")
     .single();
@@ -240,4 +248,88 @@ export async function createJobDescription(
   }
 
   return data;
+}
+
+/** One externally-sourced listing, mapped and ready to upsert (see `lib/jobs/`). */
+export type ExternalJobDescriptionUpsert = {
+  externalId: string;
+  title: string;
+  company: string | null;
+  description: string;
+  sourceUrl: string | null;
+  level: string | null;
+  location: string | null;
+  postedAt: string | null;
+};
+
+/** Batch size for `upsertExternalJobDescriptions` — keeps individual requests small. */
+const EXTERNAL_UPSERT_BATCH_SIZE = 50;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Upserts a batch of externally-sourced job listings (e.g. from The Muse —
+ * see `lib/jobs/themuse.ts`/`lib/jobs/sync.ts`), keyed on the
+ * `(source, external_id)` unique constraint added by
+ * `supabase/migrations/0004_external_job_listings.sql`. Re-running a sync
+ * for a listing already ingested updates that row in place (title/
+ * description/location can change between syncs) rather than creating a
+ * duplicate. `submitted_by` is left `null` — these rows have no JobMatch
+ * user as their submitter.
+ *
+ * Callers MUST pass a service-role client (`lib/supabase/admin.ts`): there
+ * is no authenticated user in a cron/sync context, so the
+ * `job_descriptions_insert_own` RLS policy (which requires
+ * `submitted_by = auth.uid()`) would reject every row under a normal
+ * session-scoped client.
+ *
+ * Sent in batches of `EXTERNAL_UPSERT_BATCH_SIZE` to keep each Postgrest
+ * request small; a full sync typically upserts a few hundred rows.
+ */
+export async function upsertExternalJobDescriptions(
+  supabase: Client,
+  source: Exclude<JobDescriptionSource, "user">,
+  rows: ExternalJobDescriptionUpsert[],
+): Promise<{ count: number }> {
+  if (rows.length === 0) {
+    return { count: 0 };
+  }
+
+  let count = 0;
+  for (const batch of chunk(rows, EXTERNAL_UPSERT_BATCH_SIZE)) {
+    const { error, count: batchCount } = await supabase
+      .from("job_descriptions")
+      .upsert(
+        batch.map((row) => ({
+          source,
+          external_id: row.externalId,
+          title: row.title,
+          company: row.company,
+          description: row.description,
+          source_url: row.sourceUrl,
+          level: row.level,
+          location: row.location,
+          posted_at: row.postedAt,
+          submitted_by: null,
+        })),
+        { onConflict: "source,external_id", count: "exact" },
+      );
+
+    if (error) {
+      throw new JobDescriptionQueryError(
+        `Failed to upsert external job descriptions: ${error.message}`,
+        error,
+      );
+    }
+
+    count += batchCount ?? batch.length;
+  }
+
+  return { count };
 }

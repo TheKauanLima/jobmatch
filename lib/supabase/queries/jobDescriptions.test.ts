@@ -9,6 +9,7 @@ import {
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JobDescriptionQueryError,
   listJobDescriptions,
+  upsertExternalJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
 
 /**
@@ -16,7 +17,11 @@ import {
  * lib/supabase/queries/resumes.test.ts, extended with `.limit()`, `.lt()`,
  * and `.or()` for compound-cursor pagination.
  */
-function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
+function makeQueryBuilder(resolvedValue: {
+  data: unknown;
+  error: unknown;
+  count?: number | null;
+}) {
   const calls: { method: string; args: unknown[] }[] = [];
 
   const builder: Record<string, unknown> = {};
@@ -29,6 +34,7 @@ function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
 
   builder.select = record("select");
   builder.insert = record("insert");
+  builder.upsert = record("upsert");
   builder.eq = record("eq");
   builder.in = record("in");
   builder.order = record("order");
@@ -61,6 +67,11 @@ function makeRow(overrides: Partial<Record<string, unknown>> = {}) {
     source_url: null,
     created_at: "2026-01-01T00:00:00.000Z",
     updated_at: "2026-01-01T00:00:00.000Z",
+    source: "user",
+    external_id: null,
+    level: null,
+    location: null,
+    posted_at: null,
     ...overrides,
   };
 }
@@ -94,6 +105,24 @@ describe("listJobDescriptions", () => {
     // The old strict single-column filter must not be used any more — it's
     // exactly the filter that made tied rows permanently unreachable.
     expect(calls.some((c) => c.method === "lt")).toBe(false);
+  });
+
+  it("filters by level with .eq() when a level is given", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20, level: "Internship" });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["level", "Internship"] });
+  });
+
+  it("does not filter by level when none is given", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20 });
+
+    expect(calls.some((c) => c.method === "eq")).toBe(false);
   });
 
   it("does not filter by cursor when none is given", async () => {
@@ -344,7 +373,7 @@ describe("createJobDescription", () => {
     ).toBe("user-1");
   });
 
-  it("defaults company and source_url to null when omitted", async () => {
+  it("defaults company, source_url, location, and level to null when omitted", async () => {
     const row = makeRow();
     const { builder, calls } = makeQueryBuilder({ data: row, error: null });
     const client = makeClient(builder);
@@ -359,9 +388,35 @@ describe("createJobDescription", () => {
     const inserted = insertCall?.args[0] as {
       company: unknown;
       source_url: unknown;
+      location: unknown;
+      level: unknown;
     };
     expect(inserted.company).toBeNull();
     expect(inserted.source_url).toBeNull();
+    expect(inserted.location).toBeNull();
+    expect(inserted.level).toBeNull();
+  });
+
+  it("inserts location and level when provided", async () => {
+    const row = makeRow();
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await createJobDescription(client, {
+      submittedBy: "user-1",
+      title: "Software Engineer",
+      description: "Build things.",
+      location: "Remote",
+      level: "Entry Level",
+    });
+
+    const insertCall = calls.find((c) => c.method === "insert");
+    const inserted = insertCall?.args[0] as {
+      location: unknown;
+      level: unknown;
+    };
+    expect(inserted.location).toBe("Remote");
+    expect(inserted.level).toBe("Entry Level");
   });
 
   it("throws JobDescriptionQueryError when no row is returned", async () => {
@@ -374,6 +429,87 @@ describe("createJobDescription", () => {
         title: "Software Engineer",
         description: "Build things.",
       }),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("upsertExternalJobDescriptions", () => {
+  function makeUpsertRow(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      externalId: "ext-1",
+      title: "Software Engineering Intern",
+      company: "Acme",
+      description: "Build things.",
+      sourceUrl: "https://www.themuse.com/jobs/acme/swe-intern",
+      level: "Internship",
+      location: "New York, NY",
+      postedAt: "2026-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  it("returns count: 0 without querying when rows is empty", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    const result = await upsertExternalJobDescriptions(client, "themuse", []);
+
+    expect(result).toEqual({ count: 0 });
+    expect(calls).toEqual([]);
+  });
+
+  it("upserts with submitted_by: null and the given source, keyed on (source, external_id)", async () => {
+    const { builder, calls } = makeQueryBuilder({
+      data: [],
+      error: null,
+      count: 1,
+    });
+    const client = makeClient(builder);
+
+    await upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]);
+
+    const upsertCall = calls.find((c) => c.method === "upsert");
+    expect(upsertCall).toBeDefined();
+    const [rows, options] = upsertCall!.args as [
+      Record<string, unknown>[],
+      Record<string, unknown>,
+    ];
+    expect(rows[0]).toMatchObject({
+      source: "themuse",
+      external_id: "ext-1",
+      title: "Software Engineering Intern",
+      submitted_by: null,
+    });
+    expect(options).toMatchObject({ onConflict: "source,external_id" });
+  });
+
+  it("sums counts across batches larger than the batch size", async () => {
+    const { builder } = makeQueryBuilder({
+      data: [],
+      error: null,
+      count: 50,
+    });
+    const client = makeClient(builder);
+
+    const rows = Array.from({ length: 120 }, (_, i) =>
+      makeUpsertRow({ externalId: `ext-${i}` }),
+    );
+
+    const result = await upsertExternalJobDescriptions(client, "themuse", rows);
+
+    // 3 batches of <=50 -> mocked count 50 each -> 150 total.
+    expect(result.count).toBe(150);
+  });
+
+  it("throws JobDescriptionQueryError on a Postgres error", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { message: "constraint violation" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
 });
