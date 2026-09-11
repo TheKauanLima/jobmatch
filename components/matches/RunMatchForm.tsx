@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
@@ -24,6 +24,14 @@ const GENERIC_ERROR_MESSAGE =
   "Something went wrong running the match. Please try again.";
 const NETWORK_ERROR_MESSAGE =
   "Couldn't reach the server. Check your connection and try again.";
+const SEARCH_ERROR_MESSAGE =
+  "Couldn't search job descriptions. Please try again.";
+
+// Debounce delay for the live search fetch, per docs/ARCHITECTURE.md §9.4.
+const SEARCH_DEBOUNCE_MS = 300;
+// No `?level=` and no pagination for this picker — see §9.4: it's a "find
+// the one job I mean" tool, not a browsing surface.
+const SEARCH_RESULT_LIMIT = 20;
 
 /**
  * Picks a job description and triggers `POST /api/matches` (see
@@ -36,11 +44,17 @@ const NETWORK_ERROR_MESSAGE =
  * `jobDescriptions` is a first-page snapshot (see `RunMatchForm`'s caller —
  * `GET /api/job-descriptions?limit=50`) fetched server-side and passed as
  * props; read directly, no local copy, since this list is never mutated from
- * within the form itself. A client-side title/company text filter narrows
- * this fixed 50-item snapshot (added per the 2026-09-10 UX pass, once the
- * board's real volume from external ingestion — docs/ARCHITECTURE.md §7 —
- * made scanning a plain `<select>` by eye impractical); it is NOT a
- * server-side search over the full board, which stays out of scope here.
+ * within the form itself. It's shown as-is whenever the filter input is
+ * empty, preserving the original "browse the 50 most recent" default with no
+ * extra requests on mount.
+ *
+ * Once the filter input is non-empty, per the 2026-09-11 server-side search
+ * pass (docs/ARCHITECTURE.md §9.4), this switches from the old client-side
+ * array filter to a debounced (~300ms) client-side fetch of
+ * `GET /api/job-descriptions?q=<filter>&limit=20` (no `?level=` — this
+ * picker was never level-scoped). Deliberately a single page, no "Load
+ * more"/cursor — the top 20 relevance-ranked results are it; if the job
+ * isn't there, the answer is "narrow the search term."
  *
  * This call is synchronous server-side and can take several seconds (same
  * pattern as `AnalyzeResumeButton`), so the button shows an explicit
@@ -57,24 +71,82 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
   const [matching, setMatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const filteredJobDescriptions = useMemo(() => {
-    const needle = filter.trim().toLowerCase();
-    if (!needle) return jobDescriptions;
-    return jobDescriptions.filter((jd) =>
-      `${jd.title} ${jd.company ?? ""}`.toLowerCase().includes(needle),
-    );
-  }, [jobDescriptions, filter]);
+  // `null` = search not active (filter is empty) — fall back to the
+  // `jobDescriptions` prop snapshot. Once populated (even with an empty
+  // array, meaning "zero results"), it's the source of truth while the
+  // filter is non-empty.
+  const [searchResults, setSearchResults] = useState<JobDescription[] | null>(
+    null,
+  );
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
-  // Keep the selection valid as the filter narrows/widens the options —
-  // falls back to the first still-visible option rather than leaving a
-  // filtered-out id selected (which would silently match against a job the
-  // dropdown no longer shows).
-  const selectedStillVisible = filteredJobDescriptions.some(
+  const isSearchActive = filter.trim().length > 0;
+
+  useEffect(() => {
+    // Nothing to do while the filter is empty — `isSearchActive` already
+    // gates the render below back to the `jobDescriptions` snapshot, so
+    // stale `searchResults`/`searchError` from a prior search are simply
+    // ignored rather than needing to be reset here.
+    const term = filter.trim();
+    if (!term) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    const timeoutId = setTimeout(async () => {
+      setSearching(true);
+      setSearchError(null);
+      try {
+        const params = new URLSearchParams({
+          q: term,
+          limit: String(SEARCH_RESULT_LIMIT),
+        });
+        const response = await fetch(`/api/job-descriptions?${params}`, {
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          setSearchError(SEARCH_ERROR_MESSAGE);
+          setSearchResults(null);
+          return;
+        }
+
+        const body = await response.json();
+        setSearchResults(body.job_descriptions ?? []);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setSearchError(SEARCH_ERROR_MESSAGE);
+        setSearchResults(null);
+      } finally {
+        setSearching(false);
+      }
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [filter]);
+
+  // The list currently visible in the picker: the search results once the
+  // filter is non-empty (even mid-flight, so a slow first search doesn't
+  // briefly flash the old 50-row snapshot), otherwise the original snapshot.
+  const visibleJobDescriptions = isSearchActive
+    ? (searchResults ?? [])
+    : jobDescriptions;
+
+  // Keep the selection valid as the visible list changes — falls back to the
+  // first still-visible option rather than leaving a no-longer-visible id
+  // selected (which would silently match against a job the dropdown no
+  // longer shows).
+  const selectedStillVisible = visibleJobDescriptions.some(
     (jd) => jd.id === jobDescriptionId,
   );
   const effectiveJobDescriptionId = selectedStillVisible
     ? jobDescriptionId
-    : (filteredJobDescriptions[0]?.id ?? "");
+    : (visibleJobDescriptions[0]?.id ?? "");
 
   async function handleMatch() {
     if (!effectiveJobDescriptionId) return;
@@ -131,7 +203,7 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
     <div className="flex flex-col gap-3">
       <Input
         id="match-job-filter"
-        label="Filter by title or company"
+        label="Search by title, company, or keyword"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
         placeholder="e.g. intern, or a company name"
@@ -146,7 +218,13 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
           >
             Job description
           </label>
-          {filteredJobDescriptions.length === 0 ? (
+          {isSearchActive && searching ? (
+            <p className="text-sm text-fg-subtle">Searching…</p>
+          ) : isSearchActive && searchError ? (
+            <p role="alert" className="text-sm text-danger-fg">
+              {searchError}
+            </p>
+          ) : visibleJobDescriptions.length === 0 ? (
             <p className="text-sm text-fg-subtle">
               No job descriptions match &ldquo;{filter}&rdquo;.
             </p>
@@ -158,7 +236,7 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
               disabled={matching}
               className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
             >
-              {filteredJobDescriptions.map((jobDescription) => (
+              {visibleJobDescriptions.map((jobDescription) => (
                 <option key={jobDescription.id} value={jobDescription.id}>
                   {jobDescription.title}
                   {jobDescription.company ? ` — ${jobDescription.company}` : ""}

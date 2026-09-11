@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createJobDescription,
   decodeJobDescriptionCursor,
+  decodeJobDescriptionOffsetCursor,
   encodeJobDescriptionCursor,
+  encodeJobDescriptionOffsetCursor,
   getJobDescriptionById,
   getJobDescriptionsByIds,
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JobDescriptionQueryError,
   listJobDescriptions,
+  searchJobDescriptions,
   upsertExternalJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
 
@@ -246,6 +249,188 @@ describe("encodeJobDescriptionCursor / decodeJobDescriptionCursor", () => {
 
   it("returns null for an empty string", () => {
     expect(decodeJobDescriptionCursor("")).toBeNull();
+  });
+
+  // Cross-mode: an offset cursor (search mode) replayed against the keyset
+  // decoder must not be misinterpreted — it should fail this decode and
+  // degrade to "no cursor", per docs/ARCHITECTURE.md §9.2.
+  it("returns null for an offset-mode cursor replayed in keyset mode", () => {
+    expect(decodeJobDescriptionCursor("offset_20")).toBeNull();
+  });
+});
+
+/**
+ * `searchJobDescriptions` calls `supabase.rpc(...)` directly rather than
+ * going through `.from(...)`, so it needs its own client mock (the
+ * chainable `.from()` builder above doesn't apply here).
+ */
+function makeRpcClient(resolvedValue: { data: unknown; error: unknown }) {
+  const rpc = vi.fn().mockResolvedValue(resolvedValue);
+  const client = { rpc } as unknown as Parameters<typeof searchJobDescriptions>[0];
+  return { client, rpc };
+}
+
+describe("searchJobDescriptions", () => {
+  it("calls the search_job_descriptions RPC with the expected args (query, level, limit+1, offset)", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, {
+      query: "engineer",
+      limit: 20,
+      offset: 40,
+      level: "Internship",
+    });
+
+    expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
+      search_query: "engineer",
+      level_filter: "Internship",
+      limit_count: 21,
+      offset_count: 40,
+    });
+  });
+
+  it("defaults level_filter to null and offset to 0 when omitted", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer" });
+
+    expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
+      search_query: "engineer",
+      level_filter: null,
+      limit_count: JOB_DESCRIPTIONS_DEFAULT_LIMIT + 1,
+      offset_count: 0,
+    });
+  });
+
+  it("defaults to JOB_DESCRIPTIONS_DEFAULT_LIMIT when no limit is given", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer" });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ limit_count: JOB_DESCRIPTIONS_DEFAULT_LIMIT + 1 }),
+    );
+  });
+
+  it("clamps a negative offset to 0", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer", offset: -5 });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ offset_count: 0 }),
+    );
+  });
+
+  // `listJobDescriptions` treats an empty-string `level` as "no filter"
+  // (`if (params.level) { query = query.eq(...) }`); `searchJobDescriptions`
+  // mirrors that via `params.level || null` so an empty string also
+  // substitutes to `null` rather than being sent through verbatim. Against
+  // the real RPC (`level_filter is null or level = level_filter`), sending
+  // `level_filter: ""` would filter to `level = ''`, which matches no real
+  // row (every job_description's `level` is either NULL or a non-empty
+  // string) — an empty `?level=` combined with `?q=` must fall back to "no
+  // level filter" per docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no
+  // filter"), not silently return zero results.
+  it("treats an empty-string level as no filter, same as listJobDescriptions", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer", level: "" });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ level_filter: null }),
+    );
+  });
+
+  it("reports hasMore=true and trims the extra row when more than `limit` rows come back", async () => {
+    const rows = [makeRow({ id: "a" }), makeRow({ id: "b" }), makeRow({ id: "c" })];
+    const { client } = makeRpcClient({ data: rows, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x", limit: 2 });
+
+    expect(result.hasMore).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  it("reports hasMore=false when fewer than limit + 1 rows come back", async () => {
+    const rows = [makeRow({ id: "a" })];
+    const { client } = makeRpcClient({ data: rows, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x", limit: 20 });
+
+    expect(result.hasMore).toBe(false);
+    expect(result.items).toHaveLength(1);
+  });
+
+  it("returns [] with hasMore=false when data is null", async () => {
+    const { client } = makeRpcClient({ data: null, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x" });
+
+    expect(result.items).toEqual([]);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it("throws JobDescriptionQueryError on a Postgres error", async () => {
+    const { client } = makeRpcClient({
+      data: null,
+      error: { message: "connection reset" },
+    });
+
+    await expect(searchJobDescriptions(client, { query: "x" })).rejects.toThrow(
+      JobDescriptionQueryError,
+    );
+  });
+});
+
+describe("encodeJobDescriptionOffsetCursor / decodeJobDescriptionOffsetCursor", () => {
+  it("round-trips an integer offset", () => {
+    const encoded = encodeJobDescriptionOffsetCursor(40);
+    expect(encoded).toBe("offset_40");
+    expect(decodeJobDescriptionOffsetCursor(encoded)).toBe(40);
+  });
+
+  it("round-trips an offset of 0", () => {
+    const encoded = encodeJobDescriptionOffsetCursor(0);
+    expect(decodeJobDescriptionOffsetCursor(encoded)).toBe(0);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(decodeJobDescriptionOffsetCursor("not-a-cursor")).toBeNull();
+  });
+
+  it("returns null for an empty string", () => {
+    expect(decodeJobDescriptionOffsetCursor("")).toBeNull();
+  });
+
+  it("returns null for a negative offset string (pattern requires digits only)", () => {
+    expect(decodeJobDescriptionOffsetCursor("offset_-5")).toBeNull();
+  });
+
+  it("returns null for a non-integer offset string", () => {
+    expect(decodeJobDescriptionOffsetCursor("offset_4.5")).toBeNull();
+  });
+
+  it("returns null for an unsafe-integer offset (overflow guard)", () => {
+    expect(
+      decodeJobDescriptionOffsetCursor("offset_9007199254740993"),
+    ).toBeNull();
+  });
+
+  // Cross-mode: a keyset cursor (non-search mode) replayed against the
+  // offset decoder must not be misinterpreted — it should fail this decode
+  // and degrade to "no cursor" (offset 0 / first page), per
+  // docs/ARCHITECTURE.md §9.2.
+  it("returns null for a keyset cursor replayed in offset mode", () => {
+    const keysetCursor = encodeJobDescriptionCursor({
+      created_at: "2026-01-01T00:00:00.000Z",
+      id: TEST_UUID,
+    });
+    expect(decodeJobDescriptionOffsetCursor(keysetCursor)).toBeNull();
   });
 });
 

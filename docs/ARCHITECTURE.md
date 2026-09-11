@@ -252,14 +252,35 @@ matches via cascade).
 
 **`GET /api/job-descriptions`** — list shared job descriptions.
 - Auth: required.
-- Query params: `?limit=20&cursor=<opaque token>` — keyset pagination ordered
-  `created_at desc, id desc`. `cursor` is an opaque compound token (currently
-  `<created_at>_<id>`, encoded/decoded by `encodeJobDescriptionCursor`/
-  `decodeJobDescriptionCursor` in `lib/supabase/queries/jobDescriptions.ts`) —
-  a single `created_at` value alone isn't sufficient to paginate correctly
-  when rows share a timestamp, so treat this as opaque rather than
-  constructing it manually. A malformed cursor is treated as "no cursor"
-  (first page) rather than erroring.
+- Query params:
+  - `?limit=20` — page size, capped at `JOB_DESCRIPTIONS_MAX_LIMIT` (100).
+  - `?level=<level>` (added per §7; exact match, e.g. `Internship`) —
+    omitted/empty means no filter. **Not previously documented in this
+    section despite shipping in §7 — added here now alongside `?q=` to close
+    that gap, not new behavior.**
+  - `?q=<term>` (added per §9) — full-text search over `title`/`company`/
+    `description` via `websearch_to_tsquery`, ranked by `ts_rank` (title
+    weighted highest, then company, then description — see §9.1).
+    Combinable with `?level=`. Omitted, or empty/whitespace-only after
+    trimming, means no search filter (falls back to the plain `?level=`/
+    unfiltered listing below). Capped at
+    `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` (200) characters — longer
+    values return `400`.
+  - `?cursor=<opaque token>` — pagination cursor. **Its meaning depends on
+    whether `q` is present on the same request** (see §9.2 for why): without
+    `q`, keyset pagination ordered `created_at desc, id desc` exactly as
+    before (opaque compound token, currently `<created_at>_<id>`, encoded/
+    decoded by `encodeJobDescriptionCursor`/`decodeJobDescriptionCursor` in
+    `lib/supabase/queries/jobDescriptions.ts` — a single `created_at` value
+    alone isn't sufficient when rows share a timestamp, so treat this as
+    opaque rather than constructing it manually); with `q`, plain offset
+    pagination ordered by relevance (opaque token encoding an integer
+    offset, encoded/decoded by `encodeJobDescriptionOffsetCursor`/
+    `decodeJobDescriptionOffsetCursor` in the same file). Always pass
+    `next_cursor` back verbatim, and always pair a cursor with the *same*
+    `q`/`level` combination that produced it. A malformed cursor — including
+    one from the other mode's encoding — is treated as "no cursor" (first
+    page) rather than erroring, same as today.
 - Response `200`: `{ "job_descriptions": [...], "next_cursor": string | null }`
   — pass `next_cursor` back verbatim as the next request's `cursor`.
 
@@ -1053,3 +1074,302 @@ this repo has no browser-automation tooling available in the environment this
 work was done in, and the live Supabase project's real user accounts weren't
 available to sign in as. Treat the visual/interaction result as reviewed-in-code
 but not click-tested; a quick manual pass after deploying is worth doing.
+
+---
+
+## 9. Server-side job search — 2026-09-11
+
+### Why
+`/jobs` currently supports an exact `?level=` filter (§7) plus, separately,
+`RunMatchForm`'s client-side title/company text filter over a fixed 50-row
+snapshot (§8) — neither is full-text search over the board, and the
+client-side filter explicitly can't be, since it only ever sees the first
+page. With external ingestion (§7) adding up to ~200 listings/day, the board
+is already past the size where scanning-by-eye or paging through "Load more"
+one screen at a time is a workable way to find a specific role or company.
+This section adds real full-text search — over `title`, `company`, and
+`description` — as a first-class, server-side, ranked query against
+`job_descriptions`, surfaced through the existing `GET /api/job-descriptions`
+endpoint rather than a new one.
+
+### 9.1 Schema changes
+`supabase/migrations/0005_job_description_search.sql` adds one generated
+column and its index, plus a ranking function, to `job_descriptions`. No
+change to any existing column, row, or the four other tables.
+
+| column | type | notes |
+|---|---|---|
+| `search_vector` | `tsvector generated always as (...) stored` | derived from `title`/`company`/`description`; never written directly by application code (Postgres maintains it) |
+
+```sql
+alter table job_descriptions
+  add column search_vector tsvector
+  generated always as (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(company, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(description, '')), 'C') ||
+    setweight(to_tsvector('english', coalesce(location, '')), 'D')
+  ) stored;
+
+create index job_descriptions_search_vector_idx
+  on job_descriptions using gin (search_vector);
+```
+
+`location` is included as a fourth, lowest-weight tier — **resolved with the
+user on 2026-09-11** (originally §9.6 item 1 in this section's first draft;
+removed from open questions now that it's decided, not left implicit). A
+search for "remote" now matches a listing with `location = 'Remote'` even if
+that word never appears in the title/company/description text.
+
+Weights follow Postgres's default rank weight array (`{D,C,B,A} = {0.1, 0.2,
+0.4, 1.0}`), so `A` (title) outranks `B` (company), which outranks `C`
+(description), which outranks `D` (location) — matching the ask, with
+location deliberately last since it's the least distinguishing of the four
+fields (many listings share the same city, or `'Remote'`). A `stored`
+generated column (not a plain
+expression index) is used so `search_vector` is a real, `select *`-visible
+column the ranking function can reference directly, at the cost of storing
+the tsvector on disk per row — a few hundred bytes/row at v1's volume, not a
+meaningful cost.
+
+**Ranking needs a Postgres function, not a plain `.select()`.** `ts_rank`
+is computed at query time, not stored, and supabase-js's fluent query builder
+(`.order()`) only accepts real column names — it has no way to `order by` a
+computed expression. Rather than hand-building raw SQL per call, the
+migration also adds one `stable`, `security invoker` SQL function that does
+the match + rank + paginate in one round trip:
+
+```sql
+create function search_job_descriptions(
+  search_query text,
+  level_filter text default null,
+  limit_count int default 20,
+  offset_count int default 0
+)
+returns setof job_descriptions
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select *
+  from public.job_descriptions
+  where search_vector @@ websearch_to_tsquery('english', search_query)
+    and (level_filter is null or level = level_filter)
+  order by
+    ts_rank(search_vector, websearch_to_tsquery('english', search_query)) desc,
+    created_at desc,
+    id desc
+  limit limit_count
+  offset offset_count;
+$$;
+```
+
+`set search_path = ''` (with the table reference fully qualified as
+`public.job_descriptions`) follows the same hardening
+`0003_fix_function_search_path.sql` already applied to `set_updated_at()` —
+new functions should ship with this from the start rather than needing a
+follow-up fix migration. `security invoker` (the default, stated explicitly
+for auditability) means the function runs as whichever role calls it — when
+called from a route handler's normal RLS-scoped session client, the
+`job_descriptions_select_all_authenticated` policy still applies exactly as
+it does for a plain `select *`. No RLS bypass, no new policy needed, same
+conclusion §7.2 reached for the ingestion columns. Two matched rows tying
+exactly on `ts_rank` are broken by `created_at desc, id desc` — same
+tiebreak philosophy as the existing keyset listing, applied here purely for
+deterministic ordering (it is **not** used for cursor comparisons — see
+§9.2).
+
+A query that reduces to no meaningful lexemes after stopword removal (e.g.
+`q=the`) produces an empty `tsquery` and simply matches zero rows — expected
+Postgres behavior, not an error condition; no special-case handling needed
+in the route or the UI beyond the ordinary empty-results state (§9.4).
+
+`lib/supabase/queries/jobDescriptions.ts` gains `searchJobDescriptions`,
+calling this function via `supabase.rpc("search_job_descriptions", {...})`,
+structured the same way as `listJobDescriptions` (fetches `limit + 1` rows to
+derive `hasMore` without a separate count query). Also gains
+`JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` (200) alongside the existing
+`JOB_DESCRIPTIONS_DEFAULT_LIMIT`/`JOB_DESCRIPTIONS_MAX_LIMIT` constants — a
+query-param bound, same category as those two, not a POST-body field, so it
+lives here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
+`lib/validation/schemas.ts` (per §3's existing rule: `?level=`/`?limit=` are
+validated inline in the route handler today, not via a `zod` schema — `?q=`
+follows that same existing convention rather than introducing a new one).
+
+`types/database.ts` needs `search_vector` added to `job_descriptions`' `Row`
+type on the next hand-update (per its own regenerate-later TODO, §7.2).
+`types/domain.ts`'s public `JobDescription` type should **omit**
+`search_vector` from the client-facing shape — same reasoning already applied
+to `external_id`: an internal implementation detail with no UI use.
+
+### 9.2 The pagination tradeoff — offset for search, keyset unchanged otherwise
+**Decision: adopt the proposed split (keyset when `q` is absent, offset when
+`q` is present), not a combined rank-based keyset cursor.** The alternative
+considered — extending the existing keyset cursor to a `(rank, created_at,
+id)` triple — was rejected, not just deferred:
+
+- `ts_rank` isn't a stored/indexed value. A rank-based keyset predicate needs
+  the *previous page's* rank score to compare against, which means
+  serializing a floating-point number into the opaque cursor string and
+  round-tripping it back into a `<` comparison against a freshly-recomputed
+  `ts_rank(...)` expression on every subsequent request. Floating-point
+  string round-tripping can lose precision at the boundary between two
+  closely-ranked rows, silently skipping or duplicating one — a strictly
+  worse version of the seam-duplication tradeoff `JobDescriptionList`
+  already documents and accepts for plain keyset pagination (there, it's
+  reasoned about and rare; here, it'd be an unreasoned-about float
+  comparison bug waiting to happen).
+- supabase-js's fluent builder can express a keyset `.or()` filter over real
+  columns (as today's `created_at`/`id` cursor does) but has no way to
+  filter against a computed expression like `ts_rank(...)` at all — it would
+  need hand-written raw SQL either way, at which point the "simpler, reuse
+  the existing cursor shape" framing doesn't actually hold once ranking is
+  involved.
+
+Offset pagination avoids all of this: `search_job_descriptions` takes
+`limit`/`offset` directly, Postgres recomputes rank fresh for every page (no
+serialized rank to trust or distrust), and the implementation is a single
+`limit`/`offset` pair with no custom comparison logic.
+
+**Known limitation, accepted:** a new job description landing between two
+"Load more" fetches under an active search shifts every later row's offset
+by one, which can duplicate or skip a single row at the page seam. This is
+the offset-pagination analogue of the seam behavior `JobDescriptionList`
+already accepts for keyset pagination against a live-inserted feed — not a
+new category of risk, and less consequential here than for the unfiltered
+board: a search's matched set is typically much smaller than the full board
+(the query itself narrows it), and a user paging through search results
+rarely clicks "Load more" more than once or twice. Not worth the complexity
+of a "correct" solution for v1.
+
+**Why the `cursor` param can stay the same name in both modes:** the route
+already treats `cursor` as an opaque, verbatim-passed string on the frontend
+side (`JobDescriptionList` never parses it). Search-mode cursors are simply
+encoded as a bare integer offset (`encodeJobDescriptionOffsetCursor`/
+`decodeJobDescriptionOffsetCursor`, new, alongside the existing
+`encodeJobDescriptionCursor`/`decodeJobDescriptionCursor`); the route decides
+which decoder to use based on whether `q` is present on that same request.
+A cursor produced under one mode replayed under the other simply fails that
+mode's decode (different string shape) and degrades to "no cursor" — same
+existing "malformed cursor → first page" behavior, not a new failure mode.
+Net effect: **`JobDescriptionList`'s pagination plumbing needs no changes at
+all** — see §9.4.
+
+### 9.3 API contract
+Folded into the existing `GET /api/job-descriptions` entry in §2 rather than
+a new endpoint (see §2 for the authoritative param-by-param contract — this
+is a summary, §2 is the source of truth backend-dev should implement
+against):
+- New optional `?q=<term>` — combinable with the existing `?level=`.
+- `?cursor=` semantics branch on whether `q` is present (§9.2): keyset
+  (unchanged) without `q`, offset (new) with `q`.
+- Response shape (`{ job_descriptions, next_cursor }`) is **unchanged** —
+  same envelope, same "pass `next_cursor` back verbatim" contract, in both
+  modes.
+- `POST /api/job-descriptions` and `GET /api/job-descriptions/:id` are
+  unaffected by this section.
+
+### 9.4 UI-facing implications
+- **`app/jobs/page.tsx`** gains a search input, wired the same way as the
+  existing level-filter pills (§7.4): plain SSR navigation to
+  `/jobs?q=<term>` (combinable with `&level=`), not client-side fetching —
+  consistent with how the level pills already work, and required by §9.2's
+  design (the route, not the client, decides which pagination mode applies).
+  Because it's navigation-based rather than fetch-as-you-type, the input
+  should submit on Enter/a search button or a debounced navigation, **not**
+  fire a full page navigation per keystroke — flagging this constraint here
+  so it isn't discovered mid-implementation as a UX problem.
+- `JobDescriptionList`'s remount key (currently `key={level ?? "all"}`, per
+  §7.4, specifically to keep "Load more" state from leaking across filter
+  changes) needs to also incorporate `q`, e.g. `` `${level ?? "all"}:${q ??
+  ""}` `` — otherwise switching search terms would keep stale
+  `additionalJobDescriptions`/`loadedCursor` state from the previous search
+  around, and (per §9.2) a leftover offset-cursor being replayed against a
+  new `q` would silently reset to page 1 rather than erroring, which would
+  read as a confusing "Load more did nothing" bug rather than the harmless
+  fallback it actually is.
+- `JobDescriptionList`'s empty state ("No job descriptions yet. Be the first
+  to submit one above.") is the wrong copy for "no results for this search"
+  — needs a second message conditioned on whether `q` is active, e.g. "No
+  job descriptions match "{q}"." (mirrors the wording `RunMatchForm`'s
+  existing client-side filter already uses for the same situation).
+- **`RunMatchForm` (§8) moves from its client-side 50-row filter to the new
+  search endpoint** — **resolved with the user on 2026-09-11**, in scope for
+  this pass (originally §9.6 item 2 in this section's first draft). This is
+  a materially different integration pattern from `app/jobs/page.tsx` above,
+  not the same change copy-pasted into a form: `RunMatchForm` is a client
+  component embedded in a larger page (`/resumes/[id]`), so a full SSR page
+  navigation per keystroke is not an option the way it is for `/jobs`'s
+  standalone filter pills. Concretely:
+  - Keep the existing `jobDescriptions` prop (`app/resumes/[id]/page.tsx`'s
+    current server-side `GET /api/job-descriptions?limit=50` fetch, unchanged)
+    as the list shown when the filter input is empty — this preserves
+    today's "browse the 50 most recent" default with zero extra requests on
+    mount.
+  - Once the filter input is non-empty, replace the current
+    `useMemo`-based client-array filter with a **debounced client-side
+    fetch** (suggest ~300ms after the last keystroke) to
+    `GET /api/job-descriptions?q=<filter>&limit=20` — a plain `fetch` from
+    the client component, the same pattern `handleMatch` already uses for
+    `POST /api/matches`, not `serverFetch` (that's Server-Component-only).
+    No `?level=` — the picker was never level-scoped, and there's no reason
+    to start now.
+  - **No "Load more" / no cursor use for this picker** — fetch a single
+    page (`limit=20`, `cursor` never sent) and show exactly those results.
+    This is the one real design wrinkle in this change: `RunMatchForm` is a
+    "find the specific job I already have in mind" tool, not a browsing
+    surface the way `/jobs` is — if the top 20 relevance-ranked results
+    don't contain it, the answer is "narrow the search term," not "page
+    further." Adding keyset/offset pagination inside a `<select>`-driven
+    picker would be real complexity (a second pagination mode nested inside
+    a form) for a use case that doesn't need it.
+  - Swap the `<select>` for a lightweight "Searching…" state while the
+    debounced fetch is in flight, and surface a fetch error inline (same
+    tone as the component's existing error `<p role="alert">` elements)
+    rather than silently reverting to the stale 50-row snapshot, so a failed
+    search doesn't look like "no results."
+  - The `selectedStillVisible`/`effectiveJobDescriptionId` fallback logic
+    (keeps the selection valid as the visible option set changes) carries
+    over unchanged — it already operates on "whatever list is currently
+    shown," which now happens to sometimes be a search response instead of
+    a client-filtered array.
+- **`MatchFromJobForm` needs no change — correcting a premise, not declining
+  the ask.** Per §8, `MatchFromJobForm` (rendered on `/jobs/[id]`) doesn't
+  have a job picker at all: the job is already fixed by the page it's on, and
+  its picker is over the caller's own *resumes* (to choose which resume to
+  match against this already-known job). Resumes are private, per-user data
+  — not what `job_descriptions` search covers — so there's nothing in this
+  section for `MatchFromJobForm` to move to. Flagging this rather than
+  inventing a job-picker change that doesn't exist in the current code.
+
+### 9.5 Deliberately out of scope for this pass
+- **No fuzzy/typo-tolerant matching.** `websearch_to_tsquery` does stemmed
+  lexeme matching (e.g. "engineer" matches "engineering"), not
+  misspelling-tolerant matching (`pg_trgm`/similarity search) — a misspelled
+  company name won't match. Worth revisiting if it turns out to matter in
+  practice; adding a `pg_trgm` index later is additive, not a migration that
+  conflicts with this one.
+- **No debounced live-search-as-you-type on `/jobs` itself.** Given the
+  SSR-navigation design for that page in §9.4, live suggestions there would
+  need a separate client-side fetch path against this same endpoint — a
+  reasonable v2, not built here. (`RunMatchForm`'s picker, per §9.4, *does*
+  get a debounced live client-side fetch — different component, different
+  constraints, not a contradiction of this bullet.)
+
+### 9.6 Open questions for the user
+**Items 1 and 2 from this section's first draft — whether to include
+`location` in the searched text, and whether to move `RunMatchForm`/
+`MatchFromJobForm` to server-side search — were confirmed with the user on
+2026-09-11.** Both are now decided: see §9.1 for the `location` tier and
+§9.4 for the `RunMatchForm` design (and why `MatchFromJobForm` turned out
+not to need a change at all). Neither is listed below anymore.
+
+1. **Corpus growth.** At ~200 new listings/day (§7), `job_descriptions` grows
+   by roughly that much daily with no archival/expiry mechanism in this
+   design or §7's. The GIN index keeps `@@` matching cheap well past v1's
+   likely scale, so this isn't urgent, but a retention policy (e.g. stop
+   showing/searching listings past some age with no update from a re-sync)
+   is a product call this document has deliberately not made — noting it
+   here since search is the first feature where unbounded row growth has a
+   query-cost dimension, not just a UI-pagination one.

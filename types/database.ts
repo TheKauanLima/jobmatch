@@ -14,6 +14,10 @@
  *
  * Updated by hand for supabase/migrations/0004_external_job_listings.sql
  * (adds source/external_id/level/location/posted_at to job_descriptions).
+ *
+ * Updated by hand for supabase/migrations/0005_job_description_search.sql
+ * (adds generated column job_descriptions.search_vector and the
+ * search_job_descriptions() RPC function).
  */
 
 export type Json =
@@ -101,6 +105,17 @@ export interface Database {
           level: string | null;
           location: string | null;
           posted_at: string | null;
+          /**
+           * Generated (`tsvector`) column added by
+           * supabase/migrations/0005_job_description_search.sql — Postgres
+           * maintains it from title/company/description/location, so it's
+           * never written by application code. Omitted from `Insert`/
+           * `Update` below for exactly that reason (a generated column would
+           * reject an explicit write anyway). Internal-only: omitted from
+           * the client-facing `JobDescription` type in types/domain.ts, same
+           * treatment as `external_id`.
+           */
+          search_vector: string;
         };
         Insert: {
           id?: string;
@@ -152,7 +167,23 @@ export interface Database {
       };
     };
     Views: Record<string, never>;
-    Functions: Record<string, never>;
+    Functions: {
+      /**
+       * Ranked full-text search over `job_descriptions`, added by
+       * supabase/migrations/0005_job_description_search.sql — see
+       * `lib/supabase/queries/jobDescriptions.ts#searchJobDescriptions` and
+       * docs/ARCHITECTURE.md §9.
+       */
+      search_job_descriptions: {
+        Args: {
+          search_query: string;
+          level_filter?: string | null;
+          limit_count?: number;
+          offset_count?: number;
+        };
+        Returns: Database["public"]["Tables"]["job_descriptions"]["Row"][];
+      };
+    };
     Enums: Record<string, never>;
   };
 }

@@ -34,6 +34,18 @@ export const JOB_DESCRIPTIONS_DEFAULT_LIMIT = 20;
 export const JOB_DESCRIPTIONS_MAX_LIMIT = 100;
 
 /**
+ * Maximum length (characters) accepted for `?q=` on
+ * `GET /api/job-descriptions`, per docs/ARCHITECTURE.md §9.1/§9.3. A
+ * query-param bound, same category as `JOB_DESCRIPTIONS_DEFAULT_LIMIT`/
+ * `JOB_DESCRIPTIONS_MAX_LIMIT` above, not a POST-body field — so it lives
+ * here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
+ * `lib/validation/schemas.ts`, matching §3's existing rule that `?level=`/
+ * `?limit=` are validated inline in the route handler, not via a `zod`
+ * schema.
+ */
+export const JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH = 200;
+
+/**
  * A decoded pagination cursor: the `(created_at, id)` position of the last
  * row returned on the previous page.
  */
@@ -137,6 +149,95 @@ export async function listJobDescriptions(
   if (error) {
     throw new JobDescriptionQueryError(
       `Failed to list job descriptions: ${error.message}`,
+      error,
+    );
+  }
+
+  const rows = data ?? [];
+  const hasMore = rows.length > limit;
+
+  return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
+}
+
+/**
+ * Encodes an integer offset into the opaque cursor string returned as
+ * `next_cursor` for search-mode (`?q=`) pagination, per
+ * docs/ARCHITECTURE.md §9.2. Deliberately a distinct string shape from
+ * `encodeJobDescriptionCursor`'s `<created_at>_<id>` so a cursor produced
+ * under one pagination mode simply fails the other mode's decode (see
+ * `decodeJobDescriptionOffsetCursor`) rather than being silently
+ * misinterpreted.
+ */
+export function encodeJobDescriptionOffsetCursor(offset: number): string {
+  return `offset_${offset}`;
+}
+
+const OFFSET_CURSOR_PATTERN = /^offset_(\d+)$/;
+
+/**
+ * Decodes a cursor produced by `encodeJobDescriptionOffsetCursor`. Returns
+ * `null` for a malformed/unparseable cursor — including a keyset cursor
+ * from `encodeJobDescriptionCursor` replayed in the wrong mode — rather than
+ * throwing, so it degrades to "no cursor" (first page), same "malformed
+ * cursor → first page" behavior `decodeJobDescriptionCursor` already has.
+ */
+export function decodeJobDescriptionOffsetCursor(raw: string): number | null {
+  const match = OFFSET_CURSOR_PATTERN.exec(raw);
+  if (!match) {
+    return null;
+  }
+
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) ? offset : null;
+}
+
+/**
+ * Ranked full-text search over job descriptions via the
+ * `search_job_descriptions` Postgres function (added by
+ * `supabase/migrations/0005_job_description_search.sql`), per
+ * docs/ARCHITECTURE.md §9. Structured the same way as `listJobDescriptions`:
+ * fetches `limit + 1` rows so the caller can tell whether another page
+ * exists without a separate count query; `hasMore` is true when that extra
+ * row was found (in which case it is trimmed off `items`).
+ *
+ * Unlike `listJobDescriptions`'s keyset cursor, pagination here is a plain
+ * integer offset (§9.2's deliberate tradeoff — see
+ * `encodeJobDescriptionOffsetCursor`'s docstring and §9.2 for why a
+ * rank-based keyset cursor was rejected, not just deferred).
+ */
+export async function searchJobDescriptions(
+  supabase: Client,
+  params: {
+    query: string;
+    limit?: number;
+    offset?: number;
+    level?: string | null;
+  },
+): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
+  const limit = Math.min(
+    Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
+    JOB_DESCRIPTIONS_MAX_LIMIT,
+  );
+  const offset = Math.max(0, params.offset ?? 0);
+
+  const { data, error } = await supabase.rpc("search_job_descriptions", {
+    search_query: params.query,
+    // `||`, not `??`: an empty string (from `?level=` present-but-empty)
+    // must also fall back to "no filter," matching `listJobDescriptions`'s
+    // `if (params.level) { ... }` check just above — `??` would only
+    // substitute for `null`/`undefined` and let `""` through, which the
+    // `search_job_descriptions` RPC's `level = level_filter` would then
+    // match against literally (zero rows, since no real row has
+    // `level = ''`) instead of skipping the filter as documented in
+    // docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no filter").
+    level_filter: params.level || null,
+    limit_count: limit + 1,
+    offset_count: offset,
+  });
+
+  if (error) {
+    throw new JobDescriptionQueryError(
+      `Failed to search job descriptions: ${error.message}`,
       error,
     );
   }

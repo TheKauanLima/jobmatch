@@ -5,11 +5,13 @@ const {
   mockCreateClient,
   mockListJobDescriptions,
   mockCreateJobDescription,
+  mockSearchJobDescriptions,
 } = vi.hoisted(() => ({
   mockRequireSession: vi.fn(),
   mockCreateClient: vi.fn(),
   mockListJobDescriptions: vi.fn(),
   mockCreateJobDescription: vi.fn(),
+  mockSearchJobDescriptions: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/session", async () => {
@@ -31,6 +33,7 @@ vi.mock("@/lib/supabase/queries/jobDescriptions", async () => {
     ...actual,
     listJobDescriptions: mockListJobDescriptions,
     createJobDescription: mockCreateJobDescription,
+    searchJobDescriptions: mockSearchJobDescriptions,
   };
 });
 
@@ -201,6 +204,224 @@ describe("GET /api/job-descriptions", () => {
 
     const res = await GET(makeRequest("http://localhost/api/job-descriptions"));
     expect(res.status).toBe(500);
+  });
+});
+
+describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE.md §9)", () => {
+  it("routes to searchJobDescriptions (not listJobDescriptions) when q is present", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [row], hasMore: false });
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=engineer"),
+    );
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      query: "engineer",
+      limit: 20,
+      offset: 0,
+      level: null,
+    });
+    expect(mockListJobDescriptions).not.toHaveBeenCalled();
+    expect(body.job_descriptions).toHaveLength(1);
+    expect(body.next_cursor).toBeNull();
+  });
+
+  it("combines q and level, passing both through to searchJobDescriptions", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(
+      makeRequest(
+        "http://localhost/api/job-descriptions?q=engineer&level=Internship",
+      ),
+    );
+
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      query: "engineer",
+      limit: 20,
+      offset: 0,
+      level: "Internship",
+    });
+  });
+
+  it("returns 400 when q exceeds JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+
+    const res = await GET(
+      makeRequest(
+        `http://localhost/api/job-descriptions?q=${"a".repeat(201)}`,
+      ),
+    );
+
+    expect(res.status).toBe(400);
+    expect(mockSearchJobDescriptions).not.toHaveBeenCalled();
+    expect(mockListJobDescriptions).not.toHaveBeenCalled();
+  });
+
+  it("accepts q at exactly JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH (boundary, not an off-by-one 400)", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    const res = await GET(
+      makeRequest(
+        `http://localhost/api/job-descriptions?q=${"a".repeat(200)}`,
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockSearchJobDescriptions).toHaveBeenCalled();
+  });
+
+  it("treats an empty q (?q=) as no filter and falls back to listJobDescriptions", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    const res = await GET(makeRequest("http://localhost/api/job-descriptions?q="));
+
+    expect(res.status).toBe(200);
+    expect(mockSearchJobDescriptions).not.toHaveBeenCalled();
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      limit: 20,
+      cursor: null,
+      level: null,
+    });
+  });
+
+  it("treats a whitespace-only q (?q=%20%20) as no filter and falls back to listJobDescriptions", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=%20%20%20"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockSearchJobDescriptions).not.toHaveBeenCalled();
+    expect(mockListJobDescriptions).toHaveBeenCalled();
+  });
+
+  it("trims surrounding whitespace from a non-empty q before searching", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=%20engineer%20"),
+    );
+
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ query: "engineer" }),
+    );
+  });
+
+  it("decodes a search-mode (offset) cursor and passes the offset through", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(
+      makeRequest(
+        "http://localhost/api/job-descriptions?q=engineer&cursor=offset_40",
+      ),
+    );
+
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ offset: 40 }),
+    );
+  });
+
+  it("returns next_cursor as an encoded offset cursor when hasMore is true", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [row], hasMore: true });
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=engineer"),
+    );
+    const body = await res.json();
+
+    expect(body.next_cursor).toBe("offset_1");
+  });
+
+  // §9.2's documented contract: a cursor from the OTHER pagination mode
+  // (here, a keyset `<created_at>_<id>` cursor from the non-search listing)
+  // replayed on a request that now has `q=` must degrade to page 1 (offset
+  // 0), not error and not silently misinterpret the string as an offset.
+  it("degrades to offset 0 (first page) when a keyset cursor is replayed on a q= request", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    const keysetCursor = `2026-01-01T00:00:00.000Z_${row.id}`;
+    await GET(
+      makeRequest(
+        `http://localhost/api/job-descriptions?q=engineer&cursor=${encodeURIComponent(keysetCursor)}`,
+      ),
+    );
+
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ offset: 0 }),
+    );
+  });
+
+  // The reverse direction of the above: an offset cursor (search mode)
+  // replayed on a request with no `q=` must degrade to "no cursor" (first
+  // page) in the keyset listing path, not error.
+  it("degrades to first page when an offset cursor is replayed on a request with no q=", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?cursor=offset_40"),
+    );
+
+    expect(res.status).toBe(200);
+    // The route passes the raw cursor string through to listJobDescriptions,
+    // which internally fails to decode it as a keyset cursor and applies no
+    // filter — asserting the cursor is passed through verbatim here, and
+    // relying on jobDescriptions.test.ts's own coverage that
+    // decodeJobDescriptionCursor("offset_40") -> null.
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      limit: 20,
+      cursor: "offset_40",
+      level: null,
+    });
+  });
+
+  it("response envelope shape (job_descriptions/next_cursor keys) matches the non-search mode", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [row], hasMore: false });
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=engineer"),
+    );
+    const body = await res.json();
+
+    expect(Object.keys(body).sort()).toEqual(["job_descriptions", "next_cursor"]);
+    expect(body.job_descriptions[0]).not.toHaveProperty("search_vector");
+  });
+
+  it("returns 500 (not a crash) when searchJobDescriptions throws", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockSearchJobDescriptions.mockRejectedValue(new Error("db down"));
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=engineer"),
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it("returns 401 when unauthenticated, before calling searchJobDescriptions", async () => {
+    mockRequireSession.mockRejectedValue(new UnauthorizedError());
+
+    const res = await GET(
+      makeRequest("http://localhost/api/job-descriptions?q=engineer"),
+    );
+
+    expect(res.status).toBe(401);
+    expect(mockSearchJobDescriptions).not.toHaveBeenCalled();
   });
 });
 

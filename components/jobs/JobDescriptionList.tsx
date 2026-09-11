@@ -17,6 +17,17 @@ interface JobDescriptionListProps {
    * itself never needs to change the filter mid-lifetime.
    */
   level: string | null;
+  /**
+   * Search term currently applied (per docs/ARCHITECTURE.md §9), or `null`
+   * for none. Same deal as `level`: only used to keep "Load more" fetches
+   * scoped to the same search as the initial page — the search input itself
+   * lives in `app/jobs/page.tsx` (plain SSR navigation), which remounts this
+   * component (via a `key` that now incorporates `q` alongside `level`)
+   * whenever the search term changes, so `additionalJobDescriptions`/
+   * `loadedCursor` never leak from one search into another. Also selects
+   * which empty-state message to show (see below).
+   */
+  q: string | null;
 }
 
 /**
@@ -51,6 +62,7 @@ export function JobDescriptionList({
   initialJobDescriptions,
   initialNextCursor,
   level,
+  q,
 }: JobDescriptionListProps) {
   const [additionalJobDescriptions, setAdditionalJobDescriptions] = useState<
     JobDescription[]
@@ -85,6 +97,9 @@ export function JobDescriptionList({
       if (level) {
         params.set("level", level);
       }
+      if (q) {
+        params.set("q", q);
+      }
       const response = await fetch(`/api/job-descriptions?${params}`);
 
       if (!response.ok) {
@@ -109,7 +124,9 @@ export function JobDescriptionList({
     return (
       <div className="rounded-lg border border-dashed border-border-strong bg-surface p-8 text-center">
         <p className="text-sm text-fg-muted">
-          No job descriptions yet. Be the first to submit one above.
+          {q
+            ? `No job descriptions match "${q}".`
+            : "No job descriptions yet. Be the first to submit one above."}
         </p>
       </div>
     );
