@@ -38,7 +38,7 @@ import { toJobDescription } from "@/types/domain";
  */
 export async function GET(request: Request) {
   try {
-    await requireSession();
+    const { user } = await requireSession();
     const supabase = await createClient();
 
     const url = new URL(request.url);
@@ -86,7 +86,7 @@ export async function GET(request: Request) {
         : null;
 
       return NextResponse.json({
-        job_descriptions: items.map(toJobDescription),
+        job_descriptions: items.map((row) => toJobDescription(row, user.id)),
         next_cursor,
       });
     }
@@ -102,7 +102,7 @@ export async function GET(request: Request) {
       hasMore && lastItem ? encodeJobDescriptionCursor(lastItem) : null;
 
     return NextResponse.json({
-      job_descriptions: items.map(toJobDescription),
+      job_descriptions: items.map((row) => toJobDescription(row, user.id)),
       next_cursor,
     });
   } catch (err) {
@@ -169,7 +169,7 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json(
-      { job_description: toJobDescription(jobDescription) },
+      { job_description: toJobDescription(jobDescription, user.id) },
       { status: 201 },
     );
   } catch (err) {

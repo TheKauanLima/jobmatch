@@ -156,9 +156,17 @@ export default async function DashboardPage() {
         </section>
 
         <section className="rounded-lg border border-border bg-surface p-6">
-          <h2 className="text-base font-semibold text-fg">
-            Recent matches
-          </h2>
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-base font-semibold text-fg">
+              Recent matches
+            </h2>
+            <Link
+              href="/matches"
+              className="text-sm font-medium text-fg-muted hover:text-fg"
+            >
+              View all matches &rarr;
+            </Link>
+          </div>
 
           {matchesError ? (
             <p

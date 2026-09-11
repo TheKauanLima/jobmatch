@@ -18,6 +18,9 @@
  * Updated by hand for supabase/migrations/0005_job_description_search.sql
  * (adds generated column job_descriptions.search_vector and the
  * search_job_descriptions() RPC function).
+ *
+ * Updated by hand for supabase/migrations/0006_job_description_mutability.sql
+ * (adds job_descriptions.deleted_at).
  */
 
 export type Json =
@@ -116,6 +119,12 @@ export interface Database {
            * treatment as `external_id`.
            */
           search_vector: string;
+          /**
+           * Added by supabase/migrations/0006_job_description_mutability.sql.
+           * Null = visible/active; non-null = soft-deleted by its submitter.
+           * See docs/ARCHITECTURE.md §10.
+           */
+          deleted_at: string | null;
         };
         Insert: {
           id?: string;
@@ -131,6 +140,7 @@ export interface Database {
           level?: string | null;
           location?: string | null;
           posted_at?: string | null;
+          deleted_at?: string | null;
         };
         Update: Partial<
           Database["public"]["Tables"]["job_descriptions"]["Insert"]

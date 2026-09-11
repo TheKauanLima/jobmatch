@@ -3,6 +3,8 @@ import Link from "next/link";
 import { getSession } from "@/lib/auth/session";
 import { serverFetch } from "@/lib/api/serverFetch";
 import { MatchFromJobForm } from "@/components/matches/MatchFromJobForm";
+import { EditJobDescriptionForm } from "@/components/jobs/EditJobDescriptionForm";
+import { DeleteJobDescriptionButton } from "@/components/jobs/DeleteJobDescriptionButton";
 import type { JobDescription, ResumeListItem } from "@/types/domain";
 
 type GetJobDescriptionResult =
@@ -112,12 +114,34 @@ export default async function JobDescriptionDetailPage({
         &larr; All job descriptions
       </Link>
 
+      <div className="mt-1 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-fg">
+            {jobDescription.title}
+          </h1>
+          {jobDescription.company && (
+            <p className="mt-1 text-base text-fg-muted">{jobDescription.company}</p>
+          )}
+        </div>
+        {jobDescription.is_own && (
+          <DeleteJobDescriptionButton
+            jobDescriptionId={jobDescription.id}
+            title={jobDescription.title}
+            className="shrink-0"
+          />
+        )}
+      </div>
+
       <div className="mt-1">
-        <h1 className="text-2xl font-semibold tracking-tight text-fg">
-          {jobDescription.title}
-        </h1>
-        {jobDescription.company && (
-          <p className="mt-1 text-base text-fg-muted">{jobDescription.company}</p>
+        {jobDescription.deleted_at && (
+          <p
+            role="status"
+            className="mt-4 rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-sm text-warning-fg"
+          >
+            {jobDescription.is_own
+              ? "You removed this posting."
+              : "This posting has been removed."}
+          </p>
         )}
 
         {(jobDescription.level || jobDescription.location) && (
@@ -167,26 +191,34 @@ export default async function JobDescriptionDetailPage({
         </p>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
-        <h2 className="text-base font-semibold text-fg">
-          Match against your resume
-        </h2>
-        <div className="mt-4">
-          {analyzedResumesResult.kind === "error" ? (
-            <p
-              role="alert"
-              className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
-            >
-              Couldn&apos;t load your resumes. Please refresh the page.
-            </p>
-          ) : (
-            <MatchFromJobForm
-              jobDescriptionId={jobDescription.id}
-              analyzedResumes={analyzedResumesResult.resumes}
-            />
-          )}
+      {jobDescription.is_own && (
+        <div className="mt-6">
+          <EditJobDescriptionForm jobDescription={jobDescription} />
         </div>
-      </section>
+      )}
+
+      {!jobDescription.deleted_at && (
+        <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+          <h2 className="text-base font-semibold text-fg">
+            Match against your resume
+          </h2>
+          <div className="mt-4">
+            {analyzedResumesResult.kind === "error" ? (
+              <p
+                role="alert"
+                className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
+              >
+                Couldn&apos;t load your resumes. Please refresh the page.
+              </p>
+            ) : (
+              <MatchFromJobForm
+                jobDescriptionId={jobDescription.id}
+                analyzedResumes={analyzedResumesResult.resumes}
+              />
+            )}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

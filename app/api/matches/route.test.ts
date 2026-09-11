@@ -135,6 +135,7 @@ const jobDescription = {
   source_url: null,
   created_at: "t",
   updated_at: "t",
+  deleted_at: null,
 };
 
 const matchRow = {
@@ -228,13 +229,21 @@ describe("GET /api/matches (no resume_id) — cross-resume recent matches", () =
 
   it("lists the caller's recent matches across resumes, with job_description and resume inlined", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockListRecentMatchesForUser.mockResolvedValue([
-      {
-        ...matchRow,
-        job_description: { id: JOB_DESCRIPTION_UUID, title: "Backend Engineer", company: "Acme" },
-        resume: { id: RESUME_UUID, file_name: "resume.pdf" },
-      },
-    ]);
+    mockListRecentMatchesForUser.mockResolvedValue({
+      items: [
+        {
+          ...matchRow,
+          job_description: {
+            id: JOB_DESCRIPTION_UUID,
+            title: "Backend Engineer",
+            company: "Acme",
+            deleted_at: null,
+          },
+          resume: { id: RESUME_UUID, file_name: "resume.pdf" },
+        },
+      ],
+      hasMore: false,
+    });
 
     const res = await GET(getRequest(""));
     const body = await res.json();
@@ -242,26 +251,27 @@ describe("GET /api/matches (no resume_id) — cross-resume recent matches", () =
     expect(res.status).toBe(200);
     expect(body.matches).toHaveLength(1);
     expect(body.matches[0].resume).toEqual({ id: RESUME_UUID, file_name: "resume.pdf" });
+    expect(body.next_cursor).toBeNull();
     expect(mockGetResumeById).not.toHaveBeenCalled();
     expect(mockListMatchesForResume).not.toHaveBeenCalled();
   });
 
   it("defaults to RECENT_MATCHES_DEFAULT_LIMIT and clamps a huge limit to RECENT_MATCHES_MAX_LIMIT", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockListRecentMatchesForUser.mockResolvedValue([]);
+    mockListRecentMatchesForUser.mockResolvedValue({ items: [], hasMore: false });
 
     await GET(getRequest(""));
     expect(mockListRecentMatchesForUser).toHaveBeenCalledWith(
       expect.anything(),
       "user-1",
-      5,
+      { limit: 5, cursor: null },
     );
 
     await GET(getRequest("?limit=9999"));
     expect(mockListRecentMatchesForUser).toHaveBeenLastCalledWith(
       expect.anything(),
       "user-1",
-      20,
+      { limit: 50, cursor: null },
     );
   });
 
@@ -279,6 +289,50 @@ describe("GET /api/matches (no resume_id) — cross-resume recent matches", () =
 
     const res = await GET(getRequest(""));
     expect(res.status).toBe(500);
+  });
+
+  it("passes ?cursor= through verbatim to listRecentMatchesForUser", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListRecentMatchesForUser.mockResolvedValue({ items: [], hasMore: false });
+
+    await GET(getRequest("?cursor=2026-01-01T00%3A00%3A00.000Z_11111111-1111-1111-1111-111111111111"));
+
+    expect(mockListRecentMatchesForUser).toHaveBeenCalledWith(
+      expect.anything(),
+      "user-1",
+      {
+        limit: 5,
+        cursor: "2026-01-01T00:00:00.000Z_11111111-1111-1111-1111-111111111111",
+      },
+    );
+  });
+
+  it("returns next_cursor derived from the last item when hasMore is true, and null when hasMore is false", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    const lastItem = {
+      ...matchRow,
+      id: "match-last",
+      created_at: "2026-03-01T00:00:00.000Z",
+      job_description: {
+        id: JOB_DESCRIPTION_UUID,
+        title: "Backend Engineer",
+        company: "Acme",
+        deleted_at: null,
+      },
+      resume: { id: RESUME_UUID, file_name: "resume.pdf" },
+    };
+
+    mockListRecentMatchesForUser.mockResolvedValue({ items: [lastItem], hasMore: true });
+    const res = await GET(getRequest(""));
+    const body = await res.json();
+
+    expect(body.next_cursor).toBe("2026-03-01T00:00:00.000Z_match-last");
+
+    mockListRecentMatchesForUser.mockResolvedValue({ items: [lastItem], hasMore: false });
+    const res2 = await GET(getRequest(""));
+    const body2 = await res2.json();
+
+    expect(body2.next_cursor).toBeNull();
   });
 });
 
@@ -353,6 +407,24 @@ describe("POST /api/matches", () => {
     );
     expect(res.status).toBe(404);
     expect(mockCheckRateLimit).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when the job description has been soft-deleted (per docs/ARCHITECTURE.md §10.3 — can't become the target of a NEW match)", async () => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResume);
+    mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
+    mockGetJobDescriptionById.mockResolvedValue({
+      ...jobDescription,
+      deleted_at: "2026-02-01T00:00:00.000Z",
+    });
+
+    const res = await POST(
+      postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
+    );
+
+    expect(res.status).toBe(400);
+    expect(mockCheckRateLimit).not.toHaveBeenCalled();
+    expect(mockMatchResumeToJob).not.toHaveBeenCalled();
   });
 
   it("returns 429 with retry_after when the daily match rate limit is exceeded, before calling Claude", async () => {
@@ -438,6 +510,7 @@ describe("POST /api/matches", () => {
       id: JOB_DESCRIPTION_UUID,
       title: "Backend Engineer",
       company: "Acme",
+      deleted_at: null,
     });
     expect(body.match.score).toBe(82);
   });

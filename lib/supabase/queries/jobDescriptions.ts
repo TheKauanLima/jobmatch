@@ -3,9 +3,11 @@
  * docs/ARCHITECTURE.md §3. Unlike `lib/supabase/queries/resumes.ts`, this
  * table is *shared* data — `SELECT` is open to any authenticated user (RLS
  * policy `job_descriptions_select_all_authenticated`), so functions here do
- * not filter reads by `user_id`. Only `createJobDescription` scopes a write
- * (`submitted_by`) to the caller, matching the
- * `job_descriptions_insert_own` RLS policy.
+ * not filter reads by `user_id`. `createJobDescription`, `updateJobDescription`,
+ * and `softDeleteJobDescription` (the latter two added per
+ * docs/ARCHITECTURE.md §10) all scope their writes (`submitted_by`) to the
+ * caller, matching the `job_descriptions_insert_own`/`job_descriptions_update_own`
+ * RLS policies.
  *
  * Returns full DB rows — route handlers are responsible for shaping rows
  * into the public response types in `types/domain.ts` before returning
@@ -127,6 +129,7 @@ export async function listJobDescriptions(
   let query = supabase
     .from("job_descriptions")
     .select("*")
+    .is("deleted_at", null)
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(limit + 1);
@@ -349,6 +352,110 @@ export async function createJobDescription(
   }
 
   return data;
+}
+
+/**
+ * Updates a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.3. Scoped to `.eq("submitted_by", submittedBy)`
+ * in addition to relying on RLS (the `job_descriptions_update_own` policy
+ * added by `supabase/migrations/0006_job_description_mutability.sql`) — same
+ * "checked twice" ownership pattern every other query function in this
+ * codebase follows (see docs/ARCHITECTURE.md §2's intro). Returns the
+ * updated row, or `null` if no row matched (not found, not owned, or a
+ * `source='themuse'` row — the RLS policy's `source = 'user'` check would
+ * also block that last case, but the explicit filter here means the "not
+ * found" `null` path is uniform regardless of which check actually stopped
+ * it). Callers turn `null` into a `403`, not `404`, per §2 — existence of
+ * shared job description data is already public via `GET`.
+ *
+ * `patch`'s nullable fields (`company`/`sourceUrl`/`location`/`level`) are
+ * deliberately checked against `!== undefined`, not truthiness: `undefined`
+ * means "key absent from the PATCH body, leave this column untouched" and
+ * is skipped, while `null` means "clear this column back to null" and is
+ * written through as a real `null`. `lib/validation/schemas.ts`'s
+ * `jobDescriptionUpdateSchema` is what makes `null` reachable here at all
+ * from a JSON request body (it normalizes an explicit empty string to
+ * `null` before this function ever sees it) — this is the fix for a real
+ * gap: without it, a submitter had no way to un-set an already-set optional
+ * field via the API, only to change it to a different non-empty value.
+ */
+export async function updateJobDescription(
+  supabase: Client,
+  params: {
+    id: string;
+    submittedBy: string;
+    patch: {
+      title?: string;
+      company?: string | null;
+      description?: string;
+      sourceUrl?: string | null;
+      location?: string | null;
+      level?: string | null;
+    };
+  },
+): Promise<JobDescriptionRow | null> {
+  const update: Database["public"]["Tables"]["job_descriptions"]["Update"] = {};
+  if (params.patch.title !== undefined) update.title = params.patch.title;
+  if (params.patch.company !== undefined) update.company = params.patch.company;
+  if (params.patch.description !== undefined) update.description = params.patch.description;
+  if (params.patch.sourceUrl !== undefined) update.source_url = params.patch.sourceUrl;
+  if (params.patch.location !== undefined) update.location = params.patch.location;
+  if (params.patch.level !== undefined) update.level = params.patch.level;
+
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update(update)
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return null;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to update job description ${params.id}: ${error.message}`,
+      error,
+    );
+  }
+
+  return data;
+}
+
+/**
+ * Soft-deletes (hides) a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.1/§10.3: sets `deleted_at = now()` rather than
+ * deleting the row, so `matches` referencing it (belonging to the submitter
+ * or to any other user) keep resolving exactly as before. Same ownership
+ * filtering as `updateJobDescription`. Returns `true`/`false` for "a row was
+ * updated" — idempotent, deleting an already-deleted row still returns
+ * `true` (it just re-writes the same kind of value), no special-cased
+ * "already deleted" error.
+ */
+export async function softDeleteJobDescription(
+  supabase: Client,
+  params: { id: string; submittedBy: string },
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return false;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to soft-delete job description ${params.id}: ${error.message}`,
+      error,
+    );
+  }
+
+  return data !== null;
 }
 
 /** One externally-sourced listing, mapped and ready to upsert (see `lib/jobs/`). */

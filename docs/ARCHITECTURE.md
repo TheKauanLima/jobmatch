@@ -282,12 +282,47 @@ matches via cascade).
     one from the other mode's encoding — is treated as "no cursor" (first
     page) rather than erroring, same as today.
 - Response `200`: `{ "job_descriptions": [...], "next_cursor": string | null }`
-  — pass `next_cursor` back verbatim as the next request's `cursor`.
+  — pass `next_cursor` back verbatim as the next request's `cursor`. Rows with
+  `deleted_at` set (per §10) are excluded from every mode of this listing
+  (plain, `?level=`-filtered, and `?q=` search) — a soft-deleted posting never
+  appears in a browse/search result, only via a direct link to its own `:id`
+  (below).
 
 **`GET /api/job-descriptions/:id`** — single job description detail.
 - Auth: required.
-- Response `200`: full row. `404` if it doesn't exist (no ownership check — shared
-  data, any authenticated user can read any row).
+- Response `200`: full row **even if `deleted_at` is set** (per §10) — a link
+  from an existing `matches` row or from the submitter's own view must keep
+  resolving; only listing/search hide a deleted posting, not direct-by-id
+  access. `404` if it doesn't exist at all (no ownership check for reads —
+  shared data, any authenticated user can read any row, deleted or not).
+  Response includes `is_own` (per §10) so the frontend can show Edit/Delete
+  controls without exposing `submitted_by` itself.
+
+**`PATCH /api/job-descriptions/:id`** — edit a job description you submitted.
+Added per §10.
+- Auth: required. Caller must be the row's submitter (`submitted_by =
+  auth.uid()` and `source = 'user'`) — `403` otherwise (not `404`: existence
+  of shared data is already public via `GET`, so there's nothing to hide by
+  using `404` here the way private-resource routes do per this section's
+  intro). `404` if the row doesn't exist at all.
+- Request: `{ "title"?: string, "company"?: string, "description"?: string, "source_url"?: string, "location"?: string, "level"?: "Internship" | "Entry Level" | "Mid Level" | "Senior Level" | "Management" }`
+  — same field-level validation as `POST`'s body (same
+  `JOB_DESCRIPTION_*_MAX_LENGTH` constants, same `level` enum), but every
+  field is optional and at least one must be present.
+- Response `200`: the updated row (same shape as `GET /:id`).
+- Errors: `400` validation failure or empty body, `401` unauthenticated,
+  `403` not the submitter or the row is a `source='themuse'` listing, `404`
+  not found.
+
+**`DELETE /api/job-descriptions/:id`** — soft-delete (hide) a job description
+you submitted. Added per §10.
+- Auth: required, same ownership rule as `PATCH` (`403` if not the caller's
+  own `source='user'` row, `404` if the row doesn't exist).
+- Behavior: sets `deleted_at = now()`. Does **not** delete the row or touch
+  any `matches` referencing it — see §10 for why a hard delete was rejected.
+  Idempotent: deleting an already-deleted row just returns `204` again.
+- Response `204`.
+- Errors: `401`, `403`, `404`.
 
 ### Matches
 
@@ -316,8 +351,11 @@ description.
     "matched_strengths": [...], "gaps": [...], "created_at": "...",
     "job_description": { "id": "...", "title": "...", "company": "..." } } }
   ```
-- Errors: `400` resume not yet analyzed, `404` resume or job description not
-  found/not owned, `502` Claude API failure.
+- Errors: `400` resume not yet analyzed, or the job description has been
+  soft-deleted by its submitter (per §10 — a deleted posting can't be picked
+  as a *new* match target, even though existing matches against it keep
+  working), `404` resume or job description not found/not owned, `502` Claude
+  API failure.
 
 **`GET /api/matches?resume_id=:id`** — list matches for one of the caller's resumes.
 - Auth: required. `resume_id` query param required; 404/empty if not owned by caller.
@@ -329,13 +367,26 @@ description.
 
 **`GET /api/matches`** (no `resume_id`) — added per the dashboard/UX pass on
 2026-09-10: the caller's own most recent matches **across all** their resumes,
-for the dashboard's "Latest matches" panel.
-- Auth: required. Optional `?limit=` (default 5, max 20).
+for the dashboard's "Latest matches" panel **and**, per §11, the full
+`/matches` history page.
+- Auth: required. Optional `?limit=` (default `RECENT_MATCHES_DEFAULT_LIMIT`
+  5, max `RECENT_MATCHES_MAX_LIMIT` — raised from 20 to **50** per §11, since
+  this mode now also backs a full-history page, not only a 5-item dashboard
+  widget). Optional `?cursor=<opaque token>` — added per §11, keyset
+  pagination ordered `created_at desc, id desc` (same tiebreak convention as
+  job descriptions' listing cursor, §2 above), encoded/decoded by
+  `encodeMatchCursor`/`decodeMatchCursor` in `lib/supabase/queries/matches.ts`.
+  Omitting `cursor` returns the first page; a malformed cursor is treated as
+  "no cursor" (first page), same convention as `GET /api/job-descriptions`.
+  Both params are optional and backward compatible — the dashboard's existing
+  call with neither param is unaffected.
 - Response `200`: `{ "matches": [ { ...same shape as the `resume_id`-scoped mode,
-  plus "resume": { "id": "...", "file_name": "..." } } ] }` ordered by
-  `created_at desc`. The extra `resume` field exists because, unlike the
-  `resume_id`-scoped mode, the caller doesn't already know which resume each
-  result belongs to.
+  plus "resume": { "id": "...", "file_name": "..." } } ], "next_cursor": string | null }`
+  ordered by `created_at desc, id desc`. The extra `resume` field exists because,
+  unlike the `resume_id`-scoped mode, the caller doesn't already know which resume
+  each result belongs to. `next_cursor` (added per §11) follows the same
+  "pass it back verbatim" contract as `GET /api/job-descriptions`'s; it is
+  `null` once there are no more rows.
 - Does **not** reopen the enumeration hole the paragraph above avoids — that hole
   is specifically a `job_description_id`-only filter (which would expose *other
   users'* matches against a shared posting). This mode takes no request-supplied
@@ -360,11 +411,19 @@ for the dashboard's "Latest matches" panel.
     [id]/page.tsx                  -- detail: file info, analysis, matches list, "match against a job" action
   /jobs/
     page.tsx                       -- list + submit form
-    [id]/page.tsx                  -- job description detail
-  (no standalone /matches/ pages — match results are inlined into
-   /resumes/[id]/page.tsx's Matches section rather than given their own
-   route; GET /api/matches/:id exists and is tested but has no direct UI
-   consumer in v1, kept for API completeness/future use)
+    [id]/page.tsx                  -- job description detail (Edit/Delete
+                                      controls shown when `is_own`, per §10)
+  /matches/
+    page.tsx                       -- added per §11: full match history
+                                      across all the caller's resumes,
+                                      cursor-paginated ("Load more"); each
+                                      row is already fully expanded (score,
+                                      rationale, matched_strengths, gaps,
+                                      job title/company, date, resume link)
+                                      so there is deliberately no [id]/ detail
+                                      route under here — see §11 for why
+                                      GET /api/matches/:id stays built but
+                                      unconsumed, same status as before
   /api/
     resumes/
       route.ts                     -- GET (list), POST (upload)
@@ -373,9 +432,12 @@ for the dashboard's "Latest matches" panel.
       [id]/analysis/route.ts       -- GET (latest)
     job-descriptions/
       route.ts                     -- GET (list), POST (create)
-      [id]/route.ts                -- GET
+      [id]/route.ts                -- GET (detail), PATCH (edit own, §10),
+                                      DELETE (soft-delete own, §10)
     matches/
-      route.ts                     -- GET (list by resume_id), POST (create)
+      route.ts                     -- GET (list by resume_id; or, with no
+                                      resume_id, cursor-paginated cross-resume
+                                      history per §11), POST (create)
       [id]/route.ts                -- GET
   layout.tsx
   middleware.ts                    -- Supabase session refresh + route protection
@@ -383,8 +445,12 @@ for the dashboard's "Latest matches" panel.
 /components
   /ui/                             -- generic building blocks: Button, Card, Input, Badge, etc.
   /resumes/                        -- ResumeUploadForm, ResumeCard, ResumeList, AnalysisPanel
-  /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList
-  /matches/                        -- MatchScoreBadge, MatchRationale, MatchList, RunMatchForm
+  /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList,
+                                      EditJobDescriptionForm, DeleteJobDescriptionButton (both §10,
+                                      rendered on /jobs/[id] only when `is_own`)
+  /matches/                        -- MatchScoreBadge, MatchRationale, MatchList, RunMatchForm,
+                                      MatchHistoryList (§11 — owns the /matches "Load more" cursor
+                                      state, reuses MatchScoreBadge/MatchRationale for each row)
 
 /lib
   /supabase/
@@ -395,8 +461,10 @@ for the dashboard's "Latest matches" panel.
     queries/
       resumes.ts                   -- getResumeById, listResumesForUser, createResume, deleteResume (all rely on the RLS-scoped server client, not admin)
       analyses.ts                  -- getLatestAnalysis, createAnalysis
-      jobDescriptions.ts           -- listJobDescriptions, getJobDescriptionById, getJobDescriptionsByIds, createJobDescription
-      matches.ts                   -- listMatchesForResume, getMatchById, createMatch
+      jobDescriptions.ts           -- listJobDescriptions, getJobDescriptionById, getJobDescriptionsByIds,
+                                      createJobDescription, updateJobDescription, softDeleteJobDescription (both §10)
+      matches.ts                   -- listMatchesForResume, listRecentMatchesForUser (now cursor-paginated,
+                                      §11 — gains encodeMatchCursor/decodeMatchCursor), getMatchById, createMatch
   /claude/
     client.ts                      -- Anthropic SDK client instantiation (reads ANTHROPIC_API_KEY)
     prompts/
@@ -532,9 +600,9 @@ unilaterally. Flagging them rather than silently picking an answer:
   configurable via env var for v1 — hardcoded constant in `lib/claude/rateLimit.ts`,
   trivial to change later.
 - **Deferred (not blocking v1 build):** job-description mutability (no edit/delete
-  endpoint for now) and account-deletion retention window (immediate hard-delete per
-  the cascade rules in §1, as designed) — both left as-is; revisit if/when they become
-  real product needs.
+  endpoint for now) — **resolved 2026-09-11, see §10** — and account-deletion
+  retention window (immediate hard-delete per the cascade rules in §1, as designed,
+  still deferred) — revisit the latter if/when it becomes a real product need.
 - **Prompt injection hardening:** treated as a build requirement, not optional —
   `lib/claude/prompts/*` must clearly delimit user-supplied resume/job-description text
   as data (not instructions), and `lib/claude/parse.ts` must reject any Claude response
@@ -1373,3 +1441,420 @@ not to need a change at all). Neither is listed below anymore.
    is a product call this document has deliberately not made — noting it
    here since search is the first feature where unbounded row growth has a
    query-cost dimension, not just a UI-pagination one.
+
+---
+
+## 10. Job description mutability — 2026-09-11
+
+### Why
+§5 deferred this: "job-description mutability (no edit/delete endpoint for
+now) ... left as-is; revisit if/when they become real product needs." The
+original worry, from §4 item 4, was that editing a shared `job_descriptions`
+row out from under other users' `matches` rows referencing it "would
+silently invalidate those matches' rationale." Revisiting that worry against
+the schema as actually built (§1, `lib/supabase/queries/matches.ts`) changes
+the answer:
+
+- **`matches.rationale`/`matched_strengths`/`gaps` are not live references to
+  `job_descriptions` — they're snapshots.** `createMatch` in
+  `lib/supabase/queries/matches.ts` writes `params.result.rationale`/
+  `matched_strengths`/`gaps` straight from Claude's response into the
+  `matches` row at creation time and never reads them back from
+  `job_descriptions`. Once a match exists, its explanation is frozen text,
+  independent of whatever the job posting says today. Editing the posting
+  cannot corrupt, blank out, or retroactively change a single existing
+  match's rationale — that half of the original concern was overstated.
+- **What *is* live is the `job_description: { id, title, company }` summary**
+  every match response inlines (`listMatchesForResume`/
+  `listRecentMatchesForUser`/`getMatchById`, all via `getJobDescriptionById`/
+  `getJobDescriptionsByIds`). Editing a posting's title/company *does*
+  change what those three fields show next to old matches. This is the same
+  kind of staleness already accepted elsewhere in this design — a resume's
+  `resume_analyses` history doesn't get retroactively rewritten when the
+  resume is re-analyzed either (§1) — and is arguably *correct* behavior (a
+  submitter fixing a typo'd company name should have that reflected
+  everywhere it's shown), not a defect.
+- **The real risk was mis-stated.** It isn't "rationale gets invalidated."
+  It's: `matches.job_description_id` is `on delete cascade` (§1), so a
+  **hard** delete of a `job_descriptions` row silently deletes every
+  `matches` row referencing it — including matches that belong to *other
+  users*, not the submitter. A submitter unilaterally destroying rows that a
+  different user considers their own match history is a real privacy/data-
+  ownership problem this document hasn't previously called out this
+  precisely. This is the finding that actually drives the decision below,
+  not the rationale-snapshot question (which turned out benign).
+
+### 10.1 Decision
+The submitter of a **`source='user'`** job description may **edit** it
+(title/company/description/source_url/location/level) and may **soft-delete
+(hide)** it. They may never **hard**-delete it. `source='themuse'` rows get
+neither — `submitted_by` is `null` for every externally-ingested row
+(`upsertExternalJobDescriptions` in `lib/supabase/queries/jobDescriptions.ts`
+explicitly sets it; confirmed by reading that function), so there is no
+"submitter" identity to check ownership against in the first place, and
+these rows are already kept in sync by the daily sync job (§7) — a manual
+edit would just get overwritten or drift from the source on the next run.
+
+- **Edit: allowed.** Safe per the snapshot finding above — no existing
+  `matches` row's stored content changes. Restricted to the caller's own
+  `source='user'` rows.
+- **Soft delete (hide): allowed**, via a new `deleted_at` column — chosen
+  specifically to avoid the cascade-to-other-users'-matches risk identified
+  above. A soft-deleted posting disappears from browsing/search (so it stops
+  attracting *new* matches) but every existing `matches` row referencing it —
+  belonging to the submitter or to any other user — keeps resolving exactly
+  as before.
+- **Hard delete: never exposed**, for any row, submitter or not. There is no
+  `DELETE`-that-actually-deletes path in the API. (The existing `on delete
+  cascade` FK stays in the schema — it's still correct behavior for the
+  admin/maintenance case of removing a row directly against the database —
+  it's simply never triggered by a v1 API call.)
+
+### 10.2 Schema changes
+`supabase/migrations/0006_job_description_mutability.sql`, one nullable
+column and one new RLS policy on `job_descriptions`. No change to any other
+table.
+
+| column | type | notes |
+|---|---|---|
+| `deleted_at` | timestamptz | null = visible/active; non-null = soft-deleted by its submitter. Not a new "status" enum — a single nullable timestamp, same pattern this document would use for `resumes`/`matches` if they ever needed one. |
+
+```sql
+alter table job_descriptions add column deleted_at timestamptz;
+
+create policy "job_descriptions_update_own" on job_descriptions
+  for update to authenticated
+  using (submitted_by = auth.uid() and source = 'user')
+  with check (submitted_by = auth.uid() and source = 'user');
+```
+
+This is the first `update`/`delete` policy of any kind on `job_descriptions`
+(§1 has none today). `source = 'user'` is checked in **both** `using` and
+`with check` even though `submitted_by = auth.uid()` alone already excludes
+every `source='themuse'` row (their `submitted_by` is always `null`, which
+can never equal a real `auth.uid()`) — this is defense-in-depth, not dead
+weight: it also stops the caller's own row from being mutated into
+`source='themuse'`/given a fake `external_id` by a direct Postgres call that
+bypasses the API's validation layer, consistent with this document's
+existing "checked twice" philosophy (§2's intro). No `delete` policy is added
+at all — hard delete has no path in or out of RLS, matching §10.1.
+
+`search_job_descriptions` (§9.1) and the plain keyset listing query both gain
+a `deleted_at is null` predicate:
+
+```sql
+create or replace function search_job_descriptions(
+  search_query text,
+  level_filter text default null,
+  limit_count int default 20,
+  offset_count int default 0
+)
+returns setof job_descriptions
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select *
+  from public.job_descriptions
+  where search_vector @@ websearch_to_tsquery('english', search_query)
+    and deleted_at is null
+    and (level_filter is null or level = level_filter)
+  order by
+    ts_rank(search_vector, websearch_to_tsquery('english', search_query)) desc,
+    created_at desc,
+    id desc
+  limit limit_count
+  offset offset_count;
+$$;
+```
+
+(`create or replace function` — same function name/signature as §9.1, just
+the added predicate; not a new function.) `listJobDescriptions` in
+`lib/supabase/queries/jobDescriptions.ts` gains the equivalent
+`.is("deleted_at", null)` filter on its keyset query. `getJobDescriptionById`
+/`getJobDescriptionsByIds` (used both by the detail route and by every
+match's `job_description` join) are **not** changed — a soft-deleted row must
+keep resolving there, per §10.1 and the API contract in §2.
+
+`types/database.ts` needs `deleted_at` added to `job_descriptions`' `Row`
+type on the next hand-update, per the existing regenerate-later TODO (§7.2).
+
+### 10.3 Query-layer and API changes
+- **`lib/supabase/queries/jobDescriptions.ts`** gains:
+  - `updateJobDescription(supabase, { id, submittedBy, patch })` — updates
+    only the caller's own row (filters `.eq("submitted_by", submittedBy)` in
+    addition to relying on RLS, same "checked twice" pattern as every other
+    query function here); returns the updated row or `null` if no row
+    matched (not found, not owned, or a `themuse` row).
+  - `softDeleteJobDescription(supabase, { id, submittedBy })` — same
+    ownership filtering, sets `deleted_at = now()`; returns `true`/`false`
+    for "a row was updated," idempotent (setting `deleted_at` on an
+    already-deleted row still returns `true`, it just re-writes the same
+    kind of value — no special-cased "already deleted" error).
+- **`app/api/job-descriptions/[id]/route.ts`** (existing file — currently
+  `GET` only) gains `PATCH` and `DELETE` handlers. Exact contract in §2
+  (already updated inline above).
+- **`lib/validation/schemas.ts`** gains `jobDescriptionUpdateSchema =
+  jobDescriptionCreateSchema.partial()` plus a `.refine(...)` requiring at
+  least one key present (an empty `PATCH` body is a `400`, not a no-op
+  `200`). Reuses every existing constant/enum (`JOB_DESCRIPTION_*_MAX_LENGTH`,
+  `JOB_DESCRIPTION_LEVELS`) — no new validation rules to keep in sync.
+- **`app/api/matches/route.ts`** (`POST` handler): after loading the job
+  description to build the Claude prompt, reject with `400` if
+  `deleted_at` is set — a soft-deleted posting can't become the target of a
+  *new* match, even though old matches against it keep working. (See §2's
+  updated `POST /api/matches` error list.)
+
+### 10.4 `is_own`, not raw `submitted_by`, on the client
+The frontend needs to know "is this my posting" to show Edit/Delete controls
+on `/jobs/[id]`, but `types/domain.ts`'s `JobDescription` has deliberately
+never exposed `submitted_by` ("the submitter isn't otherwise exposed in the
+UI"). Rather than reverse that stance and leak every submitter's user id to
+every authenticated viewer (this app has no username/profile-display
+feature — a raw uuid would be dead weight for every consumer except this one
+check, and it's new information about *other* users this document hasn't
+previously chosen to expose), `toJobDescription` gains a second parameter and
+computes a boolean instead:
+
+- `toJobDescription(row: JobDescriptionRow, callerId: string): JobDescription`
+  — `is_own: row.submitted_by === callerId`. All three call sites (`POST`,
+  `GET` list, `GET /:id`) already have the caller's `user.id` in scope from
+  their existing `requireSession()` call, so this is a signature change, not
+  new plumbing.
+- `JobDescription` (client type) gains `is_own: boolean` and `deleted_at:
+  string | null` (the latter genuinely client-facing now, unlike
+  `submitted_by`/`external_id`/`search_vector` — the UI needs it to render a
+  "This posting was removed" state per §10.5).
+- `MatchJobDescriptionSummary` (the join inlined into every match response)
+  gains `deleted_at: string | null` too, for the same reason on the match
+  side — `fallbackJobDescriptionSummary` (the defensive "row genuinely
+  missing" case documented in `matches.ts`'s module docstring) sets it to
+  `null`, since that's a different, unrelated failure mode from a soft
+  delete.
+
+### 10.5 UI implications
+- **`app/jobs/[id]/page.tsx`**: when `is_own`, renders new
+  `components/jobs/EditJobDescriptionForm.tsx` (a form pre-filled from the
+  current row, `PATCH`s on submit, same field set/validation as
+  `JobDescriptionForm`) and `components/jobs/DeleteJobDescriptionButton.tsx`
+  (confirm-then-`DELETE`, same interaction pattern as
+  `DeleteResumeButton.tsx`). When `deleted_at` is set, the page shows a
+  banner ("This posting has been removed." — worded slightly differently for
+  the owner, e.g. "You removed this posting.", vs. everyone else) using the
+  existing `neutral-*`/`warning-*` tokens (§6.1) — not `danger-*`; this isn't
+  an error state — and hides `MatchFromJobForm` (no new matches against a
+  removed posting, per §10.3).
+- **`components/matches/MatchList.tsx` / `RecentMatchCard.tsx` /** the new
+  `MatchHistoryList.tsx` (§11): each already renders
+  `match.job_description.title`/`company`; add a small "Removed" badge
+  (reusing `components/ui/Badge`, `neutral-*` tokens) next to the title when
+  `match.job_description.deleted_at` is set. The rationale/score/gaps below
+  it are completely unaffected (§10's whole point) — only this one badge is
+  new.
+- **`app/jobs/page.tsx`/`JobDescriptionList`**: no change. Soft-deleted rows
+  never reach this list (§10.2's query-layer filter), so there's nothing for
+  the listing UI to special-case.
+
+### 10.6 Deliberately out of scope for this pass
+- **No restore/undelete endpoint.** `PATCH` still works on a soft-deleted
+  row (a submitter can fix content before, hypothetically, someone adds a
+  restore button later), but there's no way to clear `deleted_at` from the
+  UI in v1. Small and additive to add later (`deleted_at: null` via the same
+  `updateJobDescription` machinery) if this turns out to be an annoyance —
+  not built now because nothing in this task asked for it and it's not
+  needed to resolve the deferred §4/§5 item.
+- **No hard-delete path, even for a posting with zero matches against it.**
+  Special-casing "delete for real if nothing references it yet" was
+  considered and rejected: match count isn't a stable invariant to branch
+  on (a listing can go from zero to nonzero matches between the check and
+  the delete), and having two different delete behaviors depending on timing
+  is more complexity than the soft-delete-always rule for a benefit no one
+  has asked for.
+- **No UI warning that a match's job description text has changed since the
+  match was run.** Possible nice-to-have (compare `match.created_at` to the
+  job description's `updated_at`), but §10's core finding is that this
+  doesn't corrupt anything — it's a "the world changed since this snapshot"
+  notice, not a correctness fix. Not built here; flagging so it isn't
+  mistaken for an oversight.
+- **No column-level restriction stopping a submitter from editing `source`,
+  `external_id`, or `submitted_by` on their own row via a direct Postgres
+  call** beyond the `with check` clause in §10.2 (Postgres RLS is row-level,
+  not column-level, by design) — the `with check` clause is the actual
+  enforcement; noting it here only so it's clear this was a deliberate use
+  of that mechanism, not an oversight that a future column-level grant needs
+  to fix.
+
+### 10.7 Open questions for the user
+None blocking. The mutability question §4/§5 deferred is fully resolved by
+this section — edit and soft-delete, `source='user'` rows the caller
+submitted only, no hard delete ever. Flagging one product nuance, not a
+blocking decision: the "Removed" badge wording in §10.5 and whether removed
+postings should also disappear from a resume's `RunMatchForm` job list
+(§9.4's debounced search already excludes them, since it goes through the
+same `search_job_descriptions` function) — believed already handled
+correctly by construction, but worth a quick visual check once built, same
+as §8.1's "reviewed-in-code but not click-tested" caveat.
+
+---
+
+## 11. Standalone match history page — 2026-09-11
+
+### Why
+§3's folder structure has carried this note since the app's early structure
+was laid down: "(no standalone /matches/ pages — match results are inlined
+into /resumes/[id]/page.tsx's Matches section rather than given their own
+route; GET /api/matches/:id exists and is tested but has no direct UI
+consumer in v1, kept for API completeness/future use)." That was a reasonable
+default when a user's only path to "see my matches" was drilling into one
+resume at a time. §8 already added a cross-resume mode to `GET /api/matches`
+(`listRecentMatchesForUser`, dashboard's "Latest matches" panel, capped at 5
+default/20 max) — but a 20-row cap sized for a dashboard widget isn't a
+history page. This section builds the real thing: `/matches`, all of a
+user's matches across all their resumes.
+
+### 11.1 Pagination: extend the existing cross-resume mode, don't build a new one
+**Decision: add keyset pagination to `GET /api/matches` (no `resume_id`)
+rather than accept a single higher-limit fetch.** The daily cap on both
+Claude-calling endpoints is 20/day **per user** (§5) — worst case is
+thousands of matches over a year of heavy use, which is not "acceptable to
+fetch in one response" by any reasonable definition, even if *typical* usage
+is far below the cap. Sizing a history page's data contract around assumed
+typical behavior rather than the actual documented ceiling is exactly the
+kind of assumption this document tries not to make silently. The pagination
+machinery this needs already exists in near-identical form for
+`job_descriptions`' keyset listing (§2/§9.2), so this is reuse, not new
+design:
+
+- `listRecentMatchesForUser` (in `lib/supabase/queries/matches.ts`) gains a
+  `cursor` parameter and orders `created_at desc, id desc` (adding the `id`
+  tiebreak it currently lacks — today's dashboard-only use never needed one
+  at `limit <= 20` fetched fresh every render, but a "Load more" flow that
+  pages through history needs a deterministic order across requests the same
+  way `job_descriptions`' listing already does). Fetches `limit + 1` rows to
+  derive `next_cursor`/`hasMore`, same trick `listJobDescriptions` and
+  `searchJobDescriptions` already use (§9.1).
+- New `encodeMatchCursor`/`decodeMatchCursor` in the same file — a `matches`-
+  specific compound token (`<created_at>_<id>`), **not** a shared/generic
+  cursor codec with `job_descriptions`' — kept local to this table the same
+  way `job_descriptions`' cursor codec is kept local to
+  `lib/supabase/queries/jobDescriptions.ts` rather than factored out. These
+  two tables' pagination just happens to look alike; there's no reason to
+  couple them through shared code for that.
+- `RECENT_MATCHES_MAX_LIMIT` rises from 20 to **50** — high enough that a
+  `/matches` page fetching `limit=20` per "Load more" click doesn't feel
+  clipped, without being so high it defeats the point of paginating at all.
+  `RECENT_MATCHES_DEFAULT_LIMIT` (5, the dashboard's default) is unchanged.
+- The `resume_id`-scoped mode (`listMatchesForResume`, backing
+  `/resumes/[id]`'s inline `MatchList`) is **unchanged** — deliberately out
+  of scope here. It's naturally bounded (one resume's own match count, not
+  every resume a user has), `MatchList`'s own docstring already explains why
+  it reads the full array from props rather than paginating, and nothing
+  about this section's problem (a *cross-resume* history view) touches it.
+
+Exact contract: see §2's updated `GET /api/matches` (no `resume_id`) entry
+above (already folded in) — `?cursor=`/`next_cursor` follow the identical
+"opaque, pass back verbatim, malformed = first page" rules as
+`GET /api/job-descriptions`, just with their own codec functions per the
+bullet above.
+
+### 11.2 The page: `/matches`
+- **`app/matches/page.tsx`** (new) — Server Component, same auth-gating
+  pattern as `/resumes`/`/jobs` (no session → redirect to `/login`). SSR
+  fetch via `serverFetch`: `GET /api/matches?limit=20` (a page-sized default,
+  not the dashboard's 5 — this route calls the endpoint with its own
+  explicit `limit`, it does not rely on the endpoint's default). Passes the
+  initial `{ matches, next_cursor }` into `MatchHistoryList`.
+- **`components/matches/MatchHistoryList.tsx`** (new) — client component,
+  owns "Load more" state exactly the way `JobDescriptionList` does today
+  (local `useState` array of additional pages, appends on each successful
+  fetch to `GET /api/matches?limit=20&cursor=...`, hides the "Load more"
+  button once `next_cursor` is `null`). Per row, reuses existing pieces
+  rather than inventing new presentation:
+  - `MatchScoreBadge` (score)
+  - job title (links to `/jobs/[id]`) / company, with the "Removed" badge
+    from §10.5 when applicable
+  - `created_at`, formatted the same way `MatchList` already formats it
+    (`new Date(...).toLocaleString()`)
+  - `resume.file_name`, linking to `/resumes/[id]` — same as
+    `RecentMatchCard`'s existing resume link, needed here for the same
+    reason: a cross-resume list can't assume the viewer already knows which
+    resume a row belongs to.
+  - `MatchRationale` (the full rationale/matched_strengths/gaps block),
+    reused as-is from `components/matches/MatchRationale.tsx` — **every row
+    is already fully expanded**, not collapsed/summarized. See §11.3 for why
+    that's the right call rather than a `/matches/[id]` detail route.
+  - Empty state: same tone as `MatchList`'s ("No matches yet.") with a link
+    to `/resumes` to start one.
+- **`app/dashboard/page.tsx`**'s existing "Latest matches" panel gains a
+  "View all matches →" link to `/matches` — otherwise the new page has no
+  discoverable entry point besides typing the URL. Add a "Matches" link to
+  the primary nav (`components/Nav.tsx`, alongside the existing
+  Resumes/Jobs links) for the same reason.
+
+### 11.3 No `/matches/[id]` detail route — `GET /api/matches/:id` stays built, unconsumed
+Deciding this the same way §3 already reasoned about `/resumes/[id]` never
+needing a separate match page: a detail route earns its place only if the
+detail endpoint returns something the list doesn't already have. Checking
+`GET /api/matches/:id` against `GET /api/matches` (no `resume_id`) confirms
+it doesn't — both return the exact same `MatchWithJobDescription`/
+`RecentMatchWithContext` shape (`score`, `rationale`, `matched_strengths`,
+`gaps`, `job_description` summary, `created_at`, and — for the cross-resume
+mode — `resume`). Unlike `resumes` (whose list response omits
+`extracted_text` for size, per §2, making the detail fetch load real
+additional data), there is no field `GET /api/matches/:id` would surface
+that `MatchHistoryList`'s rows don't already render inline via
+`MatchRationale`. A click-through to a detail page would therefore be a
+strictly worse experience (an extra navigation, a second loading state) for
+zero new information.
+
+**Decision: no `/matches/[id]` route.** `GET /api/matches/:id` remains
+exactly as it was described before this section — "exists and is tested but
+has no direct UI consumer in v1, kept for API completeness/future use" — this
+section doesn't change that status, it just confirms it was already the
+right call by actually checking the shapes rather than assuming. Nothing
+about §2's `GET /api/matches/:id` entry changes.
+
+### 11.4 Filter/sort: none for v1
+Per-row content stays as designed above with no filter or sort controls.
+Reasoning, not a default-by-omission:
+- **Sort by score** would need the same kind of pagination redesign §9.2
+  already worked through for search ranking (a non-indexed, computed-per-row
+  order can't cleanly extend a keyset cursor — see §9.2's `ts_rank`
+  discussion, which is the identical shape of problem: "sort by something
+  that isn't a stored column" always trades away simple keyset pagination).
+  There's no evidence yet that users need to sort a match history by score
+  rather than recency — building the more complex pagination mode on
+  spec, for a need nobody has asked for, is exactly the kind of speculative
+  complexity this document otherwise avoids (see §7.5/§9.5's own
+  "deliberately out of scope" reasoning for the same pattern).
+- **Filter by resume** is more plausible as a real future ask (a user with
+  many resumes might want "just this resume's matches" without leaving
+  `/matches`), but that's already served today by `/resumes/[id]`'s inline
+  `MatchList` — this page's whole reason to exist is the cross-resume view,
+  so a resume filter would partially duplicate a page that already exists.
+  Not built.
+- **Date range** — no evidence of need at v1's realistic volume (bounded by
+  the 20/day cap, §5); "Load more" through recency-ordered pages already
+  gets a user to "matches from around this time" without a dedicated filter
+  UI.
+
+### 11.5 Deliberately out of scope for this pass
+- **No change to `listMatchesForResume`/`/resumes/[id]`'s inline `MatchList`.**
+  That view stays exactly as it is — §11.1 explains why it doesn't need
+  pagination, and there's no reason to also duplicate `/matches`' cursor
+  machinery there.
+- **No bulk actions** (e.g. "re-run all stale matches," "delete a match from
+  history"). `matches` remains an append-only history table per §1 — nothing
+  in this section changes that, and delete-a-match wasn't asked for.
+- **No export/CSV of match history.** Plausible future ask for a
+  job-search-tracking feature, out of scope for what this task asked for.
+
+### 11.6 Open questions for the user
+None blocking. Both design questions this section was asked to resolve
+(pagination strategy, whether a detail route is needed) have concrete
+answers with reasoning above. One thing worth a product opinion later, not
+now: whether `/matches` should eventually support the same score/date sort
+control flagged as deliberately out of scope in §11.4 — noted there so it
+isn't silently assumed unnecessary forever, just not built without evidence
+of need.

@@ -66,6 +66,7 @@ export function Nav({ userEmail }: NavProps) {
         { href: "/dashboard", label: "Dashboard" },
         { href: "/resumes", label: "Resumes" },
         { href: "/jobs", label: "Jobs" },
+        { href: "/matches", label: "Matches" },
       ]
     : [{ href: "/login", label: "Log in" }];
 

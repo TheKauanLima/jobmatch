@@ -8,6 +8,7 @@ import { getLatestAnalysis } from "@/lib/supabase/queries/analyses";
 import { getJobDescriptionById } from "@/lib/supabase/queries/jobDescriptions";
 import {
   createMatch,
+  encodeMatchCursor,
   listMatchesForResume,
   listRecentMatchesForUser,
   RECENT_MATCHES_DEFAULT_LIMIT,
@@ -119,15 +120,23 @@ async function getValidatedMatchAssessment(
  * - no `resume_id` — the caller's own most recent matches **across all**
  *   their resumes (optionally `?limit=`, default/max per
  *   `RECENT_MATCHES_DEFAULT_LIMIT`/`RECENT_MATCHES_MAX_LIMIT`), added for the
- *   dashboard's "Latest matches" panel. Each result includes a `resume`
- *   summary (absent from the `resume_id`-scoped shape, since that mode's
- *   caller already knows which resume they queried) — see
- *   `types/domain.ts#RecentMatch`. This is NOT the `job_description_id`-only
- *   enumeration mode ARCHITECTURE.md §2 deliberately excludes (that would let
- *   a caller see *other users'* matches against a shared job posting) — this
- *   mode takes no filter beyond the caller's own `user.id`, so it can only
- *   ever return rows the caller already owns, same as the `resume_id`-scoped
- *   mode. See `listRecentMatchesForUser`'s docstring for the full reasoning.
+ *   dashboard's "Latest matches" panel and, per docs/ARCHITECTURE.md §11,
+ *   extended with `?cursor=<opaque token>` for the full `/matches` history
+ *   page — keyset pagination ordered `created_at desc, id desc`, encoded/
+ *   decoded by `encodeMatchCursor`/`decodeMatchCursor` in
+ *   `lib/supabase/queries/matches.ts`. Omitting `cursor` returns the first
+ *   page; a malformed cursor is treated as "no cursor" (first page), same
+ *   convention as `GET /api/job-descriptions`. `next_cursor` in the response
+ *   follows the same "pass it back verbatim" contract, `null` once there are
+ *   no more rows. Each result includes a `resume` summary (absent from the
+ *   `resume_id`-scoped shape, since that mode's caller already knows which
+ *   resume they queried) — see `types/domain.ts#RecentMatch`. This is NOT the
+ *   `job_description_id`-only enumeration mode ARCHITECTURE.md §2
+ *   deliberately excludes (that would let a caller see *other users'*
+ *   matches against a shared job posting) — this mode takes no filter beyond
+ *   the caller's own `user.id`, so it can only ever return rows the caller
+ *   already owns, same as the `resume_id`-scoped mode. See
+ *   `listRecentMatchesForUser`'s docstring for the full reasoning.
  */
 export async function GET(request: Request) {
   let user;
@@ -146,6 +155,7 @@ export async function GET(request: Request) {
 
   if (!resumeId) {
     const limitParam = url.searchParams.get("limit");
+    const cursorParam = url.searchParams.get("cursor");
     let limit = RECENT_MATCHES_DEFAULT_LIMIT;
     if (limitParam !== null) {
       const parsed = Number(limitParam);
@@ -159,11 +169,17 @@ export async function GET(request: Request) {
     }
 
     try {
-      const matches = await listRecentMatchesForUser(supabase, user.id, limit);
+      const { items, hasMore } = await listRecentMatchesForUser(supabase, user.id, {
+        limit,
+        cursor: cursorParam,
+      });
+
+      const lastItem = items[items.length - 1];
+      const next_cursor = hasMore && lastItem ? encodeMatchCursor(lastItem) : null;
+
       return NextResponse.json({
-        matches: matches.map((row) =>
-          toRecentMatch(row, row.job_description, row.resume),
-        ),
+        matches: items.map((row) => toRecentMatch(row, row.job_description, row.resume)),
+        next_cursor,
       });
     } catch (err) {
       console.error(
@@ -206,10 +222,12 @@ export async function GET(request: Request) {
  *
  * Flow (exact order per the architecture contract): auth -> validate body ->
  * resume ownership check (404) -> latest analysis exists (400, "must be
- * analyzed before matching") -> job description exists (404) -> daily
- * rate-limit check (429) -> call Claude -> validate its response -> insert a
- * `matches` row -> respond `201` with the joined job description summary
- * inlined.
+ * analyzed before matching") -> job description exists (404) -> job
+ * description not soft-deleted (400, per docs/ARCHITECTURE.md §10.3 — a
+ * removed posting can't become the target of a *new* match, though existing
+ * matches against it keep working) -> daily rate-limit check (429) -> call
+ * Claude -> validate its response -> insert a `matches` row -> respond `201`
+ * with the joined job description summary inlined.
  *
  * Never logs resume/job-description text or Claude response content — only
  * error messages, per the no-PII-in-logs rule (see CLAUDE.md).
@@ -294,6 +312,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Not found." }, { status: 404 });
   }
 
+  if (jobDescription.deleted_at) {
+    return NextResponse.json(
+      { error: "This job description has been removed and can't be matched against." },
+      { status: 400 },
+    );
+  }
+
   try {
     const rateLimitResult = await checkRateLimit(supabase, user.id, {
       kind: "match",
@@ -356,6 +381,7 @@ export async function POST(request: Request) {
         id: jobDescription.id,
         title: jobDescription.title,
         company: jobDescription.company,
+        deleted_at: jobDescription.deleted_at,
       }),
     },
     { status: 201 },

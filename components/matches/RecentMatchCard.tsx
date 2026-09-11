@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { RecentMatch } from "@/types/domain";
 import { MatchScoreBadge } from "@/components/matches/MatchScoreBadge";
+import { Badge } from "@/components/ui/Badge";
 
 interface RecentMatchCardProps {
   match: RecentMatch;
@@ -23,9 +24,12 @@ export function RecentMatchCard({ match }: RecentMatchCardProps) {
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="truncate text-sm font-medium text-fg">
-            {match.job_description.title}
-          </p>
+          <div className="flex min-w-0 items-center gap-2">
+            <p className="truncate text-sm font-medium text-fg">
+              {match.job_description.title}
+            </p>
+            {match.job_description.deleted_at && <Badge>Removed</Badge>}
+          </div>
           {match.job_description.company && (
             <p className="truncate text-sm text-fg-muted">
               {match.job_description.company}

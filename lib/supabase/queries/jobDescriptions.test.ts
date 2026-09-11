@@ -12,6 +12,8 @@ import {
   JobDescriptionQueryError,
   listJobDescriptions,
   searchJobDescriptions,
+  softDeleteJobDescription,
+  updateJobDescription,
   upsertExternalJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
 
@@ -38,8 +40,10 @@ function makeQueryBuilder(resolvedValue: {
   builder.select = record("select");
   builder.insert = record("insert");
   builder.upsert = record("upsert");
+  builder.update = record("update");
   builder.eq = record("eq");
   builder.in = record("in");
+  builder.is = record("is");
   builder.order = record("order");
   builder.limit = record("limit");
   builder.lt = record("lt");
@@ -108,6 +112,15 @@ describe("listJobDescriptions", () => {
     // The old strict single-column filter must not be used any more — it's
     // exactly the filter that made tied rows permanently unreachable.
     expect(calls.some((c) => c.method === "lt")).toBe(false);
+  });
+
+  it("filters out soft-deleted rows via .is('deleted_at', null), per docs/ARCHITECTURE.md §10.2", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20 });
+
+    expect(calls).toContainEqual({ method: "is", args: ["deleted_at", null] });
   });
 
   it("filters by level with .eq() when a level is given", async () => {
@@ -695,6 +708,201 @@ describe("upsertExternalJobDescriptions", () => {
 
     await expect(
       upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("updateJobDescription — per docs/ARCHITECTURE.md §10.3", () => {
+  it("scopes the update by both id AND submitted_by (the 'checked twice' ownership pattern)", async () => {
+    const row = makeRow({ title: "New Title" });
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["id", TEST_UUID] });
+    expect(calls).toContainEqual({ method: "eq", args: ["submitted_by", "user-1"] });
+  });
+
+  it("returns the updated row when a row matched", async () => {
+    const row = makeRow({ title: "New Title" });
+    const { builder } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    expect(result).toEqual(row);
+  });
+
+  it("returns null when no row matched (not found, not owned, or a themuse row) — caller turns this into 403", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "attacker",
+      patch: { title: "Hijacked" },
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("only writes columns present (!== undefined) in the patch — an absent key is left off the update payload entirely", async () => {
+    const row = makeRow();
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(written).toEqual({ title: "New Title" });
+    expect(written).not.toHaveProperty("company");
+    expect(written).not.toHaveProperty("location");
+  });
+
+  it("writes an explicit null for a nullable field to clear it (distinct from an absent/undefined key)", async () => {
+    const row = makeRow({ company: null });
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { company: null },
+    });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(written).toHaveProperty("company", null);
+  });
+
+  it("returns null (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: "not-a-real-id",
+      submittedBy: "user-1",
+      patch: { title: "x" },
+    });
+    expect(result).toBeNull();
+  });
+
+  it("throws JobDescriptionQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      updateJobDescription(client, {
+        id: TEST_UUID,
+        submittedBy: "user-1",
+        patch: { title: "x" },
+      }),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("softDeleteJobDescription — per docs/ARCHITECTURE.md §10.1/§10.3", () => {
+  it("scopes the update by both id AND submitted_by", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    await softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["id", TEST_UUID] });
+    expect(calls).toContainEqual({ method: "eq", args: ["submitted_by", "user-1"] });
+  });
+
+  it("sets deleted_at to a timestamp (soft delete, not a real DELETE)", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    await softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(typeof written.deleted_at).toBe("string");
+    expect(calls.some((c) => c.method === "delete")).toBe(false);
+  });
+
+  it("returns true when a row matched", async () => {
+    const { builder } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false when no row matched (not found, not owned, or a themuse row)", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "attacker",
+    });
+    expect(result).toBe(false);
+  });
+
+  it("is idempotent: deleting an already-deleted row still returns true, not a special error", async () => {
+    // An already-soft-deleted row still matches `.eq("id", ...).eq("submitted_by", ...)`
+    // (deleted_at being set doesn't remove it from that filter), so re-running
+    // the update just re-writes deleted_at and still returns a row.
+    const { builder } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: "not-a-real-id",
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(false);
+  });
+
+  it("throws JobDescriptionQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" }),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
 });

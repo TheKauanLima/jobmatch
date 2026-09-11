@@ -115,6 +115,55 @@ function isHttpOrHttpsUrl(value: string): boolean {
 }
 
 /**
+ * Base field schemas shared between `jobDescriptionCreateSchema` and
+ * `jobDescriptionUpdateSchema` — single source of truth for the length caps/
+ * URL-scheme/enum validation that applies whenever one of these fields is
+ * actually provided with a non-empty value, in either request.
+ */
+const jobDescriptionTitleSchema = z
+  .string()
+  .trim()
+  .min(1, "title must not be empty.")
+  .max(
+    JOB_DESCRIPTION_TITLE_MAX_LENGTH,
+    `title must be at most ${JOB_DESCRIPTION_TITLE_MAX_LENGTH} characters.`,
+  );
+const jobDescriptionCompanySchema = z
+  .string()
+  .trim()
+  .min(1, "company must not be empty when provided.")
+  .max(
+    JOB_DESCRIPTION_COMPANY_MAX_LENGTH,
+    `company must be at most ${JOB_DESCRIPTION_COMPANY_MAX_LENGTH} characters.`,
+  );
+const jobDescriptionDescriptionSchema = z
+  .string()
+  .trim()
+  .min(1, "description must not be empty.")
+  .max(
+    JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH,
+    `description must be at most ${JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH} characters.`,
+  );
+const jobDescriptionSourceUrlSchema = z
+  .string()
+  .trim()
+  .max(
+    JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH,
+    `source_url must be at most ${JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH} characters.`,
+  )
+  .url("source_url must be a valid URL.")
+  .refine(isHttpOrHttpsUrl, "source_url must use the http or https scheme.");
+const jobDescriptionLocationSchema = z
+  .string()
+  .trim()
+  .min(1, "location must not be empty when provided.")
+  .max(
+    JOB_DESCRIPTION_LOCATION_MAX_LENGTH,
+    `location must be at most ${JOB_DESCRIPTION_LOCATION_MAX_LENGTH} characters.`,
+  );
+const jobDescriptionLevelSchema = z.enum(JOB_DESCRIPTION_LEVELS);
+
+/**
  * Request body for submitting a job description, per
  * docs/ARCHITECTURE.md §2: `title` and `description` are required and must
  * be non-empty (not just present); `company` and `source_url` are optional.
@@ -125,55 +174,75 @@ function isHttpOrHttpsUrl(value: string): boolean {
  * the renderer to sanitize later.
  */
 export const jobDescriptionCreateSchema = z.object({
-  title: z
-    .string()
-    .trim()
-    .min(1, "title must not be empty.")
-    .max(
-      JOB_DESCRIPTION_TITLE_MAX_LENGTH,
-      `title must be at most ${JOB_DESCRIPTION_TITLE_MAX_LENGTH} characters.`,
-    ),
-  company: z
-    .string()
-    .trim()
-    .min(1, "company must not be empty when provided.")
-    .max(
-      JOB_DESCRIPTION_COMPANY_MAX_LENGTH,
-      `company must be at most ${JOB_DESCRIPTION_COMPANY_MAX_LENGTH} characters.`,
-    )
-    .optional(),
-  description: z
-    .string()
-    .trim()
-    .min(1, "description must not be empty.")
-    .max(
-      JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH,
-      `description must be at most ${JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH} characters.`,
-    ),
-  source_url: z
-    .string()
-    .trim()
-    .max(
-      JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH,
-      `source_url must be at most ${JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH} characters.`,
-    )
-    .url("source_url must be a valid URL.")
-    .refine(isHttpOrHttpsUrl, "source_url must use the http or https scheme.")
-    .optional(),
-  location: z
-    .string()
-    .trim()
-    .min(1, "location must not be empty when provided.")
-    .max(
-      JOB_DESCRIPTION_LOCATION_MAX_LENGTH,
-      `location must be at most ${JOB_DESCRIPTION_LOCATION_MAX_LENGTH} characters.`,
-    )
-    .optional(),
-  level: z.enum(JOB_DESCRIPTION_LEVELS).optional(),
+  title: jobDescriptionTitleSchema,
+  company: jobDescriptionCompanySchema.optional(),
+  description: jobDescriptionDescriptionSchema,
+  source_url: jobDescriptionSourceUrlSchema.optional(),
+  location: jobDescriptionLocationSchema.optional(),
+  level: jobDescriptionLevelSchema.optional(),
 });
 
 export type JobDescriptionCreateInput = z.infer<
   typeof jobDescriptionCreateSchema
+>;
+
+/**
+ * Wraps one of the base field schemas above for `PATCH` semantics on a
+ * *nullable* `job_descriptions` column (`company`/`source_url`/`location`/
+ * `level` — per docs/ARCHITECTURE.md §1/§7, all four are nullable in the
+ * database). `updateJobDescription`
+ * (`lib/supabase/queries/jobDescriptions.ts`) already distinguishes an
+ * **absent** key (leave the column untouched — `undefined`) from a
+ * **present** one (write it), so this schema-level wrapper is what makes a
+ * *third* state reachable over JSON: an explicit empty string (after
+ * trimming — covers both `""` and whitespace-only input, since a form field
+ * cleared by the user produces `""`) or an explicit `null` is normalized to
+ * `null` here, which `updateJobDescription` then writes as a real `null` —
+ * clearing an already-set optional field back to empty, which was
+ * previously impossible via this endpoint (only *changing* to a different
+ * non-empty value worked, since the base schemas above reject `""` via
+ * `.min(1, ...)`). A present, non-empty value still runs the field's normal
+ * validation (length caps, URL scheme, enum membership) unchanged.
+ */
+function clearableOptional<T extends z.ZodTypeAny>(schema: T) {
+  return z.preprocess(
+    (value) =>
+      typeof value === "string" && value.trim().length === 0 ? null : value,
+    schema.nullable().optional(),
+  );
+}
+
+/**
+ * Request body for `PATCH /api/job-descriptions/:id`, per
+ * docs/ARCHITECTURE.md §10.3: every field from `jobDescriptionCreateSchema`
+ * becomes optional (same field-level validation when a non-empty value is
+ * given — same `JOB_DESCRIPTION_*_MAX_LENGTH` constants, same `level` enum),
+ * but at least one key must be present so an empty `PATCH` body is a `400`,
+ * not a no-op `200`.
+ *
+ * `title`/`description` stay plain "non-empty when provided" (via
+ * `.optional()` alone) — they're `not null` columns, so there's no "clear to
+ * null" state that makes sense for them. `company`/`source_url`/`location`/
+ * `level` go through `clearableOptional` instead, so a submitter can
+ * explicitly clear one of those back to `null` (see that function's
+ * docstring) — the gap this schema shipped with originally: it silently had
+ * no way to un-set an already-set optional field at all.
+ */
+export const jobDescriptionUpdateSchema = z
+  .object({
+    title: jobDescriptionTitleSchema.optional(),
+    company: clearableOptional(jobDescriptionCompanySchema),
+    description: jobDescriptionDescriptionSchema.optional(),
+    source_url: clearableOptional(jobDescriptionSourceUrlSchema),
+    location: clearableOptional(jobDescriptionLocationSchema),
+    level: clearableOptional(jobDescriptionLevelSchema),
+  })
+  .refine((data) => Object.keys(data).length > 0, {
+    message: "Request body must include at least one field to update.",
+  });
+
+export type JobDescriptionUpdateInput = z.infer<
+  typeof jobDescriptionUpdateSchema
 >;
 
 // ---------------------------------------------------------------------
