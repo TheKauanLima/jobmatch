@@ -169,6 +169,39 @@ export async function updateResume(
 }
 
 /**
+ * Batch-fetches resumes by id, scoped to their owner. Used by
+ * `lib/supabase/queries/matches.ts#listRecentMatchesForUser` to join a
+ * resume `file_name` summary onto a cross-resume matches listing without an
+ * N+1 query per match. Unlike `job_descriptions` (shared data), resumes are
+ * private — every id is additionally filtered by `user_id` so this can never
+ * return another user's resume even if called with an unexpected id.
+ */
+export async function getResumesByIds(
+  supabase: Client,
+  userId: string,
+  ids: string[],
+): Promise<ResumeRow[]> {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from("resumes")
+    .select("*")
+    .in("id", ids)
+    .eq("user_id", userId);
+
+  if (error) {
+    throw new ResumeQueryError(
+      `Failed to fetch resumes by id: ${error.message}`,
+      error,
+    );
+  }
+
+  return data ?? [];
+}
+
+/**
  * Deletes a resume row, scoped to its owner. Does **not** touch the
  * Storage object — callers must delete that separately via
  * `lib/storage/resumeFiles.ts#deleteResumeFile` (see

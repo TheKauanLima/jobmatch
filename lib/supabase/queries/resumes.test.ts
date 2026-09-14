@@ -4,6 +4,7 @@ import {
   createResume,
   deleteResume,
   getResumeById,
+  getResumesByIds,
   listResumesForUser,
   ResumeQueryError,
 } from "@/lib/supabase/queries/resumes";
@@ -34,6 +35,7 @@ function makeQueryBuilder(resolvedValue: {
   builder.insert = record("insert");
   builder.delete = record("delete");
   builder.eq = record("eq");
+  builder.in = record("in");
   builder.order = record("order");
   // Terminal methods resolve the "promise".
   builder.maybeSingle = vi.fn().mockResolvedValue(resolvedValue);
@@ -146,6 +148,48 @@ describe("getResumeById — privacy boundary", () => {
     await expect(getResumeById(client, "user-1", "some-id")).rejects.toThrow(
       ResumeQueryError,
     );
+  });
+});
+
+describe("getResumesByIds — privacy boundary", () => {
+  it("returns [] immediately without querying when ids is empty", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    const result = await getResumesByIds(client, "user-1", []);
+
+    expect(result).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it("filters by ids AND user_id (never another user's resume, even if their id is passed)", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await getResumesByIds(client, "user-1", ["resume-1", "resume-2"]);
+
+    expect(calls).toContainEqual({ method: "in", args: ["id", ["resume-1", "resume-2"]] });
+    expect(calls).toContainEqual({ method: "eq", args: ["user_id", "user-1"] });
+  });
+
+  it("returns [] when data is null", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await getResumesByIds(client, "user-1", ["resume-1"]);
+    expect(result).toEqual([]);
+  });
+
+  it("throws ResumeQueryError on a Postgres error", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { message: "boom" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      getResumesByIds(client, "user-1", ["resume-1"]),
+    ).rejects.toThrow(ResumeQueryError);
   });
 });
 

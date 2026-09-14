@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Match } from "@/types/domain";
 import { MatchScoreBadge } from "@/components/matches/MatchScoreBadge";
 import { MatchRationale } from "@/components/matches/MatchRationale";
+import { Badge } from "@/components/ui/Badge";
 
 interface MatchListProps {
   matches: Match[];
@@ -46,12 +47,15 @@ export function MatchList({ matches }: MatchListProps) {
             <div className="flex min-w-0 items-center gap-3">
               <MatchScoreBadge score={match.score} />
               <div className="min-w-0">
-                <Link
-                  href={`/jobs/${match.job_description.id}`}
-                  className="truncate text-sm font-medium text-fg hover:underline"
-                >
-                  {match.job_description.title}
-                </Link>
+                <div className="flex min-w-0 items-center gap-2">
+                  <Link
+                    href={`/jobs/${match.job_description.id}`}
+                    className="truncate text-sm font-medium text-fg hover:underline"
+                  >
+                    {match.job_description.title}
+                  </Link>
+                  {match.job_description.deleted_at && <Badge>Removed</Badge>}
+                </div>
                 {match.job_description.company && (
                   <p className="truncate text-sm text-fg-muted">
                     {match.job_description.company}

@@ -3,12 +3,18 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createJobDescription,
   decodeJobDescriptionCursor,
+  decodeJobDescriptionOffsetCursor,
   encodeJobDescriptionCursor,
+  encodeJobDescriptionOffsetCursor,
   getJobDescriptionById,
   getJobDescriptionsByIds,
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JobDescriptionQueryError,
   listJobDescriptions,
+  searchJobDescriptions,
+  softDeleteJobDescription,
+  updateJobDescription,
+  upsertExternalJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
 
 /**
@@ -16,7 +22,11 @@ import {
  * lib/supabase/queries/resumes.test.ts, extended with `.limit()`, `.lt()`,
  * and `.or()` for compound-cursor pagination.
  */
-function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
+function makeQueryBuilder(resolvedValue: {
+  data: unknown;
+  error: unknown;
+  count?: number | null;
+}) {
   const calls: { method: string; args: unknown[] }[] = [];
 
   const builder: Record<string, unknown> = {};
@@ -29,8 +39,11 @@ function makeQueryBuilder(resolvedValue: { data: unknown; error: unknown }) {
 
   builder.select = record("select");
   builder.insert = record("insert");
+  builder.upsert = record("upsert");
+  builder.update = record("update");
   builder.eq = record("eq");
   builder.in = record("in");
+  builder.is = record("is");
   builder.order = record("order");
   builder.limit = record("limit");
   builder.lt = record("lt");
@@ -61,6 +74,11 @@ function makeRow(overrides: Partial<Record<string, unknown>> = {}) {
     source_url: null,
     created_at: "2026-01-01T00:00:00.000Z",
     updated_at: "2026-01-01T00:00:00.000Z",
+    source: "user",
+    external_id: null,
+    level: null,
+    location: null,
+    posted_at: null,
     ...overrides,
   };
 }
@@ -94,6 +112,33 @@ describe("listJobDescriptions", () => {
     // The old strict single-column filter must not be used any more — it's
     // exactly the filter that made tied rows permanently unreachable.
     expect(calls.some((c) => c.method === "lt")).toBe(false);
+  });
+
+  it("filters out soft-deleted rows via .is('deleted_at', null), per docs/ARCHITECTURE.md §10.2", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20 });
+
+    expect(calls).toContainEqual({ method: "is", args: ["deleted_at", null] });
+  });
+
+  it("filters by level with .eq() when a level is given", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20, level: "Internship" });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["level", "Internship"] });
+  });
+
+  it("does not filter by level when none is given", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    await listJobDescriptions(client, { limit: 20 });
+
+    expect(calls.some((c) => c.method === "eq")).toBe(false);
   });
 
   it("does not filter by cursor when none is given", async () => {
@@ -217,6 +262,188 @@ describe("encodeJobDescriptionCursor / decodeJobDescriptionCursor", () => {
 
   it("returns null for an empty string", () => {
     expect(decodeJobDescriptionCursor("")).toBeNull();
+  });
+
+  // Cross-mode: an offset cursor (search mode) replayed against the keyset
+  // decoder must not be misinterpreted — it should fail this decode and
+  // degrade to "no cursor", per docs/ARCHITECTURE.md §9.2.
+  it("returns null for an offset-mode cursor replayed in keyset mode", () => {
+    expect(decodeJobDescriptionCursor("offset_20")).toBeNull();
+  });
+});
+
+/**
+ * `searchJobDescriptions` calls `supabase.rpc(...)` directly rather than
+ * going through `.from(...)`, so it needs its own client mock (the
+ * chainable `.from()` builder above doesn't apply here).
+ */
+function makeRpcClient(resolvedValue: { data: unknown; error: unknown }) {
+  const rpc = vi.fn().mockResolvedValue(resolvedValue);
+  const client = { rpc } as unknown as Parameters<typeof searchJobDescriptions>[0];
+  return { client, rpc };
+}
+
+describe("searchJobDescriptions", () => {
+  it("calls the search_job_descriptions RPC with the expected args (query, level, limit+1, offset)", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, {
+      query: "engineer",
+      limit: 20,
+      offset: 40,
+      level: "Internship",
+    });
+
+    expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
+      search_query: "engineer",
+      level_filter: "Internship",
+      limit_count: 21,
+      offset_count: 40,
+    });
+  });
+
+  it("defaults level_filter to null and offset to 0 when omitted", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer" });
+
+    expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
+      search_query: "engineer",
+      level_filter: null,
+      limit_count: JOB_DESCRIPTIONS_DEFAULT_LIMIT + 1,
+      offset_count: 0,
+    });
+  });
+
+  it("defaults to JOB_DESCRIPTIONS_DEFAULT_LIMIT when no limit is given", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer" });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ limit_count: JOB_DESCRIPTIONS_DEFAULT_LIMIT + 1 }),
+    );
+  });
+
+  it("clamps a negative offset to 0", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer", offset: -5 });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ offset_count: 0 }),
+    );
+  });
+
+  // `listJobDescriptions` treats an empty-string `level` as "no filter"
+  // (`if (params.level) { query = query.eq(...) }`); `searchJobDescriptions`
+  // mirrors that via `params.level || null` so an empty string also
+  // substitutes to `null` rather than being sent through verbatim. Against
+  // the real RPC (`level_filter is null or level = level_filter`), sending
+  // `level_filter: ""` would filter to `level = ''`, which matches no real
+  // row (every job_description's `level` is either NULL or a non-empty
+  // string) — an empty `?level=` combined with `?q=` must fall back to "no
+  // level filter" per docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no
+  // filter"), not silently return zero results.
+  it("treats an empty-string level as no filter, same as listJobDescriptions", async () => {
+    const { client, rpc } = makeRpcClient({ data: [], error: null });
+
+    await searchJobDescriptions(client, { query: "engineer", level: "" });
+
+    expect(rpc).toHaveBeenCalledWith(
+      "search_job_descriptions",
+      expect.objectContaining({ level_filter: null }),
+    );
+  });
+
+  it("reports hasMore=true and trims the extra row when more than `limit` rows come back", async () => {
+    const rows = [makeRow({ id: "a" }), makeRow({ id: "b" }), makeRow({ id: "c" })];
+    const { client } = makeRpcClient({ data: rows, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x", limit: 2 });
+
+    expect(result.hasMore).toBe(true);
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  it("reports hasMore=false when fewer than limit + 1 rows come back", async () => {
+    const rows = [makeRow({ id: "a" })];
+    const { client } = makeRpcClient({ data: rows, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x", limit: 20 });
+
+    expect(result.hasMore).toBe(false);
+    expect(result.items).toHaveLength(1);
+  });
+
+  it("returns [] with hasMore=false when data is null", async () => {
+    const { client } = makeRpcClient({ data: null, error: null });
+
+    const result = await searchJobDescriptions(client, { query: "x" });
+
+    expect(result.items).toEqual([]);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it("throws JobDescriptionQueryError on a Postgres error", async () => {
+    const { client } = makeRpcClient({
+      data: null,
+      error: { message: "connection reset" },
+    });
+
+    await expect(searchJobDescriptions(client, { query: "x" })).rejects.toThrow(
+      JobDescriptionQueryError,
+    );
+  });
+});
+
+describe("encodeJobDescriptionOffsetCursor / decodeJobDescriptionOffsetCursor", () => {
+  it("round-trips an integer offset", () => {
+    const encoded = encodeJobDescriptionOffsetCursor(40);
+    expect(encoded).toBe("offset_40");
+    expect(decodeJobDescriptionOffsetCursor(encoded)).toBe(40);
+  });
+
+  it("round-trips an offset of 0", () => {
+    const encoded = encodeJobDescriptionOffsetCursor(0);
+    expect(decodeJobDescriptionOffsetCursor(encoded)).toBe(0);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(decodeJobDescriptionOffsetCursor("not-a-cursor")).toBeNull();
+  });
+
+  it("returns null for an empty string", () => {
+    expect(decodeJobDescriptionOffsetCursor("")).toBeNull();
+  });
+
+  it("returns null for a negative offset string (pattern requires digits only)", () => {
+    expect(decodeJobDescriptionOffsetCursor("offset_-5")).toBeNull();
+  });
+
+  it("returns null for a non-integer offset string", () => {
+    expect(decodeJobDescriptionOffsetCursor("offset_4.5")).toBeNull();
+  });
+
+  it("returns null for an unsafe-integer offset (overflow guard)", () => {
+    expect(
+      decodeJobDescriptionOffsetCursor("offset_9007199254740993"),
+    ).toBeNull();
+  });
+
+  // Cross-mode: a keyset cursor (non-search mode) replayed against the
+  // offset decoder must not be misinterpreted — it should fail this decode
+  // and degrade to "no cursor" (offset 0 / first page), per
+  // docs/ARCHITECTURE.md §9.2.
+  it("returns null for a keyset cursor replayed in offset mode", () => {
+    const keysetCursor = encodeJobDescriptionCursor({
+      created_at: "2026-01-01T00:00:00.000Z",
+      id: TEST_UUID,
+    });
+    expect(decodeJobDescriptionOffsetCursor(keysetCursor)).toBeNull();
   });
 });
 
@@ -344,7 +571,7 @@ describe("createJobDescription", () => {
     ).toBe("user-1");
   });
 
-  it("defaults company and source_url to null when omitted", async () => {
+  it("defaults company, source_url, location, and level to null when omitted", async () => {
     const row = makeRow();
     const { builder, calls } = makeQueryBuilder({ data: row, error: null });
     const client = makeClient(builder);
@@ -359,9 +586,35 @@ describe("createJobDescription", () => {
     const inserted = insertCall?.args[0] as {
       company: unknown;
       source_url: unknown;
+      location: unknown;
+      level: unknown;
     };
     expect(inserted.company).toBeNull();
     expect(inserted.source_url).toBeNull();
+    expect(inserted.location).toBeNull();
+    expect(inserted.level).toBeNull();
+  });
+
+  it("inserts location and level when provided", async () => {
+    const row = makeRow();
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await createJobDescription(client, {
+      submittedBy: "user-1",
+      title: "Software Engineer",
+      description: "Build things.",
+      location: "Remote",
+      level: "Entry Level",
+    });
+
+    const insertCall = calls.find((c) => c.method === "insert");
+    const inserted = insertCall?.args[0] as {
+      location: unknown;
+      level: unknown;
+    };
+    expect(inserted.location).toBe("Remote");
+    expect(inserted.level).toBe("Entry Level");
   });
 
   it("throws JobDescriptionQueryError when no row is returned", async () => {
@@ -374,6 +627,282 @@ describe("createJobDescription", () => {
         title: "Software Engineer",
         description: "Build things.",
       }),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("upsertExternalJobDescriptions", () => {
+  function makeUpsertRow(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      externalId: "ext-1",
+      title: "Software Engineering Intern",
+      company: "Acme",
+      description: "Build things.",
+      sourceUrl: "https://www.themuse.com/jobs/acme/swe-intern",
+      level: "Internship",
+      location: "New York, NY",
+      postedAt: "2026-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  it("returns count: 0 without querying when rows is empty", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null });
+    const client = makeClient(builder);
+
+    const result = await upsertExternalJobDescriptions(client, "themuse", []);
+
+    expect(result).toEqual({ count: 0 });
+    expect(calls).toEqual([]);
+  });
+
+  it("upserts with submitted_by: null and the given source, keyed on (source, external_id)", async () => {
+    const { builder, calls } = makeQueryBuilder({
+      data: [],
+      error: null,
+      count: 1,
+    });
+    const client = makeClient(builder);
+
+    await upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]);
+
+    const upsertCall = calls.find((c) => c.method === "upsert");
+    expect(upsertCall).toBeDefined();
+    const [rows, options] = upsertCall!.args as [
+      Record<string, unknown>[],
+      Record<string, unknown>,
+    ];
+    expect(rows[0]).toMatchObject({
+      source: "themuse",
+      external_id: "ext-1",
+      title: "Software Engineering Intern",
+      submitted_by: null,
+    });
+    expect(options).toMatchObject({ onConflict: "source,external_id" });
+  });
+
+  it("sums counts across batches larger than the batch size", async () => {
+    const { builder } = makeQueryBuilder({
+      data: [],
+      error: null,
+      count: 50,
+    });
+    const client = makeClient(builder);
+
+    const rows = Array.from({ length: 120 }, (_, i) =>
+      makeUpsertRow({ externalId: `ext-${i}` }),
+    );
+
+    const result = await upsertExternalJobDescriptions(client, "themuse", rows);
+
+    // 3 batches of <=50 -> mocked count 50 each -> 150 total.
+    expect(result.count).toBe(150);
+  });
+
+  it("throws JobDescriptionQueryError on a Postgres error", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { message: "constraint violation" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("updateJobDescription — per docs/ARCHITECTURE.md §10.3", () => {
+  it("scopes the update by both id AND submitted_by (the 'checked twice' ownership pattern)", async () => {
+    const row = makeRow({ title: "New Title" });
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["id", TEST_UUID] });
+    expect(calls).toContainEqual({ method: "eq", args: ["submitted_by", "user-1"] });
+  });
+
+  it("returns the updated row when a row matched", async () => {
+    const row = makeRow({ title: "New Title" });
+    const { builder } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    expect(result).toEqual(row);
+  });
+
+  it("returns null when no row matched (not found, not owned, or a themuse row) — caller turns this into 403", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "attacker",
+      patch: { title: "Hijacked" },
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("only writes columns present (!== undefined) in the patch — an absent key is left off the update payload entirely", async () => {
+    const row = makeRow();
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { title: "New Title" },
+    });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(written).toEqual({ title: "New Title" });
+    expect(written).not.toHaveProperty("company");
+    expect(written).not.toHaveProperty("location");
+  });
+
+  it("writes an explicit null for a nullable field to clear it (distinct from an absent/undefined key)", async () => {
+    const row = makeRow({ company: null });
+    const { builder, calls } = makeQueryBuilder({ data: row, error: null });
+    const client = makeClient(builder);
+
+    await updateJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+      patch: { company: null },
+    });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(written).toHaveProperty("company", null);
+  });
+
+  it("returns null (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await updateJobDescription(client, {
+      id: "not-a-real-id",
+      submittedBy: "user-1",
+      patch: { title: "x" },
+    });
+    expect(result).toBeNull();
+  });
+
+  it("throws JobDescriptionQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      updateJobDescription(client, {
+        id: TEST_UUID,
+        submittedBy: "user-1",
+        patch: { title: "x" },
+      }),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+});
+
+describe("softDeleteJobDescription — per docs/ARCHITECTURE.md §10.1/§10.3", () => {
+  it("scopes the update by both id AND submitted_by", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    await softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" });
+
+    expect(calls).toContainEqual({ method: "eq", args: ["id", TEST_UUID] });
+    expect(calls).toContainEqual({ method: "eq", args: ["submitted_by", "user-1"] });
+  });
+
+  it("sets deleted_at to a timestamp (soft delete, not a real DELETE)", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    await softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" });
+
+    const updateCall = calls.find((c) => c.method === "update");
+    const written = updateCall?.args[0] as Record<string, unknown>;
+    expect(typeof written.deleted_at).toBe("string");
+    expect(calls.some((c) => c.method === "delete")).toBe(false);
+  });
+
+  it("returns true when a row matched", async () => {
+    const { builder } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false when no row matched (not found, not owned, or a themuse row)", async () => {
+    const { builder } = makeQueryBuilder({ data: null, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "attacker",
+    });
+    expect(result).toBe(false);
+  });
+
+  it("is idempotent: deleting an already-deleted row still returns true, not a special error", async () => {
+    // An already-soft-deleted row still matches `.eq("id", ...).eq("submitted_by", ...)`
+    // (deleted_at being set doesn't remove it from that filter), so re-running
+    // the update just re-writes deleted_at and still returns a row.
+    const { builder } = makeQueryBuilder({ data: { id: TEST_UUID }, error: null });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: TEST_UUID,
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false (not a thrown error) for a malformed/non-uuid id (Postgres 22P02)", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "22P02", message: "invalid input syntax for type uuid" },
+    });
+    const client = makeClient(builder);
+
+    const result = await softDeleteJobDescription(client, {
+      id: "not-a-real-id",
+      submittedBy: "user-1",
+    });
+    expect(result).toBe(false);
+  });
+
+  it("throws JobDescriptionQueryError for a Postgres error with a different code", async () => {
+    const { builder } = makeQueryBuilder({
+      data: null,
+      error: { code: "53300", message: "too many connections" },
+    });
+    const client = makeClient(builder);
+
+    await expect(
+      softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" }),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
 });

@@ -9,19 +9,21 @@ const ACCEPT_ATTR =
 const MAX_SIZE_BYTES = 5 * 1024 * 1024;
 const MAX_SIZE_LABEL = "5MB";
 
-interface ResumeUploadFormProps {
-  /** Called after a successful upload, in addition to refreshing the route. */
-  onUploaded?: () => void;
-}
-
 /**
  * Uploads a single resume file to `POST /api/resumes` (multipart/form-data,
  * field name `file` — see docs/ARCHITECTURE.md §2). Client-side type/size
  * checks are a UX nicety only; the API route is the source of truth and
  * re-validates (per ARCHITECTURE.md's resolved decision: PDF/DOCX/TXT,
  * 5MB cap).
+ *
+ * On success, navigates straight to the new resume's detail page
+ * (`/resumes/[id]`) rather than staying on the list and calling
+ * `router.refresh()` — added per the 2026-09-10 UX pass to cut one full
+ * click+scan step (find the new row in the list, then click into it) out of
+ * the upload → analyze → match funnel, since `POST /api/resumes` already
+ * returns the new resume's `id` for free.
  */
-export function ResumeUploadForm({ onUploaded }: ResumeUploadFormProps) {
+export function ResumeUploadForm() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState<string | null>(null);
@@ -67,12 +69,21 @@ export function ResumeUploadForm({ onUploaded }: ResumeUploadFormProps) {
         return;
       }
 
+      const body = await response.json().catch(() => null);
+      const newResumeId = body?.resume?.id;
+
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
       setFileName(null);
-      onUploaded?.();
-      router.refresh();
+
+      if (newResumeId) {
+        router.push(`/resumes/${newResumeId}`);
+      } else {
+        // Defensive fallback if the response is ever missing `resume.id` —
+        // stay on the list and refresh it rather than navigating nowhere.
+        router.refresh();
+      }
     } catch {
       setError("Something went wrong uploading your resume. Please try again.");
     } finally {

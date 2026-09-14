@@ -1,19 +1,19 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
-import { MatchScoreBadge } from "@/components/matches/MatchScoreBadge";
-import { MatchRationale } from "@/components/matches/MatchRationale";
-import type { Match, ResumeListItem } from "@/types/domain";
+import type { ResumeListItem } from "@/types/domain";
 
-interface RunJobMatchFormProps {
+interface MatchFromJobFormProps {
   jobDescriptionId: string;
-  resumes: ResumeListItem[];
+  /** Only the caller's *analyzed* resumes — see `app/jobs/[id]/page.tsx`'s filter. */
+  analyzedResumes: ResumeListItem[];
 }
 
 const NOT_ANALYZED_MESSAGE =
-  "That resume hasn't finished analysis yet. Analyze it from its resume page, then try again.";
+  "That resume needs to be analyzed before it can be matched. Try again after analyzing it.";
 const NOT_FOUND_MESSAGE =
   "That resume is no longer available. Please pick another.";
 const RATE_LIMIT_MESSAGE =
@@ -26,31 +26,28 @@ const NETWORK_ERROR_MESSAGE =
   "Couldn't reach the server. Check your connection and try again.";
 
 /**
- * Mirror image of `components/matches/RunMatchForm.tsx`: fixed
- * `job_description_id` (this page), picks one of the caller's own analyzed
- * resumes, and posts to `POST /api/matches` (see docs/ARCHITECTURE.md §2).
+ * The mirror image of `RunMatchForm`: picks one of the caller's own
+ * *analyzed* resumes and matches it against this already-known job
+ * description, from the job detail page (`app/jobs/[id]/page.tsx`) rather
+ * than the resume detail page. Added per the 2026-09-10 UX pass — previously
+ * the only way to start a match was from `/resumes/[id]`'s job picker, which
+ * has no search over what's now a much larger, continually-growing board
+ * (docs/ARCHITECTURE.md §7); a student browsing `/jobs` and finding a
+ * specific posting had no way to act on it without first navigating away and
+ * re-finding it by title.
  *
- * `resumes` is the caller's full resume list, fetched server-side via
- * `GET /api/resumes` and passed as props. Filtered down to `status ===
- * "analyzed"` here rather than shown with a disabled/hint state for
- * non-analyzed resumes — the API 400s on an unanalyzed resume, so filtering
- * avoids a dead-end click entirely (see this component's caller for the
- * corresponding empty-state copy when there are zero analyzed resumes).
- *
- * Unlike `RunMatchForm` (which calls `router.refresh()` and relies on
- * `MatchList` re-fetching from the server), this form has no "match history
- * for this job" list to refresh — the result is shown inline from the POST
- * response directly, kept in local state.
+ * On success, navigates to `/resumes/[id]` for the resume just matched —
+ * there's no standalone match page (docs/ARCHITECTURE.md §3) and that's
+ * where `MatchList` renders the new result (score, rationale, gaps).
  */
-export function RunJobMatchForm({
+export function MatchFromJobForm({
   jobDescriptionId,
-  resumes,
-}: RunJobMatchFormProps) {
-  const analyzedResumes = resumes.filter((r) => r.status === "analyzed");
+  analyzedResumes,
+}: MatchFromJobFormProps) {
+  const router = useRouter();
   const [resumeId, setResumeId] = useState(analyzedResumes[0]?.id ?? "");
   const [matching, setMatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [match, setMatch] = useState<Match | null>(null);
 
   async function handleMatch() {
     if (!resumeId) return;
@@ -83,10 +80,7 @@ export function RunJobMatchForm({
         return;
       }
 
-      const body = await response.json().catch(() => null);
-      if (body?.match) {
-        setMatch(body.match);
-      }
+      router.push(`/resumes/${resumeId}`);
     } catch {
       setError(NETWORK_ERROR_MESSAGE);
     } finally {
@@ -97,7 +91,7 @@ export function RunJobMatchForm({
   if (analyzedResumes.length === 0) {
     return (
       <p className="text-sm text-fg-muted">
-        Upload and analyze a resume first to match it against this job.{" "}
+        Upload and analyze a resume first to match it against this listing.{" "}
         <Link href="/resumes" className="underline hover:text-fg">
           Go to your resumes
         </Link>
@@ -114,7 +108,7 @@ export function RunJobMatchForm({
             htmlFor="match-resume"
             className="text-sm font-medium text-fg-muted"
           >
-            Resume
+            Your resume
           </label>
           <select
             id="match-resume"
@@ -136,7 +130,7 @@ export function RunJobMatchForm({
           disabled={matching || !resumeId}
           className="shrink-0"
         >
-          {matching ? "Matching…" : "Match"}
+          {matching ? "Matching…" : "Match against this job"}
         </Button>
       </div>
       {matching && (
@@ -149,18 +143,6 @@ export function RunJobMatchForm({
         <p role="alert" className="text-xs text-danger-fg">
           {error}
         </p>
-      )}
-
-      {match && (
-        <div className="mt-2 rounded-lg border border-border bg-bg p-4">
-          <div className="flex items-center gap-3">
-            <MatchScoreBadge score={match.score} />
-            <span className="text-sm font-medium text-fg">Match result</span>
-          </div>
-          <div className="mt-4">
-            <MatchRationale match={match} />
-          </div>
-        </div>
       )}
     </div>
   );

@@ -186,6 +186,50 @@ describe("jobDescriptionCreateSchema", () => {
     }
   });
 
+  it("accepts a valid location and level", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      location: "Remote",
+      level: "Entry Level",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.location).toBe("Remote");
+      expect(result.data.level).toBe("Entry Level");
+    }
+  });
+
+  it("allows location and level to be omitted entirely", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.location).toBeUndefined();
+      expect(result.data.level).toBeUndefined();
+    }
+  });
+
+  it("rejects an empty-string location when explicitly provided", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      location: "",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a level outside the fixed JOB_DESCRIPTION_LEVELS set", () => {
+    const result = jobDescriptionCreateSchema.safeParse({
+      title: "Software Engineer",
+      description: "Build things.",
+      level: "Staff",
+    });
+    expect(result.success).toBe(false);
+  });
+
   it("rejects a whitespace-only description (trimmed before the min-length check)", () => {
     const result = jobDescriptionCreateSchema.safeParse({
       title: "Software Engineer",

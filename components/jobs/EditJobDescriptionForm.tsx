@@ -12,15 +12,15 @@ import {
   JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH,
   JOB_DESCRIPTION_TITLE_MAX_LENGTH,
 } from "@/lib/validation/schemas";
+import type { JobDescription } from "@/types/domain";
 
 const SUCCESS_MESSAGE_DURATION_MS = 4000;
 
 /**
- * `x / max` counter for a length-capped field, colored via the shared
- * success/warning/danger tokens as the value nears/hits the cap — added per
- * the 2026-09-10 UX pass since `title`/`description` were previously capped
- * with a silent `maxLength` and no on-screen indication, so a pasted value
- * over the limit was truncated with zero feedback.
+ * `x / max` counter for a length-capped field — identical to
+ * `JobDescriptionForm`'s `CharCount`, duplicated here rather than shared
+ * since it's a small, private presentational helper local to each form (same
+ * call as `JobDescriptionForm` already made, not a new pattern).
  */
 function CharCount({ value, max }: { value: string; max: number }) {
   const remaining = max - value.length;
@@ -42,31 +42,49 @@ function CharCount({ value, max }: { value: string; max: number }) {
   );
 }
 
+interface EditJobDescriptionFormProps {
+  jobDescription: JobDescription;
+}
+
 /**
- * Submits a job description to `POST /api/job-descriptions` (see
- * docs/ARCHITECTURE.md §2). `title` and `description` are required;
- * `company`/`source_url`/`location`/`level` are optional. Server-side `zod`
- * validation in `lib/validation/schemas.ts` is the source of truth for
- * length caps and URL scheme — this form relies on the API's `error`
- * message rather than re-implementing those rules client-side, so
- * validation stays in one place.
+ * Pre-filled edit form for a job description the caller submitted —
+ * `PATCH`s `/api/job-descriptions/:id` on submit (docs/ARCHITECTURE.md §10).
+ * Same field set/validation/character-counter pattern as
+ * `JobDescriptionForm` (the create form) — server-side `zod` validation in
+ * `lib/validation/schemas.ts#jobDescriptionUpdateSchema` is the source of
+ * truth for length caps/URL scheme here too, so this relies on the API's
+ * `error` message rather than re-implementing those rules.
  *
- * `location`/`level` were added per docs/ARCHITECTURE.md §7 so a
- * user-submitted listing can carry the same fields externally-ingested ones
- * do, and so the `/jobs` level filter works uniformly across both. `level`
- * is a fixed dropdown (`JOB_DESCRIPTION_LEVELS`) rather than free text —
- * unlike an external source, a manual submission has no existing vocabulary
- * to inherit, so offering an open text field here would just fragment the
- * filter with near-duplicate values ("Intern" vs "Internship", etc.).
+ * Only ever rendered by `app/jobs/[id]/page.tsx` when `jobDescription.is_own`
+ * is `true` — the API independently re-checks ownership
+ * (`submitted_by`/`source`) on every `PATCH`, so this is a UI convenience,
+ * not the actual access control.
+ *
+ * Known gap (flagged, not silently worked around): like
+ * `JobDescriptionForm`, optional fields are omitted from the request body
+ * when blank rather than sent as `null`
+ * (`company.trim() || undefined`) — `jobDescriptionUpdateSchema` treats a
+ * present-but-empty string as invalid (`.min(1, "... must not be empty when
+ * provided.")`) and an *absent* key as "leave this column untouched" (see
+ * `updateJobDescription` in `lib/supabase/queries/jobDescriptions.ts`), and
+ * accepts neither `null` nor `""` for these fields. That means there is
+ * currently no way, via this form or the API it calls, to clear an
+ * already-set `company`/`source_url`/`location`/`level` back to empty — only
+ * to change it to a different non-empty value. This wasn't called out in
+ * §10.3/§10.5, so it's noted here rather than fixed by loosening
+ * `lib/validation/schemas.ts` (backend-dev/architect's call, not
+ * frontend's).
  */
-export function JobDescriptionForm() {
+export function EditJobDescriptionForm({
+  jobDescription,
+}: EditJobDescriptionFormProps) {
   const router = useRouter();
-  const [title, setTitle] = useState("");
-  const [company, setCompany] = useState("");
-  const [description, setDescription] = useState("");
-  const [sourceUrl, setSourceUrl] = useState("");
-  const [location, setLocation] = useState("");
-  const [level, setLevel] = useState("");
+  const [title, setTitle] = useState(jobDescription.title);
+  const [company, setCompany] = useState(jobDescription.company ?? "");
+  const [description, setDescription] = useState(jobDescription.description);
+  const [sourceUrl, setSourceUrl] = useState(jobDescription.source_url ?? "");
+  const [location, setLocation] = useState(jobDescription.location ?? "");
+  const [level, setLevel] = useState(jobDescription.level ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSuccess, setShowSuccess] = useState(false);
@@ -96,8 +114,8 @@ export function JobDescriptionForm() {
 
     setSubmitting(true);
     try {
-      const response = await fetch("/api/job-descriptions", {
-        method: "POST",
+      const response = await fetch(`/api/job-descriptions/${jobDescription.id}`, {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           title: title.trim(),
@@ -112,17 +130,11 @@ export function JobDescriptionForm() {
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         setError(
-          body?.error ?? "Couldn't submit this job description. Please try again.",
+          body?.error ?? "Couldn't update this job description. Please try again.",
         );
         return;
       }
 
-      setTitle("");
-      setCompany("");
-      setDescription("");
-      setSourceUrl("");
-      setLocation("");
-      setLevel("");
       router.refresh();
 
       setShowSuccess(true);
@@ -135,7 +147,7 @@ export function JobDescriptionForm() {
       );
     } catch {
       setError(
-        "Something went wrong submitting this job description. Please try again.",
+        "Something went wrong updating this job description. Please try again.",
       );
     } finally {
       setSubmitting(false);
@@ -149,18 +161,18 @@ export function JobDescriptionForm() {
     >
       <div>
         <h2 className="text-base font-semibold text-fg">
-          Submit a job description
+          Edit this job description
         </h2>
         <p className="mt-1 text-sm text-fg-muted">
-          Job descriptions are shared data — visible to every signed-in user
-          and usable for matching across the app, unlike your private
-          resumes.
+          Changes here are visible to every signed-in user. Existing matches
+          against this posting keep their original rationale — only the title
+          and company shown next to them update.
         </p>
       </div>
 
       <div>
         <Input
-          id="job-title"
+          id="edit-job-title"
           label="Title"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
@@ -173,7 +185,7 @@ export function JobDescriptionForm() {
       </div>
 
       <Input
-        id="job-company"
+        id="edit-job-company"
         label="Company (optional)"
         value={company}
         onChange={(e) => setCompany(e.target.value)}
@@ -185,13 +197,13 @@ export function JobDescriptionForm() {
       <div className="flex flex-col gap-3 sm:flex-row">
         <div className="flex flex-1 flex-col gap-1.5">
           <label
-            htmlFor="job-level"
+            htmlFor="edit-job-level"
             className="text-sm font-medium text-fg-muted"
           >
             Level (optional)
           </label>
           <select
-            id="job-level"
+            id="edit-job-level"
             value={level}
             onChange={(e) => setLevel(e.target.value)}
             disabled={submitting}
@@ -208,7 +220,7 @@ export function JobDescriptionForm() {
 
         <div className="flex-1">
           <Input
-            id="job-location"
+            id="edit-job-location"
             label="Location (optional)"
             value={location}
             onChange={(e) => setLocation(e.target.value)}
@@ -221,13 +233,13 @@ export function JobDescriptionForm() {
 
       <div className="flex flex-col gap-1.5">
         <label
-          htmlFor="job-description"
+          htmlFor="edit-job-description"
           className="text-sm font-medium text-fg-muted"
         >
           Description
         </label>
         <textarea
-          id="job-description"
+          id="edit-job-description"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Paste the full job description here."
@@ -244,7 +256,7 @@ export function JobDescriptionForm() {
       </div>
 
       <Input
-        id="job-source-url"
+        id="edit-job-source-url"
         label="Source URL (optional)"
         type="url"
         value={sourceUrl}
@@ -265,12 +277,12 @@ export function JobDescriptionForm() {
 
       {showSuccess && (
         <p className="rounded-md border border-success-border bg-success-bg px-3 py-2 text-sm text-success-fg">
-          Job description submitted.
+          Job description updated.
         </p>
       )}
 
       <Button type="submit" loading={submitting} className="self-start">
-        Submit job description
+        Save changes
       </Button>
     </form>
   );

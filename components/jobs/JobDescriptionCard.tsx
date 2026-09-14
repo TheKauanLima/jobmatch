@@ -13,7 +13,13 @@ interface JobDescriptionCardProps {
   jobDescription: JobDescription;
 }
 
-/** Compact display of one job description: title, company, preview, date. */
+/**
+ * Compact display of one job description: title, company, level/location
+ * tags, preview, date. `level` and `location` (added per
+ * docs/ARCHITECTURE.md §7) are only populated for externally-ingested
+ * listings in v1 — rendered conditionally so user-submitted rows (which
+ * never set either) look exactly as before.
+ */
 export function JobDescriptionCard({ jobDescription }: JobDescriptionCardProps) {
   return (
     <Link
@@ -35,6 +41,22 @@ export function JobDescriptionCard({ jobDescription }: JobDescriptionCardProps) 
           {new Date(jobDescription.created_at).toLocaleDateString()}
         </span>
       </div>
+
+      {(jobDescription.level || jobDescription.location) && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {jobDescription.level && (
+            <span className="rounded-full bg-neutral-bg px-2 py-0.5 text-xs font-medium text-neutral-fg">
+              {jobDescription.level}
+            </span>
+          )}
+          {jobDescription.location && (
+            <span className="text-xs text-fg-subtle">
+              {jobDescription.location}
+            </span>
+          )}
+        </div>
+      )}
+
       <p className="mt-2 text-sm text-fg-muted">
         {previewText(jobDescription.description)}
       </p>

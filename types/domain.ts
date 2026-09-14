@@ -5,9 +5,13 @@
  * contracts") — keep the two in sync.
  */
 
-import type { Database, ResumeStatus } from "@/types/database";
+import type {
+  Database,
+  JobDescriptionSource,
+  ResumeStatus,
+} from "@/types/database";
 
-export type { ResumeStatus };
+export type { JobDescriptionSource, ResumeStatus };
 
 export type ResumeRow = Database["public"]["Tables"]["resumes"]["Row"];
 
@@ -121,7 +125,19 @@ export type JobDescriptionRow =
  * resumes which split list vs. detail). Omits nothing internal: unlike
  * `resumes`, there is no `storage_path`-style internal field, and
  * `submitted_by` has no client use (the submitter isn't otherwise exposed
- * in the UI per the folder structure in §3) so it's dropped too.
+ * in the UI per the folder structure in §3) so it's dropped too — `is_own`
+ * (below) is the boolean the frontend actually needs, per §10.4.
+ *
+ * `source`/`level`/`location`/`posted_at` were added per docs/ARCHITECTURE.md
+ * §7 for externally-ingested listings (The Muse). `external_id` is dropped
+ * (internal dedup detail with no client use, same reasoning as
+ * `submitted_by`).
+ *
+ * `is_own`/`deleted_at` were added per §10.4: `is_own` lets the frontend show
+ * Edit/Delete controls without exposing `submitted_by` itself, and
+ * `deleted_at` (genuinely client-facing now, unlike `submitted_by`/
+ * `external_id`/`search_vector`) lets the UI render a "This posting was
+ * removed" state per §10.5.
  */
 export type JobDescription = {
   id: string;
@@ -131,10 +147,25 @@ export type JobDescription = {
   source_url: string | null;
   created_at: string;
   updated_at: string;
+  source: JobDescriptionSource;
+  level: string | null;
+  location: string | null;
+  posted_at: string | null;
+  is_own: boolean;
+  deleted_at: string | null;
 };
 
-/** Shapes a full DB row into the public response representation. */
-export function toJobDescription(row: JobDescriptionRow): JobDescription {
+/**
+ * Shapes a full DB row into the public response representation. Takes the
+ * caller's own id (`callerId`, always `requireSession()`'s `user.id`, never
+ * a request param) to compute `is_own` — per docs/ARCHITECTURE.md §10.4,
+ * this replaces exposing raw `submitted_by` to the client, which would leak
+ * every submitter's user id to every authenticated viewer.
+ */
+export function toJobDescription(
+  row: JobDescriptionRow,
+  callerId: string,
+): JobDescription {
   return {
     id: row.id,
     title: row.title,
@@ -143,6 +174,12 @@ export function toJobDescription(row: JobDescriptionRow): JobDescription {
     source_url: row.source_url,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    source: row.source,
+    level: row.level,
+    location: row.location,
+    posted_at: row.posted_at,
+    is_own: row.submitted_by === callerId,
+    deleted_at: row.deleted_at,
   };
 }
 
@@ -152,11 +189,18 @@ export function toJobDescription(row: JobDescriptionRow): JobDescription {
 
 export type MatchRow = Database["public"]["Tables"]["matches"]["Row"];
 
-/** The joined `job_descriptions` summary inlined on every match response, per docs/ARCHITECTURE.md §2. */
+/**
+ * The joined `job_descriptions` summary inlined on every match response, per
+ * docs/ARCHITECTURE.md §2. `deleted_at` was added per §10.4 so match UIs
+ * (`MatchList`/`RecentMatchCard`/`MatchHistoryList`) can render a "Removed"
+ * badge next to a soft-deleted posting's title (§10.5) — the rationale/
+ * score/gaps below it are unaffected, per §10's whole point.
+ */
 export type MatchJobDescriptionSummary = {
   id: string;
   title: string;
   company: string | null;
+  deleted_at: string | null;
 };
 
 /**
@@ -196,4 +240,27 @@ export function toMatch(row: MatchRow, jobDescription: MatchJobDescriptionSummar
     created_at: row.created_at,
     job_description: jobDescription,
   };
+}
+
+/** The joined resume summary inlined on the cross-resume "recent matches" response (see `toRecentMatch`). */
+export type MatchResumeSummary = { id: string; file_name: string };
+
+/**
+ * Public shape of a match as returned by `GET /api/matches` when called
+ * *without* `resume_id` — the caller's own most recent matches across every
+ * resume (see that route's docstring and
+ * `lib/supabase/queries/matches.ts#listRecentMatchesForUser`). Adds `resume`
+ * on top of `Match`'s shape specifically because, unlike the `resume_id`-
+ * scoped listing, the caller doesn't already know which resume each result
+ * belongs to.
+ */
+export type RecentMatch = Match & { resume: MatchResumeSummary };
+
+/** Shapes a full `matches` DB row plus its joined job description and resume summaries. */
+export function toRecentMatch(
+  row: MatchRow,
+  jobDescription: MatchJobDescriptionSummary,
+  resume: MatchResumeSummary,
+): RecentMatch {
+  return { ...toMatch(row, jobDescription), resume };
 }

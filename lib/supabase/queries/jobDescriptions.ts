@@ -3,9 +3,11 @@
  * docs/ARCHITECTURE.md §3. Unlike `lib/supabase/queries/resumes.ts`, this
  * table is *shared* data — `SELECT` is open to any authenticated user (RLS
  * policy `job_descriptions_select_all_authenticated`), so functions here do
- * not filter reads by `user_id`. Only `createJobDescription` scopes a write
- * (`submitted_by`) to the caller, matching the
- * `job_descriptions_insert_own` RLS policy.
+ * not filter reads by `user_id`. `createJobDescription`, `updateJobDescription`,
+ * and `softDeleteJobDescription` (the latter two added per
+ * docs/ARCHITECTURE.md §10) all scope their writes (`submitted_by`) to the
+ * caller, matching the `job_descriptions_insert_own`/`job_descriptions_update_own`
+ * RLS policies.
  *
  * Returns full DB rows — route handlers are responsible for shaping rows
  * into the public response types in `types/domain.ts` before returning
@@ -14,7 +16,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import type { Database } from "@/types/database";
+import type { Database, JobDescriptionSource } from "@/types/database";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -32,6 +34,18 @@ export class JobDescriptionQueryError extends Error {
 /** Default/maximum page size for `listJobDescriptions`, per docs/ARCHITECTURE.md §2. */
 export const JOB_DESCRIPTIONS_DEFAULT_LIMIT = 20;
 export const JOB_DESCRIPTIONS_MAX_LIMIT = 100;
+
+/**
+ * Maximum length (characters) accepted for `?q=` on
+ * `GET /api/job-descriptions`, per docs/ARCHITECTURE.md §9.1/§9.3. A
+ * query-param bound, same category as `JOB_DESCRIPTIONS_DEFAULT_LIMIT`/
+ * `JOB_DESCRIPTIONS_MAX_LIMIT` above, not a POST-body field — so it lives
+ * here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
+ * `lib/validation/schemas.ts`, matching §3's existing rule that `?level=`/
+ * `?limit=` are validated inline in the route handler, not via a `zod`
+ * schema.
+ */
+export const JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH = 200;
 
 /**
  * A decoded pagination cursor: the `(created_at, id)` position of the last
@@ -105,7 +119,7 @@ export function decodeJobDescriptionCursor(
  */
 export async function listJobDescriptions(
   supabase: Client,
-  params: { limit?: number; cursor?: string | null },
+  params: { limit?: number; cursor?: string | null; level?: string | null },
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
     Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
@@ -115,9 +129,14 @@ export async function listJobDescriptions(
   let query = supabase
     .from("job_descriptions")
     .select("*")
+    .is("deleted_at", null)
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(limit + 1);
+
+  if (params.level) {
+    query = query.eq("level", params.level);
+  }
 
   if (params.cursor) {
     const decoded = decodeJobDescriptionCursor(params.cursor);
@@ -133,6 +152,95 @@ export async function listJobDescriptions(
   if (error) {
     throw new JobDescriptionQueryError(
       `Failed to list job descriptions: ${error.message}`,
+      error,
+    );
+  }
+
+  const rows = data ?? [];
+  const hasMore = rows.length > limit;
+
+  return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
+}
+
+/**
+ * Encodes an integer offset into the opaque cursor string returned as
+ * `next_cursor` for search-mode (`?q=`) pagination, per
+ * docs/ARCHITECTURE.md §9.2. Deliberately a distinct string shape from
+ * `encodeJobDescriptionCursor`'s `<created_at>_<id>` so a cursor produced
+ * under one pagination mode simply fails the other mode's decode (see
+ * `decodeJobDescriptionOffsetCursor`) rather than being silently
+ * misinterpreted.
+ */
+export function encodeJobDescriptionOffsetCursor(offset: number): string {
+  return `offset_${offset}`;
+}
+
+const OFFSET_CURSOR_PATTERN = /^offset_(\d+)$/;
+
+/**
+ * Decodes a cursor produced by `encodeJobDescriptionOffsetCursor`. Returns
+ * `null` for a malformed/unparseable cursor — including a keyset cursor
+ * from `encodeJobDescriptionCursor` replayed in the wrong mode — rather than
+ * throwing, so it degrades to "no cursor" (first page), same "malformed
+ * cursor → first page" behavior `decodeJobDescriptionCursor` already has.
+ */
+export function decodeJobDescriptionOffsetCursor(raw: string): number | null {
+  const match = OFFSET_CURSOR_PATTERN.exec(raw);
+  if (!match) {
+    return null;
+  }
+
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) ? offset : null;
+}
+
+/**
+ * Ranked full-text search over job descriptions via the
+ * `search_job_descriptions` Postgres function (added by
+ * `supabase/migrations/0005_job_description_search.sql`), per
+ * docs/ARCHITECTURE.md §9. Structured the same way as `listJobDescriptions`:
+ * fetches `limit + 1` rows so the caller can tell whether another page
+ * exists without a separate count query; `hasMore` is true when that extra
+ * row was found (in which case it is trimmed off `items`).
+ *
+ * Unlike `listJobDescriptions`'s keyset cursor, pagination here is a plain
+ * integer offset (§9.2's deliberate tradeoff — see
+ * `encodeJobDescriptionOffsetCursor`'s docstring and §9.2 for why a
+ * rank-based keyset cursor was rejected, not just deferred).
+ */
+export async function searchJobDescriptions(
+  supabase: Client,
+  params: {
+    query: string;
+    limit?: number;
+    offset?: number;
+    level?: string | null;
+  },
+): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
+  const limit = Math.min(
+    Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
+    JOB_DESCRIPTIONS_MAX_LIMIT,
+  );
+  const offset = Math.max(0, params.offset ?? 0);
+
+  const { data, error } = await supabase.rpc("search_job_descriptions", {
+    search_query: params.query,
+    // `||`, not `??`: an empty string (from `?level=` present-but-empty)
+    // must also fall back to "no filter," matching `listJobDescriptions`'s
+    // `if (params.level) { ... }` check just above — `??` would only
+    // substitute for `null`/`undefined` and let `""` through, which the
+    // `search_job_descriptions` RPC's `level = level_filter` would then
+    // match against literally (zero rows, since no real row has
+    // `level = ''`) instead of skipping the filter as documented in
+    // docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no filter").
+    level_filter: params.level || null,
+    limit_count: limit + 1,
+    offset_count: offset,
+  });
+
+  if (error) {
+    throw new JobDescriptionQueryError(
+      `Failed to search job descriptions: ${error.message}`,
       error,
     );
   }
@@ -218,6 +326,8 @@ export async function createJobDescription(
     company?: string | null;
     description: string;
     sourceUrl?: string | null;
+    location?: string | null;
+    level?: string | null;
   },
 ): Promise<JobDescriptionRow> {
   const { data, error } = await supabase
@@ -228,6 +338,8 @@ export async function createJobDescription(
       company: params.company ?? null,
       description: params.description,
       source_url: params.sourceUrl ?? null,
+      location: params.location ?? null,
+      level: params.level ?? null,
     })
     .select("*")
     .single();
@@ -240,4 +352,192 @@ export async function createJobDescription(
   }
 
   return data;
+}
+
+/**
+ * Updates a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.3. Scoped to `.eq("submitted_by", submittedBy)`
+ * in addition to relying on RLS (the `job_descriptions_update_own` policy
+ * added by `supabase/migrations/0006_job_description_mutability.sql`) — same
+ * "checked twice" ownership pattern every other query function in this
+ * codebase follows (see docs/ARCHITECTURE.md §2's intro). Returns the
+ * updated row, or `null` if no row matched (not found, not owned, or a
+ * `source='themuse'` row — the RLS policy's `source = 'user'` check would
+ * also block that last case, but the explicit filter here means the "not
+ * found" `null` path is uniform regardless of which check actually stopped
+ * it). Callers turn `null` into a `403`, not `404`, per §2 — existence of
+ * shared job description data is already public via `GET`.
+ *
+ * `patch`'s nullable fields (`company`/`sourceUrl`/`location`/`level`) are
+ * deliberately checked against `!== undefined`, not truthiness: `undefined`
+ * means "key absent from the PATCH body, leave this column untouched" and
+ * is skipped, while `null` means "clear this column back to null" and is
+ * written through as a real `null`. `lib/validation/schemas.ts`'s
+ * `jobDescriptionUpdateSchema` is what makes `null` reachable here at all
+ * from a JSON request body (it normalizes an explicit empty string to
+ * `null` before this function ever sees it) — this is the fix for a real
+ * gap: without it, a submitter had no way to un-set an already-set optional
+ * field via the API, only to change it to a different non-empty value.
+ */
+export async function updateJobDescription(
+  supabase: Client,
+  params: {
+    id: string;
+    submittedBy: string;
+    patch: {
+      title?: string;
+      company?: string | null;
+      description?: string;
+      sourceUrl?: string | null;
+      location?: string | null;
+      level?: string | null;
+    };
+  },
+): Promise<JobDescriptionRow | null> {
+  const update: Database["public"]["Tables"]["job_descriptions"]["Update"] = {};
+  if (params.patch.title !== undefined) update.title = params.patch.title;
+  if (params.patch.company !== undefined) update.company = params.patch.company;
+  if (params.patch.description !== undefined) update.description = params.patch.description;
+  if (params.patch.sourceUrl !== undefined) update.source_url = params.patch.sourceUrl;
+  if (params.patch.location !== undefined) update.location = params.patch.location;
+  if (params.patch.level !== undefined) update.level = params.patch.level;
+
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update(update)
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return null;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to update job description ${params.id}: ${error.message}`,
+      error,
+    );
+  }
+
+  return data;
+}
+
+/**
+ * Soft-deletes (hides) a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.1/§10.3: sets `deleted_at = now()` rather than
+ * deleting the row, so `matches` referencing it (belonging to the submitter
+ * or to any other user) keep resolving exactly as before. Same ownership
+ * filtering as `updateJobDescription`. Returns `true`/`false` for "a row was
+ * updated" — idempotent, deleting an already-deleted row still returns
+ * `true` (it just re-writes the same kind of value), no special-cased
+ * "already deleted" error.
+ */
+export async function softDeleteJobDescription(
+  supabase: Client,
+  params: { id: string; submittedBy: string },
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return false;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to soft-delete job description ${params.id}: ${error.message}`,
+      error,
+    );
+  }
+
+  return data !== null;
+}
+
+/** One externally-sourced listing, mapped and ready to upsert (see `lib/jobs/`). */
+export type ExternalJobDescriptionUpsert = {
+  externalId: string;
+  title: string;
+  company: string | null;
+  description: string;
+  sourceUrl: string | null;
+  level: string | null;
+  location: string | null;
+  postedAt: string | null;
+};
+
+/** Batch size for `upsertExternalJobDescriptions` — keeps individual requests small. */
+const EXTERNAL_UPSERT_BATCH_SIZE = 50;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Upserts a batch of externally-sourced job listings (e.g. from The Muse —
+ * see `lib/jobs/themuse.ts`/`lib/jobs/sync.ts`), keyed on the
+ * `(source, external_id)` unique constraint added by
+ * `supabase/migrations/0004_external_job_listings.sql`. Re-running a sync
+ * for a listing already ingested updates that row in place (title/
+ * description/location can change between syncs) rather than creating a
+ * duplicate. `submitted_by` is left `null` — these rows have no JobMatch
+ * user as their submitter.
+ *
+ * Callers MUST pass a service-role client (`lib/supabase/admin.ts`): there
+ * is no authenticated user in a cron/sync context, so the
+ * `job_descriptions_insert_own` RLS policy (which requires
+ * `submitted_by = auth.uid()`) would reject every row under a normal
+ * session-scoped client.
+ *
+ * Sent in batches of `EXTERNAL_UPSERT_BATCH_SIZE` to keep each Postgrest
+ * request small; a full sync typically upserts a few hundred rows.
+ */
+export async function upsertExternalJobDescriptions(
+  supabase: Client,
+  source: Exclude<JobDescriptionSource, "user">,
+  rows: ExternalJobDescriptionUpsert[],
+): Promise<{ count: number }> {
+  if (rows.length === 0) {
+    return { count: 0 };
+  }
+
+  let count = 0;
+  for (const batch of chunk(rows, EXTERNAL_UPSERT_BATCH_SIZE)) {
+    const { error, count: batchCount } = await supabase
+      .from("job_descriptions")
+      .upsert(
+        batch.map((row) => ({
+          source,
+          external_id: row.externalId,
+          title: row.title,
+          company: row.company,
+          description: row.description,
+          source_url: row.sourceUrl,
+          level: row.level,
+          location: row.location,
+          posted_at: row.postedAt,
+          submitted_by: null,
+        })),
+        { onConflict: "source,external_id", count: "exact" },
+      );
+
+    if (error) {
+      throw new JobDescriptionQueryError(
+        `Failed to upsert external job descriptions: ${error.message}`,
+        error,
+      );
+    }
+
+    count += batchCount ?? batch.length;
+  }
+
+  return { count };
 }
