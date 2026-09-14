@@ -265,6 +265,23 @@ export default async function ResumeDetailPage({
       </section>
 
       <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+        <h2 className="text-base font-semibold text-fg">Resume content</h2>
+        <div className="mt-4">
+          {resume.extracted_text ? (
+            <div className="max-h-[32rem] overflow-y-auto rounded-md border border-border bg-bg p-4">
+              <p className="whitespace-pre-wrap text-sm leading-relaxed text-fg-muted">
+                {resume.extracted_text}
+              </p>
+            </div>
+          ) : (
+            <p className="text-sm text-fg-subtle">
+              No extracted text available for this resume.
+            </p>
+          )}
+        </div>
+      </section>
+
+      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
         <div className="flex items-center justify-between gap-4">
           <h2 className="text-base font-semibold text-fg">Analysis</h2>
           <AnalyzeResumeButton resumeId={resume.id} hasAnalysis={!!analysis} />

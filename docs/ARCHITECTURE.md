@@ -316,10 +316,10 @@ description.
   /dashboard/page.tsx              -- overview: recent resumes, recent matches
   /resumes/
     page.tsx                       -- list + upload form
-    [id]/page.tsx                  -- detail: file info, analysis, matches list, "match against a job" action
+    [id]/page.tsx                  -- detail: file info, extracted resume content, analysis, matches list, "match against a job" action
   /jobs/
     page.tsx                       -- list + submit form
-    [id]/page.tsx                  -- job description detail
+    [id]/page.tsx                  -- job description detail, "match against your resumes" action
   (no standalone /matches/ pages — match results are inlined into
    /resumes/[id]/page.tsx's Matches section rather than given their own
    route; GET /api/matches/:id exists and is tested but has no direct UI
@@ -342,7 +342,7 @@ description.
 /components
   /ui/                             -- generic building blocks: Button, Card, Input, Badge, etc.
   /resumes/                        -- ResumeUploadForm, ResumeCard, ResumeList, AnalysisPanel
-  /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList
+  /jobs/                           -- JobDescriptionForm, JobDescriptionCard, JobDescriptionList, RunJobMatchForm
   /matches/                        -- MatchScoreBadge, MatchRationale, MatchList, RunMatchForm
 
 /lib
