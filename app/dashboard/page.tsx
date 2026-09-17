@@ -113,7 +113,7 @@ export default async function DashboardPage() {
       </p>
 
       <div className="mt-10 grid gap-6 sm:grid-cols-2">
-        <section className="rounded-lg border border-border bg-surface p-6">
+        <section className="rounded-lg border border-border bg-surface shadow-sm p-6">
           <div className="flex items-center justify-between gap-4">
             <h2 className="text-base font-semibold text-fg">
               Your resumes
@@ -155,7 +155,7 @@ export default async function DashboardPage() {
           )}
         </section>
 
-        <section className="rounded-lg border border-border bg-surface p-6">
+        <section className="rounded-lg border border-border bg-surface shadow-sm p-6">
           <div className="flex items-center justify-between gap-4">
             <h2 className="text-base font-semibold text-fg">
               Recent matches
@@ -190,7 +190,7 @@ export default async function DashboardPage() {
         </section>
       </div>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <div className="flex items-center justify-between gap-4">
           <h2 className="text-base font-semibold text-fg">
             Latest job listings

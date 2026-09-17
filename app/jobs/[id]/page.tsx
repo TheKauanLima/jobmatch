@@ -184,7 +184,7 @@ export default async function JobDescriptionDetailPage({
         </p>
       )}
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <h2 className="text-base font-semibold text-fg">Description</h2>
         <p className="mt-3 whitespace-pre-wrap text-sm text-fg-muted">
           {jobDescription.description}
@@ -198,7 +198,7 @@ export default async function JobDescriptionDetailPage({
       )}
 
       {!jobDescription.deleted_at && (
-        <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+        <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
           <h2 className="text-base font-semibold text-fg">
             Match against your resume
           </h2>

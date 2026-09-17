@@ -24,7 +24,7 @@ export function JobDescriptionCard({ jobDescription }: JobDescriptionCardProps) 
   return (
     <Link
       href={`/jobs/${jobDescription.id}`}
-      className="block rounded-lg border border-border bg-surface p-4 transition-colors hover:bg-surface-hover"
+      className="block rounded-lg border border-border bg-surface p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:border-border-strong hover:bg-surface-hover hover:shadow-md"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">

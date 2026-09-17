@@ -23,7 +23,7 @@ interface ResumeCardProps {
 /** Compact display of one resume: name, status, date, view + delete actions. */
 export function ResumeCard({ resume }: ResumeCardProps) {
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-surface p-4">
+    <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-surface shadow-sm p-4">
       <div className="min-w-0">
         <Link
           href={`/resumes/${resume.id}`}

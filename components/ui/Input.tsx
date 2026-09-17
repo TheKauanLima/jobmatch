@@ -12,7 +12,7 @@ export function Input({ label, id, className = "", ...props }: InputProps) {
       </label>
       <input
         id={id}
-        className={`rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-disabled focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle ${className}`}
+        className={`rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg transition-colors placeholder:text-fg-disabled focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle ${className}`}
         {...props}
       />
     </div>

@@ -100,7 +100,7 @@ export function MatchHistoryList({
       {matches.map((match) => (
         <div
           key={match.id}
-          className="rounded-lg border border-border bg-surface p-4"
+          className="rounded-lg border border-border bg-surface shadow-sm p-4"
         >
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">

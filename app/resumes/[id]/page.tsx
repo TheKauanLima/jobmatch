@@ -234,7 +234,7 @@ export default async function ResumeDetailPage({
         />
       </div>
 
-      <section className="mt-8 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-8 rounded-lg border border-border bg-surface shadow-sm p-6">
         <h2 className="text-base font-semibold text-fg">
           File details
         </h2>
@@ -264,7 +264,7 @@ export default async function ResumeDetailPage({
         </dl>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <h2 className="text-base font-semibold text-fg">Resume content</h2>
         <div className="mt-4">
           {resume.extracted_text ? (
@@ -281,7 +281,7 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <div className="flex items-center justify-between gap-4">
           <h2 className="text-base font-semibold text-fg">Analysis</h2>
           <AnalyzeResumeButton resumeId={resume.id} hasAnalysis={!!analysis} />
@@ -301,7 +301,7 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <h2 className="text-base font-semibold text-fg">Matches</h2>
         <div className="mt-4">
           {!analysis ? (

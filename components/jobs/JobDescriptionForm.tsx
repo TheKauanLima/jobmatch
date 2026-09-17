@@ -145,7 +145,7 @@ export function JobDescriptionForm() {
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex flex-col gap-3 rounded-lg border border-border bg-surface p-6"
+      className="flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
     >
       <div>
         <h2 className="text-base font-semibold text-fg">

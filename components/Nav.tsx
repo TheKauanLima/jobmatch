@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -22,6 +22,7 @@ interface NavProps {
  */
 export function Nav({ userEmail }: NavProps) {
   const router = useRouter();
+  const pathname = usePathname();
   const [signingOut, setSigningOut] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -76,11 +77,24 @@ export function Nav({ userEmail }: NavProps) {
       className="relative flex items-center gap-3 text-sm font-medium text-fg-muted sm:gap-6"
     >
       <div className="hidden items-center gap-6 sm:flex">
-        {navLinks.map((link) => (
-          <Link key={link.href} href={link.href} className="hover:text-fg">
-            {link.label}
-          </Link>
-        ))}
+        {navLinks.map((link) => {
+          const isActive =
+            pathname === link.href || pathname?.startsWith(`${link.href}/`);
+          return (
+            <Link
+              key={link.href}
+              href={link.href}
+              aria-current={isActive ? "page" : undefined}
+              className={`border-b-2 pb-1 transition-colors hover:text-fg ${
+                isActive
+                  ? "border-accent text-fg"
+                  : "border-transparent"
+              }`}
+            >
+              {link.label}
+            </Link>
+          );
+        })}
       </div>
 
       <ThemeToggle />
@@ -140,16 +154,23 @@ export function Nav({ userEmail }: NavProps) {
           id="mobile-nav-menu"
           className="absolute right-0 top-full z-10 mt-2 flex w-48 flex-col gap-1 rounded-md border border-border bg-surface p-2 shadow-lg sm:hidden"
         >
-          {navLinks.map((link) => (
-            <Link
-              key={link.href}
-              href={link.href}
-              onClick={() => setMenuOpen(false)}
-              className="rounded-md px-3 py-2 hover:bg-surface-hover hover:text-fg"
-            >
-              {link.label}
-            </Link>
-          ))}
+          {navLinks.map((link) => {
+            const isActive =
+              pathname === link.href || pathname?.startsWith(`${link.href}/`);
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                onClick={() => setMenuOpen(false)}
+                aria-current={isActive ? "page" : undefined}
+                className={`rounded-md px-3 py-2 transition-colors hover:bg-surface-hover hover:text-fg ${
+                  isActive ? "bg-surface-hover text-fg" : ""
+                }`}
+              >
+                {link.label}
+              </Link>
+            );
+          })}
           {userEmail ? (
             <button
               type="button"
