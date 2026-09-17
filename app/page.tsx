@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { FadeInSection } from "@/components/FadeInSection";
+import { SampleAnalysisShowcase } from "@/components/SampleAnalysisShowcase";
 
 /**
  * Landing page. Visual polish pass (2026-09-17): previously a single
@@ -8,6 +10,12 @@ import Link from "next/link";
  * works" section, still built entirely from the existing design tokens
  * (docs/ARCHITECTURE.md §6) — no new colors, no new components beyond
  * plain markup.
+ *
+ * Follow-up polish pass (2026-09-17, same day): added a static sample
+ * resume/analysis showcase (`SampleAnalysisShowcase`) so the "AI analyzes
+ * your resume" pitch is concrete rather than abstract, and wrapped each
+ * section in `FadeInSection` so the page doesn't feel static while
+ * scrolling.
  */
 
 const STEPS = [
@@ -34,7 +42,7 @@ const STEPS = [
 export default function Home() {
   return (
     <div className="flex flex-1 flex-col">
-      <section className="mx-auto w-full max-w-5xl px-6 pt-20 pb-16 sm:pt-28 sm:pb-24">
+      <FadeInSection as="section" className="mx-auto w-full max-w-5xl px-6 pt-20 pb-16 sm:pt-28 sm:pb-24">
         <p className="text-sm font-semibold tracking-wide text-fg-muted uppercase">
           AI-powered job matching
         </p>
@@ -61,9 +69,24 @@ export default function Home() {
             Log in
           </Link>
         </div>
-      </section>
+      </FadeInSection>
 
-      <section className="border-t border-border bg-surface">
+      <FadeInSection as="section" className="border-t border-border bg-surface">
+        <div className="mx-auto w-full max-w-5xl px-6 py-16 sm:py-20">
+          <h2 className="text-xl font-semibold tracking-tight text-fg">
+            See it in action
+          </h2>
+          <p className="mt-2 max-w-2xl text-sm text-fg-muted">
+            A sample resume excerpt and the kind of analysis JobMatch
+            generates for it — not real data, just an example.
+          </p>
+          <div className="mt-8">
+            <SampleAnalysisShowcase />
+          </div>
+        </div>
+      </FadeInSection>
+
+      <FadeInSection as="section">
         <div className="mx-auto w-full max-w-5xl px-6 py-16 sm:py-20">
           <h2 className="text-xl font-semibold tracking-tight text-fg">
             How it works
@@ -72,7 +95,7 @@ export default function Home() {
             {STEPS.map((step) => (
               <div
                 key={step.number}
-                className="rounded-lg border border-border bg-bg p-6 shadow-sm"
+                className="rounded-lg border border-border bg-surface p-6 shadow-sm transition-shadow hover:shadow-md"
               >
                 <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent text-sm font-semibold text-accent-fg">
                   {step.number}
@@ -87,9 +110,9 @@ export default function Home() {
             ))}
           </div>
         </div>
-      </section>
+      </FadeInSection>
 
-      <section className="mx-auto w-full max-w-5xl px-6 py-16 sm:py-20">
+      <FadeInSection as="section" className="mx-auto w-full max-w-5xl px-6 py-16 sm:py-20">
         <div className="rounded-lg border border-border bg-surface p-8 text-center shadow-sm sm:p-12">
           <h2 className="text-xl font-semibold tracking-tight text-fg sm:text-2xl">
             Ready to see how your resume measures up?
@@ -107,7 +130,7 @@ export default function Home() {
             </Link>
           </div>
         </div>
-      </section>
+      </FadeInSection>
     </div>
   );
 }
