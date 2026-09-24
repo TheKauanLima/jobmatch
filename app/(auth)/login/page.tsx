@@ -2,10 +2,28 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FormEvent, useState } from "react";
+import { FormEvent, useState, useSyncExternalStore } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+
+// `?reset=success` is a static, client-only value (it never changes during
+// the page's lifetime, and only exists post-hydration since it comes from
+// `window.location`) — read via useSyncExternalStore rather than
+// useState+useEffect, same idiom as components/ThemeToggle.tsx, so the
+// server-rendered paint (no banner) and the client's first paint agree
+// without a synchronous setState-in-effect.
+function subscribeNoop() {
+  return () => {};
+}
+
+function getResetSuccessSnapshot() {
+  return new URLSearchParams(window.location.search).get("reset") === "success";
+}
+
+function getResetSuccessServerSnapshot() {
+  return false;
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -13,6 +31,11 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const resetSuccess = useSyncExternalStore(
+    subscribeNoop,
+    getResetSuccessSnapshot,
+    getResetSuccessServerSnapshot,
+  );
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -68,6 +91,21 @@ export default function LoginPage() {
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
+
+        <div className="flex justify-end">
+          <Link
+            href="/forgot-password"
+            className="text-sm font-medium text-fg underline underline-offset-2"
+          >
+            Forgot password?
+          </Link>
+        </div>
+
+        {resetSuccess && (
+          <p className="rounded-md border border-success-border bg-success-bg px-3 py-2 text-sm text-success-fg">
+            Password updated. Log in with your new password.
+          </p>
+        )}
 
         {error && (
           <p

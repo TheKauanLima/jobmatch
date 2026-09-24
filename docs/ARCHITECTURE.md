@@ -186,6 +186,35 @@ leak existence of other users' rows.
 Request/response bodies are JSON except where noted (file upload). All JSON bodies
 are validated against shared `zod` schemas in `lib/validation/schemas.ts`.
 
+**Exception: `app/auth/confirm/route.ts`.** Added per §12 — this is the one route
+handler in the app that does **not** live under `app/api/**`. It's deliberately
+outside that pattern because it isn't called via `fetch()` from the frontend at
+all; it's the target of a link Supabase's password-recovery email hands the user,
+which a browser navigates to directly (a plain GET from an email client/browser
+chrome). This is Supabase's documented pattern for PKCE-flow email-link
+confirmation — see §12.1 for why a client-side alternative doesn't work with this
+app's PKCE-configured browser client.
+
+- **`GET /auth/confirm?token_hash=<string>&type=recovery&next=<path>`**
+  - Auth: none required (this is what establishes a session).
+  - Behavior: calls `supabase.auth.verifyOtp({ token_hash, type })` via the
+    server Supabase client (`lib/supabase/server.ts`), which writes the
+    resulting session to cookies on success.
+  - Response: `302` redirect to `next` on success; `302` redirect to
+    `${next}?error=invalid` if `token_hash`/`type` are missing or `verifyOtp`
+    fails.
+  - **Security-critical:** `next` is validated against a strict **allowlist**
+    (`ALLOWED_NEXT_PATHS`, currently just `/reset-password`), not a blocklist
+    or prefix check. A prefix-based blocklist ("must start with `/`, must not
+    start with `//`") was tried first and found live-exploitable:
+    `next=/\evil.com` passes an "is-a-relative-path" prefix check, but WHATWG
+    URL parsing — what `new URL(next, origin)` actually uses to build the
+    redirect — treats `\` the same as `/` for special schemes like `http`, so
+    it resolves to `http://evil.com/` anyway, a full open redirect including
+    on the success path with a real valid recovery session attached. A
+    blocklist can't keep up with parser quirks like this one — do **not**
+    revert this to a blocklist/prefix-check "simplification"; see §12.2.
+
 ### Resumes
 
 **`POST /api/resumes`** — upload a resume file.
@@ -405,6 +434,15 @@ for the dashboard's "Latest matches" panel **and**, per §11, the full
   /(auth)/
     login/page.tsx
     signup/page.tsx
+    forgot-password/page.tsx       -- added per §12: request a password-reset email
+    reset-password/page.tsx        -- added per §12: set a new password once
+                                      /auth/confirm has established a recovery
+                                      session; gates on session presence, not
+                                      URL parsing (see §12.1)
+  /auth/
+    confirm/route.ts               -- added per §12: the one route handler
+                                      outside app/api/** — see §2's exception
+                                      note for its contract and why
   /dashboard/page.tsx              -- overview: recent resumes, recent matches
   /resumes/
     page.tsx                       -- list + upload form
@@ -1858,3 +1896,77 @@ now: whether `/matches` should eventually support the same score/date sort
 control flagged as deliberately out of scope in §11.4 — noted there so it
 isn't silently assumed unnecessary forever, just not built without evidence
 of need.
+
+---
+
+## 12. Password reset flow — 2026-09-24
+
+### Why
+Forgot-password was a real gap flagged by the user: there was no self-service
+way for a user who forgot their password to regain account access — `login`/
+`signup` existed but nothing in between. This section adds that flow.
+
+### 12.1 Root cause: PKCE vs. implicit flow — why this needs a server route
+The browser Supabase client (`lib/supabase/client.ts`) is created via
+`@supabase/ssr`'s `createBrowserClient`, which hardcodes PKCE flow. The
+architecturally "obvious" first approach — client-side hash-fragment
+detection (`/reset-password` reading `#access_token=...&type=recovery` off
+`window.location` and listening for a `PASSWORD_RECOVERY` auth event) — was
+tried and found **completely broken**: a PKCE-flow client never receives that
+event, because Supabase's recovery email for a PKCE-configured project links
+with a `token_hash`/`type` query pair, not an access-token hash fragment.
+Recording this so it isn't re-attempted by a future maintainer chasing the
+same "obvious" fix.
+
+The working fix routes through a server-side confirm route instead:
+`app/auth/confirm/route.ts` calls `supabase.auth.verifyOtp({ token_hash, type
+})` via the server client (`lib/supabase/server.ts`) — the PKCE-compatible
+way to exchange the link's token for a session — and writes that session
+straight to cookies before redirecting to `/reset-password`. By the time
+`/reset-password` renders, a session already exists (checked there via a
+plain `getSession()` call); the page never needs to parse anything from the
+URL itself, beyond reading the confirm route's own `?error=invalid`
+passthrough for the failure case. `verifyOtp` is called from exactly one
+place in this app — every auth email template (signup confirmation, magic
+link, password recovery) must link to this route, never straight to a page.
+
+### 12.2 Open-redirect consideration
+See §2's exception note on `GET /auth/confirm` for the full contract; the key
+point is repeated here for visibility since it's the kind of thing a later
+"cleanup" pass could easily undo without this context. `next` is validated
+against a strict **allowlist** (`/reset-password` only), not a blocklist or
+prefix check, because a blocklist was tried first and found exploitable: a
+prefix check ("must start with `/`, must not start with `//`") accepted
+`next=/\evil.com`, and WHATWG URL parsing — what the route's redirect
+construction (`new URL(next, origin)`) actually uses — treats a leading `\`
+the same as `/` for special schemes like `http`, resolving that value to
+`http://evil.com/`. That's a full open redirect, reachable on the success
+path with a real, valid recovery session attached. Do not reintroduce a
+blocklist/prefix-check here.
+
+### 12.3 Account-enumeration consideration
+`app/(auth)/forgot-password/page.tsx` never branches its UI on what
+`supabase.auth.resetPasswordForEmail` returns. Success and error responses
+from Supabase — including a `429 over_email_send_rate_limit`, which Supabase
+only returns for an email tied to a real account (an unknown email is never
+rate-limited, since no email is ever sent for it) — both render the same
+"Check your email" state. Only a *thrown exception* (network failure, client
+misconfiguration — the request never reaching Supabase for an answer at all)
+shows a distinct failure message. This is a deliberate anti-enumeration
+measure: any response *from* Supabase's API, whatever it says, is treated as
+"an answer was given, don't reveal which," and only a non-answer is treated
+differently.
+
+### 12.4 Files
+- `app/(auth)/forgot-password/page.tsx` (new) — email input, calls
+  `resetPasswordForEmail`, always shows "Check your email" per §12.3.
+- `app/(auth)/reset-password/page.tsx` (new) — set-new-password form; gates
+  on an existing session (established by the confirm route, per §12.1) rather
+  than parsing any token itself; shows "Link expired or invalid" for
+  `?error=invalid` or a missing session; signs the recovery session out and
+  redirects to `/login?reset=success` after a successful
+  `updateUser({ password })`, matching the "confirm, then log in fresh"
+  pattern signup already uses elsewhere in this app.
+- `app/auth/confirm/route.ts` (new) — see §2's exception note and §12.1.
+- `app/(auth)/login/page.tsx` (edited) — added a "Forgot password?" link and
+  a `?reset=success` confirmation banner.
