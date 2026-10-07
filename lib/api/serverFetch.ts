@@ -21,6 +21,7 @@ export async function serverFetch(path: string, init: RequestInit = {}) {
     throw new Error("Unable to determine request host for server-side fetch.");
   }
 
+  
   return fetch(`${protocol}://${host}${path}`, {
     ...init,
     headers: {
