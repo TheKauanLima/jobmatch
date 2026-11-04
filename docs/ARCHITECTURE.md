@@ -2218,7 +2218,7 @@ Indexes: `(created_at)`, `(user_id, created_at)`.
 |---|---|---|
 | `id` | uuid pk | |
 | `user_id` | uuid not null → `auth.users` on delete cascade | |
-| `kind` | text not null | check in `('resume_report','refresh_matches','fit_check','url_import','job_listing_create','job_listing_update')` |
+| `kind` | text not null | check in `('resume_report','refresh_matches','fit_check','url_import','job_listing_create','job_listing_update','account_reauth')` |
 | `ref_id` | uuid null | report / match / import / listing id |
 | `refunded_at` | timestamptz null | set when the action failed for system reasons (§13.10.4); refunded rows don't count |
 | `created_at` | timestamptz | |
@@ -2227,7 +2227,9 @@ Index `(user_id, kind, created_at desc)`. Policy: `rate_limit_events_select_own`
 
 **`private.rate_limits`** (`kind text pk, daily_limit int not null`). Seeded:
 `resume_report 5, refresh_matches 5, fit_check 20, url_import 20,
-job_listing_create 20, job_listing_update 40`. Limits live in SQL because
+job_listing_create 20, job_listing_update 40, account_reauth 10`.
+(`account_reauth` counts every password re-auth attempt per user per UTC day; see
+§13.13.7.) Limits live in SQL because
 RPCs enforce them, and a limit passed in as an argument could be forged by a direct
 PostgREST call. `lib/rateLimit.ts` reads them through `get_my_rate_limits()`
 (security definer, returns `{kind, daily_limit, used_today, resets_at}` for
@@ -2237,7 +2239,27 @@ PostgREST call. `lib/rateLimit.ts` reads them through `get_my_rate_limits()`
 `pg_advisory_xact_lock(hashtext(p_user_id::text || p_kind))`, counts today's (UTC)
 non-refunded rows, and inserts one when under the limit. It returns false at the
 limit. Callers turn false into SQLSTATE `P0001` with message `rate_limited:<kind>`,
-which the route maps to `429`.
+which the route maps to `429`. Execute is revoked from `public, anon,
+authenticated`, and the `private` schema isn't exposed by PostgREST, so users can only
+reach it through the security-definer RPCs.
+
+**`public.consume_account_reauth_attempt() returns boolean`**:
+- Declared `security definer`, `set search_path = ''`.
+- Grants: `revoke execute on function public.consume_account_reauth_attempt() from
+  public, anon;` then `grant execute on function public.consume_account_reauth_attempt()
+  to authenticated;`.
+- Body:
+  1. Raise `unauthenticated` if `auth.uid()` is null.
+  2. Return `private.consume_rate_limit(auth.uid(), 'account_reauth', null)`. This
+     returns `true` when the attempt was recorded and `false` at the limit; it does
+     **not** raise.
+- It takes no arguments, so it can only ever charge the caller.
+- Called by `DELETE /api/account` through the session client (via
+  `lib/rateLimit.ts#consumeAccountReauthAttempt`) before contacting GoTrue:
+  - `false` → `429 {code:'rate_limited', kind:'account_reauth', retry_after}`;
+  - RPC error → `500` (fails closed).
+
+  Full contract in §13.13.7.
 
 #### 13.3.2 Worker schedule (0008)
 - `create extension if not exists pg_cron; create extension if not exists pg_net;`
@@ -2968,6 +2990,55 @@ Behavior, in order:
 recommended" error at these values, pass an explicit `timeout` (which bypasses the
 estimate) or switch that task to `client.beta.messages.stream(...).finalMessage()`.
 Verify in M1.1.
+
+**Verified (M1.1, 2026-11-04, `@anthropic-ai/sdk` 0.122.0, zod 4.6.5, live calls on `claude-opus-5-5`):**
+- **(a) `beta.messages.parse` + `output_config.format` + `fallbacks`:** it exists, and a live
+  call with `betas: ['server-side-fallback-2026-07-01']`, `fallbacks: 'default'`,
+  `output_config: { format: zodOutputFormat(S), effort }` returned `end_turn` with a
+  correct `parsed_output`. **We use the step-2 alternative anyway:**
+  `client.beta.messages.create(...).withResponse()` with
+  `output_config.format = { type: 'json_schema', schema: zodOutputFormat(schema).schema }`,
+  then `schema.safeParse(JSON.parse(text))`. This was also verified live, and it works
+  without the `structured-outputs-*` beta header that `parse` adds. Reasons, from the
+  SDK source:
+  (1) `parse` **throws** a plain `AnthropicError` when the text fails JSON or zod
+  parsing, instead of returning `parsed_output: null`. That discards the response, so
+  usage can't be recorded (step 3) and a `max_tokens` truncation can't be told apart
+  from invalid output (step 4). Its message can also quote model output (Node's
+  `JSON.parse` errors include a snippet).
+  (2) `parse` returns a plain Promise (`create(...).then(...)`), so `.withResponse()`
+  isn't available and the `request-id` is lost (the spread also drops `_request_id`).
+- **(b) zod v4:** `zodOutputFormat` imports `zod/v4` and works with our `zod` 4.x
+  schemas (it uses `z.toJSONSchema` plus the SDK's `transformJSONSchema`). Objects get
+  `additionalProperties: false` and full `required`. Nullable fields become
+  `type: [T, 'null']`.
+- **(c) Unsupported constraints:** the helper moves numeric `minimum`/`maximum`,
+  string `minLength`/`maxLength`, array `maxItems`, and `minItems` > 1 out of the schema
+  and into the field's `description` as a hint (e.g. `{minimum: 0, maximum: 100}`). Only
+  `minItems` 0/1 and a fixed set of string `format`s survive. So none of these are
+  enforced server-side, and `validateX` re-checks every one. **It also strips `enum`**
+  into the description, even though the API accepts `enum` (verified live with a raw
+  schema). For v2 schemas with enums (most of §13.5.4), that means enum membership is
+  enforced only by our client-side zod parse: a miss becomes `ai_invalid_output`, then
+  a retry. *Open item for the architect before M2.x:* either accept that, or have
+  `callStructured` restore `enum` on the wire schema (a small post-processing step on
+  `z.toJSONSchema` output).
+- **(d) Non-streaming guard at 20k:** without an explicit timeout, the SDK throws above
+  `max_tokens` ≈ 21 333 (`3_600_000 × max_tokens / 128_000 > 600_000` ms). 16k and 20k
+  pass, and `claude-opus-5-5` isn't in `MODEL_NONSTREAMING_TOKENS`. `callStructured`
+  always passes the task's `timeoutMs` anyway, which skips the estimate entirely.
+  Non-streaming is fine for every task in §13.5.3.
+- **Other live findings:** forced `tool_choice` and `temperature` both return a typed
+  `BadRequestError` (400). `usage.iterations[].model` can be `null`, meaning the
+  response model. When the fallback fires, `content` can contain a declined model's
+  partial text, then a `fallback` boundary block, then the serving model's answer.
+  `callStructured` reads only the text after the last boundary, and
+  `costFromUsage` prices each `usage.iterations` hop at its own model.
+- **Classification details beyond steps 4–6:** `model_context_window_exceeded` is
+  treated as `ClaudeTruncatedError`, since retrying won't help. 401/403 map to
+  `ai_unavailable` with `retryable: false` (key problem). 408/409 are retryable.
+  Other 4xx (404, 413, 422) and SDK-side pre-send errors map to `ClaudeBadRequestError`.
+  A missing API key maps to `ai_unavailable` with `retryable: false`.
 
 **Deleted by M1.1:** `repairListField`, `repairMatchResponseShape`,
 `TAG_COVERAGE_THRESHOLD`, `extractToolUseInput`, the forced-tool definitions, and the
@@ -3878,24 +3949,148 @@ authenticated user.
 posting_count, required_count } ] } }`. `404` for an unknown slug.
 
 #### 13.13.7 Account
-**`DELETE /api/account`** (new)
-- Request: `{ "password": string, "confirm": "DELETE" }`.
-- Behavior (`lib/account/deleteAccount.ts`, admin client):
-  1. Verify the password via `signInWithPassword` on a **throwaway, non-cookie**
-     client. Failure → `403 {code:'reauth_failed'}`.
-  2. `cancel_tasks_for_user`.
-  3. List and remove **every object under `{user_id}/`** in the `resumes` bucket
-     (paginated `list` 100 at a time, then `remove`, repeated until a list comes back
-     empty). Any failure → `500` and stop, with nothing else deleted, so the request is
-     safely retryable.
-  4. `auth.admin.deleteUser(user_id)` (hard delete), which cascades per §13.3.12.
-  5. Clear the session cookies.
-  Idempotent: re-running after a partial failure finishes the job.
-- Response `204`. Errors: `400`, `401`, `403`, `500`.
+**`DELETE /api/account`** (new; built in M1.4a, `app/api/account/route.ts` +
+`lib/account/**`; this entry is the authoritative contract)
+- Request: `{ "password": string, "confirm": "DELETE" }` (zod `accountDeleteSchema`).
+  The user id and email always come from the verified session (`requireSession()`),
+  never from the body. Validation errors never echo the password.
 - `export const maxDuration = 60`.
+- **Sequence.** Steps 0–4 live in `lib/account/deleteAccount.ts`; step 5 is done by
+  the route.
+  0. **Re-auth rate limit** (M1.4c, after M1.2 merges; see "Re-auth rate limiting"
+     below). Consume one `account_reauth` attempt before contacting GoTrue.
+  1. **Re-authenticate** (`lib/account/reauthenticate.ts#verifyPassword`):
+     - Runs `signInWithPassword` on a **throwaway client**: plain supabase-js with the
+       anon key, `persistSession:false`, `autoRefreshToken:false`,
+       `detectSessionInUrl:false`. It never reads or writes the caller's cookies.
+     - Outcome mapping:
 
-**`GET /api/account/limits`** (new): `{ "limits": [ { kind, daily_limit, used_today,
-resets_at } ] }` from `get_my_rate_limits()`.
+       | Outcome | Condition | Response |
+       |---|---|---|
+       | `invalid` (wrong credentials) | GoTrue answers 400 / 401 / 403 / 422 | `403 {code:'reauth_failed'}` |
+       | `invalid` | session user has **no email** | `403 {code:'reauth_failed'}` |
+       | `invalid` | GoTrue signs in a different user id than the session's (defense in depth) | `403 {code:'reauth_failed'}` |
+       | `unavailable` | GoTrue 429, GoTrue 5xx, network/fetch failure, or a thrown error | `500 {code:'internal_error'}` |
+
+     - **An outage must never be reported as a wrong password.** M1.4b's form codes
+       against exactly this mapping.
+     - On `ok`, the throwaway session is **revoked** with
+       `client.auth.signOut({ scope: 'local' })`. This is best effort: a failure there
+       doesn't change the result. Revoking stops a later step's failure from leaving a
+       stray session behind.
+     - **Known limitation:** only email/password sign-in exists today. A user without
+       an email (if OAuth or phone sign-in is ever added) can't pass step 1 and gets
+       `403`. Adding another sign-in method requires designing a different re-auth
+       path, for example GoTrue's `reauthenticate()` nonce flow or a fresh OAuth
+       round-trip, **before** that method ships.
+  2. **Cancel queued tasks** (`lib/account/cancelUserTasks.ts` →
+     `cancel_tasks_for_user`):
+     - Gated by the code constant `CANCEL_TASKS_FOR_USER_ENABLED`, which stays `false`
+       until 0007 is applied in **every** environment the app runs against.
+     - It is a constant on purpose, not runtime "function missing" detection, because
+       detection would also hide a genuinely missing function after M1.2.
+     - Failure → `500`, and nothing has been deleted.
+     - **Decision:** the RPC call moves to `lib/supabase/queries/tasks.ts#cancelQueuedTasksForUser`.
+       Every Postgres call goes through `queries/*` (the §3 rule), and that file already
+       owns the other task functions. When the gate is flipped (M1.4c), types are
+       regenerated, the `UntypedRpcClient` cast is dropped, and
+       `lib/account/cancelUserTasks.ts` is deleted. `deleteAccount.ts` then imports from
+       `queries/tasks.ts`.
+  3. **Purge Storage** (`lib/account/purgeUserStorage.ts#purgeUserResumeObjects`,
+     admin client):
+     - **Guards** (this runs with RLS bypassed):
+       - `userId` must be a canonical uuid, which refuses a bucket-root prefix;
+       - every path passed to `remove` is re-checked to start with `{user_id}/`;
+       - nested folders are purged recursively, at most 8 levels deep.
+     - **Loop:** list the prefix 100 entries at a time **from offset 0**, remove them,
+       and repeat until a list comes back empty. Always listing from offset 0 means
+       removed objects can't shift the offset and cause entries to be skipped.
+     - **No-progress guard:** if a `remove` reports success but deleted 0 objects
+       (e.g. a concurrent request already removed them), **list again once**. If that
+       re-list returns the same non-empty page, throw. This tolerates a concurrent
+       double-submit without looping forever.
+     - **Round cap:** `STORAGE_PURGE_MAX_ROUNDS` counts list/remove rounds across all
+       prefixes. Backend-dev sizes it so the worst case finishes inside the 60s
+       `maxDuration` with room for steps 1, 4 and 5. Target: ≤ ~40s of Storage work at
+       observed per-round latency, with the chosen value and its reasoning in the
+       constant's docstring. Exceeding it fails the purge (retryable) instead of
+       running into the platform timeout.
+     - **Failure handling:** any Storage error throws. The route returns `500`; the
+       auth user and every DB row are untouched, so the request is safely retryable
+       (objects already removed stay removed).
+  4. **Delete the auth user:** `auth.admin.deleteUser(user_id, false)`, a hard delete
+     that cascades per §13.3.12.
+     - A `404` / `code: 'user_not_found'` response is **treated as success**. This
+       covers a double-submit where a concurrent request finished first.
+  5. **Best-effort second Storage sweep, then clear cookies.**
+     - Step 3 runs again after step 4 to catch objects uploaded in the window between
+       them (e.g. a second tab mid-upload).
+     - A failure here is logged **without identifiers** and does not fail the request,
+       because the account is already gone.
+     - **Operator recovery:** an orphaned top-level folder in the `resumes` bucket
+       whose name matches no `auth.users.id` is safe to delete with the service role.
+       A periodic orphan sweep is not built. Revisit if any orphans are ever observed.
+     - The route then calls `lib/account/clearAuthSession.ts#clearAuthSession`, which
+       never throws:
+       1. `signOut({ scope: 'local' })` on the cookie-bound server client;
+       2. **backstop:** expire every request cookie matching
+          `^sb-[^.]+-auth-token(-code-verifier)?(\.\d+)?$`. That covers the session
+          cookie, its `.N` chunks and the PKCE `-code-verifier`, each set with
+          `maxAge: 0, path: '/'`.
+- **Idempotency:** every step is safe to repeat. A retry after a failure at steps 2–4
+  re-verifies the password (the account still exists), finds Storage already empty,
+  and completes the delete.
+- **Responses:**
+
+  | Status | Body | When |
+  |---|---|---|
+  | `204` | none (cookies cleared) | deleted |
+  | `400` | `{code:'validation_failed'}` | bad or missing JSON body |
+  | `401` | `{error}` | no session |
+  | `403` | `{code:'reauth_failed'}` | wrong password, or no email on the session |
+  | `429` | `{code:'rate_limited', kind:'account_reauth', retry_after}` | from M1.4c |
+  | `500` | `{code:'internal_error'}` | any step failed before the user was deleted; GoTrue unavailable; rate-limit check failed (fails closed) |
+
+  The `500` copy says "your account still exists — try again".
+- **Frontend rule:** a **`401` from this endpoint means "already signed out or
+  already deleted"**. This happens on a retry after a `204` that was lost in transit,
+  because the session no longer resolves. M1.4b treats it like success: show the
+  deleted confirmation and route to `/`. It does not show an error.
+
+**Re-auth rate limiting (`account_reauth`; M1.4c).** Resolves deferred review finding
+S2.
+- **Why:**
+  - Every re-auth call reaches GoTrue from Vercel's shared egress IPs, so GoTrue's
+    per-IP limit is effectively shared by all users.
+  - Someone holding a stolen session cookie could otherwise guess passwords, limited
+    only by that shared limit.
+- **Kind:** a new `rate_limit_events.kind` value `account_reauth`, seeded in
+  `private.rate_limits` with **`daily_limit = 10`** (per user, UTC day, same mechanism
+  as the other kinds).
+  - The kind, its seed value, and the RPC are part of §13.3.1 and ship in **0007**.
+- **Where it's consumed:**
+  - New user-callable RPC `public.consume_account_reauth_attempt() returns boolean`:
+    `security definer`, `search_path=''`, `grant execute to authenticated`. It raises
+    `unauthenticated` if `auth.uid()` is null, then calls
+    `private.consume_rate_limit(auth.uid(), 'account_reauth', null)`.
+  - The route calls it through the **session** client via
+    `lib/rateLimit.ts#consumeAccountReauthAttempt(supabase)`. This happens after body
+    validation and before `deleteAccount` (step 0), so a rejected attempt never
+    reaches GoTrue.
+- **What counts:** **every** attempt, successful or not. Counting only failures would
+  need a second write after GoTrue answers, opening a race window, and 10/day is ample
+  for legitimate use.
+- **Responses:**
+  - Limit reached → `429 { error, code:'rate_limited', kind:'account_reauth',
+    retry_after }`, where `retry_after` is the next UTC midnight.
+  - RPC error → `500 internal_error`. It fails closed: no GoTrue call is made without
+    a successful consume.
+- **Scope:** applies to every future password-re-auth endpoint (e.g. change email),
+  which must reuse the same kind.
+
+**`GET /api/account/limits`** (new; M1.4c): `{ "limits": [ { kind, daily_limit,
+used_today, resets_at } ] }` from `get_my_rate_limits()`. The list includes
+`account_reauth`.
 
 **`GET|PUT /api/account/notifications`** (Phase 5): `{ "weekly_digest_enabled":
 boolean }`.
@@ -3965,7 +4160,10 @@ the same semantics for RFC 8058 one-click.
   /taxonomy/  normalize.ts, vocabulary.ts (loads canonical skills/roles for prompts; cached per invocation)
   /market/    stats.ts
   /net/       safeFetch.ts, ipPolicy.ts, extractListingText.ts
-  /account/   deleteAccount.ts
+  /account/   deleteAccount.ts (orchestrates §13.13.7 steps 1–4 + post-delete sweep),
+              reauthenticate.ts (throwaway anon-key client; never admin), purgeUserStorage.ts (admin),
+              cancelUserTasks.ts (temporary — superseded by queries/tasks.ts in M1.4c, then deleted),
+              clearAuthSession.ts (cookie-bound server client + cookie-expiry backstop)
   /email/     provider.ts, resend.ts, templates/weeklyDigest.ts          (Phase 5)
   /client/    usePolledResource.ts
   rateLimit.ts                                                           (replaces lib/claude/rateLimit.ts)
@@ -3976,7 +4174,21 @@ the same semantics for RFC 8058 one-click.
               evals/{extraction,critique,retrieval,injection}.ts   (manual, need real keys; never in CI)
 /supabase/tests/database/*.test.sql                                (pgTAP, run via `supabase test db`)
 /tests/fixtures/{resumes,listings,sources,adversarial,pages}/       (synthetic only — no real PII)
+/tests/fakes/                                                      (in-memory test doubles shared across modules,
+                                                                    e.g. supabaseStorage.ts; imported only by *.test.ts)
 ```
+**Test files and test doubles:**
+- Unit tests sit next to their module (`foo.ts` + `foo.test.ts`, the existing
+  convention).
+- Reusable fakes live in **`/tests/fakes/`**, not inside feature folders. The Storage
+  fake written for account deletion will also serve `resume.extract_text`, the
+  `DELETE /api/resumes/:id` tests, and the worker tests, and a fake inside
+  `lib/account/` would sit in production source.
+- Data fixtures stay in `/tests/fixtures/`.
+- Code under `lib/**` or `app/**` must never import from `/tests/**`. The reviewer
+  greps for this.
+- `lib/account/testing/fakeStorage.ts` moves to `/tests/fakes/supabaseStorage.ts` in
+  M1.4c.
 **Service-role boundary (reviewer greps for `createAdminClient` imports):** allowed
 only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidates.ts`,
 `lib/supabase/queries/{tasks,usage,embeddings,sources}.ts`, `app/api/worker/**`,

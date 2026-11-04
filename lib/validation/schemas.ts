@@ -263,3 +263,35 @@ export const matchCreateSchema = z.object({
 });
 
 export type MatchCreateInput = z.infer<typeof matchCreateSchema>;
+
+// ---------------------------------------------------------------------
+// Account — DELETE /api/account
+// ---------------------------------------------------------------------
+
+/** The exact word the user must type to confirm account deletion (§13.13.7). */
+export const ACCOUNT_DELETE_CONFIRMATION = "DELETE" as const;
+
+/**
+ * Upper bound on the password field for `DELETE /api/account`. Purely a
+ * request-size guard (Supabase Auth's own limit is far lower); deliberately
+ * not a policy check — the password is verified by Supabase Auth, never here.
+ */
+export const ACCOUNT_DELETE_PASSWORD_MAX_LENGTH = 1024;
+
+/**
+ * Request body for `DELETE /api/account`, per docs/ARCHITECTURE.md §13.13.7:
+ * `{ password, confirm: "DELETE" }`. The password is not trimmed or otherwise
+ * normalized (leading/trailing spaces can be part of a real password), and
+ * no validation message ever echoes it back.
+ */
+export const accountDeleteSchema = z.object({
+  password: z
+    .string({ message: "Enter your password." })
+    .min(1, "Enter your password.")
+    .max(ACCOUNT_DELETE_PASSWORD_MAX_LENGTH, "Password is too long."),
+  confirm: z.literal(ACCOUNT_DELETE_CONFIRMATION, {
+    message: `Type ${ACCOUNT_DELETE_CONFIRMATION} to confirm.`,
+  }),
+});
+
+export type AccountDeleteInput = z.infer<typeof accountDeleteSchema>;

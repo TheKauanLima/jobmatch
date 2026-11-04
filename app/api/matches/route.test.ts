@@ -11,7 +11,6 @@ const {
   mockCreateMatch,
   mockCheckRateLimit,
   mockMatchResumeToJob,
-  mockParseMatchResponse,
 } = vi.hoisted(() => ({
   mockRequireSession: vi.fn(),
   mockCreateClient: vi.fn(),
@@ -23,7 +22,6 @@ const {
   mockCreateMatch: vi.fn(),
   mockCheckRateLimit: vi.fn(),
   mockMatchResumeToJob: vi.fn(),
-  mockParseMatchResponse: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/session", async () => {
@@ -84,17 +82,26 @@ vi.mock("@/lib/claude/prompts/matchResumeToJob", async () => {
   return { ...actual, matchResumeToJob: mockMatchResumeToJob };
 });
 
-vi.mock("@/lib/claude/parse", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/claude/parse")>(
-    "@/lib/claude/parse",
-  );
-  return { ...actual, parseMatchResponse: mockParseMatchResponse };
-});
-
 const { GET, POST } = await import("@/app/api/matches/route");
 const { UnauthorizedError } = await import("@/lib/auth/session");
-const { ClaudeApiError } = await import("@/lib/claude/client");
-const { ClaudeResponseValidationError } = await import("@/lib/claude/parse");
+const {
+  ClaudeApiError,
+  ClaudeBadRequestError,
+  ClaudeInvalidOutputError,
+  ClaudeRefusalError,
+  ClaudeTruncatedError,
+} = await import("@/lib/claude/errors");
+
+/** Shape returned by the migrated `matchResumeToJob` (lib/claude/prompts/matchResumeToJob.ts). */
+function outcome(value: unknown) {
+  return {
+    value,
+    dropped: 0,
+    model: "claude-opus-5-5",
+    usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, priceKnown: true },
+    requestId: "req_test",
+  };
+}
 
 const RESUME_UUID = "11111111-1111-4111-8111-111111111111";
 const JOB_DESCRIPTION_UUID = "22222222-2222-4222-8222-222222222222";
@@ -455,13 +462,12 @@ describe("POST /api/matches", () => {
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
-    mockParseMatchResponse.mockReturnValue({
+    mockMatchResumeToJob.mockResolvedValue(outcome({
       score: 82,
       rationale: "Good fit.",
       matched_strengths: ["Node.js"],
       gaps: ["Kubernetes"],
-    });
+    }));
     mockCreateMatch.mockResolvedValue(matchRow);
 
     await POST(postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }));
@@ -479,13 +485,12 @@ describe("POST /api/matches", () => {
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
-    mockParseMatchResponse.mockReturnValue({
+    mockMatchResumeToJob.mockResolvedValue(outcome({
       score: 82,
       rationale: "Good fit.",
       matched_strengths: ["Node.js"],
       gaps: ["Kubernetes"],
-    });
+    }));
     mockCreateMatch.mockResolvedValue(matchRow);
 
     const res = await POST(
@@ -496,6 +501,7 @@ describe("POST /api/matches", () => {
     expect(mockMatchResumeToJob).toHaveBeenCalledWith(
       ownedResume.extracted_text,
       jobDescription.description,
+      { userId: "user-1" },
     );
     expect(mockCreateMatch).toHaveBeenCalledWith(
       expect.anything(),
@@ -515,13 +521,13 @@ describe("POST /api/matches", () => {
     expect(body.match.score).toBe(82);
   });
 
-  it("returns 502 when the Claude API call fails, WITHOUT retrying (ClaudeApiError is not retried, only schema-validation failures are)", async () => {
+  it("returns 502 when the Claude API is unavailable, calling the task once", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(ownedResume);
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockRejectedValue(new ClaudeApiError("boom"));
+    mockMatchResumeToJob.mockRejectedValue(new ClaudeApiError("Claude unavailable.", { code: "ai_unavailable", retryable: true, status: 529 }));
 
     const res = await POST(
       postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
@@ -531,60 +537,82 @@ describe("POST /api/matches", () => {
     expect(mockMatchResumeToJob).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 502 when Claude's response fails schema validation on every attempt, after retrying up to the bounded max", async () => {
+  it("returns 502 when Claude's output is invalid (after matchResumeToJob's own single retry); the route has no retry loop of its own (MAX_MATCH_ATTEMPTS removed in M1.1)", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(ownedResume);
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
-    mockParseMatchResponse.mockImplementation(() => {
-      throw new ClaudeResponseValidationError("bad shape");
-    });
+    mockMatchResumeToJob.mockRejectedValue(
+      new ClaudeInvalidOutputError("Claude output failed validation (matchResumeToJob: schema mismatch at score)."),
+    );
+
+    const res = await POST(
+      postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
+    );
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "Match assessment failed. Please try again." });
+    expect(mockCreateMatch).not.toHaveBeenCalled();
+    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["refusal", () => new ClaudeRefusalError("Claude declined the request.", { category: "general_harms" })],
+    ["truncation", () => new ClaudeTruncatedError("Claude output was truncated.")],
+    ["bad request", () => new ClaudeBadRequestError("Claude rejected the request.", { status: 400 })],
+    ["rate limit / overload", () => new ClaudeApiError("Claude rate limited.", { code: "ai_unavailable", retryable: true, status: 429 })],
+  ])("maps a Claude %s to 502 without persisting", async (_name, makeErr) => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResume);
+    mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
+    mockGetJobDescriptionById.mockResolvedValue(jobDescription);
+    mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
+    mockMatchResumeToJob.mockRejectedValue(makeErr());
 
     const res = await POST(
       postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
     );
     expect(res.status).toBe(502);
     expect(mockCreateMatch).not.toHaveBeenCalled();
-    // Bounded retry: 1 initial attempt + up to 3 retries = 4 total calls,
-    // not an unbounded retry loop.
-    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(4);
-    expect(mockParseMatchResponse).toHaveBeenCalledTimes(4);
   });
 
-  it("recovers via retry: a schema-invalid response on the first attempt followed by a valid response on the second attempt succeeds with 201 (regression test for the QA-reported bug — no retry previously existed)", async () => {
+  it("persists the validated value and the model that actually served the response", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetResumeById.mockResolvedValue(ownedResume);
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
-    mockParseMatchResponse
-      .mockImplementationOnce(() => {
-        // Reproduces the QA-reported non-compliant response: matched_strengths
-        // as a string instead of an array, gaps omitted.
-        throw new ClaudeResponseValidationError(
-          "matched_strengths must be an array, gaps is required",
-        );
-      })
-      .mockImplementationOnce(() => ({
-        score: 82,
-        rationale: "Good fit.",
-        matched_strengths: ["Node.js"],
-        gaps: ["Kubernetes"],
-      }));
+    const value = { score: 82, rationale: "Good fit.", matched_strengths: ["Node.js"], gaps: ["Kubernetes"] };
+    mockMatchResumeToJob.mockResolvedValue({ ...outcome(value), model: "claude-sonnet-5-5" });
     mockCreateMatch.mockResolvedValue(matchRow);
 
-    const res = await POST(
-      postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
-    );
-    const body = await res.json();
+    await POST(postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }));
 
-    expect(res.status).toBe(201);
-    expect(body.match.score).toBe(82);
-    expect(mockMatchResumeToJob).toHaveBeenCalledTimes(2);
-    expect(mockCreateMatch).toHaveBeenCalledTimes(1);
+    expect(mockCreateMatch).toHaveBeenCalledWith(expect.anything(), {
+      resumeId: RESUME_UUID,
+      jobDescriptionId: JOB_DESCRIPTION_UUID,
+      userId: "user-1",
+      model: "claude-sonnet-5-5",
+      result: value,
+    });
+  });
+
+  it("never logs resume or job description text when Claude fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResume);
+    mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
+    mockGetJobDescriptionById.mockResolvedValue(jobDescription);
+    mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
+    mockMatchResumeToJob.mockRejectedValue(new ClaudeTruncatedError("Claude output was truncated."));
+
+    await POST(postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }));
+
+    const logged = JSON.stringify(errorSpy.mock.calls);
+    expect(logged).toContain("ai_truncated");
+    expect(logged).not.toContain(ownedResume.extracted_text);
+    expect(logged).not.toContain(jobDescription.description);
+    errorSpy.mockRestore();
   });
 
   it("returns 500 (not a crash) on an unexpected DB failure creating the match", async () => {
@@ -593,13 +621,12 @@ describe("POST /api/matches", () => {
     mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
     mockGetJobDescriptionById.mockResolvedValue(jobDescription);
     mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
-    mockMatchResumeToJob.mockResolvedValue({ model: "claude-sonnet-5" });
-    mockParseMatchResponse.mockReturnValue({
+    mockMatchResumeToJob.mockResolvedValue(outcome({
       score: 82,
       rationale: "Good fit.",
       matched_strengths: [],
       gaps: [],
-    });
+    }));
     mockCreateMatch.mockRejectedValue(new Error("db down"));
 
     const res = await POST(

@@ -100,24 +100,67 @@ check.
    paginated Storage purge under `{user_id}/`, `auth.admin.deleteUser`, and
    idempotent re-runs.
 2. [BE] `DELETE /api/account` with zod body `{password, confirm:'DELETE'}`, sign-out,
-   and `maxDuration = 60`. Add `GET /api/account/limits` (once M1.2 is merged).
+   and `maxDuration = 60`.
+3. [BE] (Added at review.) Implement the hardening in §13.13.7:
+   - the re-auth outcome mapping (credentials rejected → 403; outage → 500);
+   - throwaway-session revoke;
+   - `user_not_found` treated as success;
+   - the post-delete Storage sweep;
+   - cookie-expiry backstop;
+   - the re-list-once no-progress guard;
+   - a `STORAGE_PURGE_MAX_ROUNDS` sized to fit `maxDuration = 60`, with its
+     reasoning in the docstring.
 
 **Acceptance:**
 - A test user with 2 resumes is fully gone: no `storage.objects` rows under their
   prefix, no rows in any user-linked table.
 - A shared listing they submitted remains with `submitted_by = null`.
 - A wrong password returns 403.
+- A GoTrue 429/5xx/network failure returns 500, not 403.
 - A simulated Storage failure deletes nothing else and can be retried.
+- A concurrent double-submit doesn't loop or error spuriously.
 
 ### M1.4b Account deletion and settings UI [FE]
-Depends on: M1.4a. Implements §13.13.7, §13.14 (`/settings`).
+Depends on: M1.4a (deletion form); M1.4c (usage panel and the `account_reauth` 429).
+Implements §13.13.7, §13.14 (`/settings`).
 1. [FE] `/settings` page with `DeleteAccountForm`. The copy states what is deleted
    and that shared listings stay anonymized. Requires typing DELETE plus the password.
    Add a link in Nav.
-2. [FE] `UsageLimits` panel (reads `/api/account/limits`), once M1.2 is merged.
+2. [FE] Map responses exactly as §13.13.7:
+   - `403 reauth_failed` → "Incorrect password";
+   - `500` → "Your account still exists — try again";
+   - **`401` → treat as already deleted/signed out** (confirmation + route to `/`);
+   - `429 kind:'account_reauth'` → "Too many attempts, try again after <retry_after>".
+3. [FE] `UsageLimits` panel (reads `/api/account/limits`), once M1.4c is merged.
 
-**Acceptance:** deletion signs the user out and lands on `/` with a confirmation.
-Errors show inline. The page uses the §6 tokens only.
+**Acceptance:**
+- Deletion signs the user out and lands on `/` with a confirmation.
+- A replayed request after a lost 204 also lands on the confirmation.
+- Errors show inline.
+- The page uses the §6 tokens only.
+
+### M1.4c Account hardening follow-ups [BE]
+Depends on: M1.2 merged and 0007 applied in every environment. Implements §13.13.7
+("Re-auth rate limiting", step 2 decision, `GET /api/account/limits`) and §13.14 (test
+doubles).
+1. [BE] The `account_reauth` kind (limit 10) and the RPC
+   `consume_account_reauth_attempt()` ship in 0007 (M1.2, per §13.3.1). Here, add
+   `lib/rateLimit.ts#consumeAccountReauthAttempt` and call it in `DELETE /api/account`
+   before `deleteAccount` → `429` / `500` per §13.13.7.
+2. [BE] Flip `CANCEL_TASKS_FOR_USER_ENABLED`, regenerate `types/database.ts`, move
+   the RPC call to `lib/supabase/queries/tasks.ts#cancelQueuedTasksForUser` (typed, no
+   cast), and delete `lib/account/cancelUserTasks.ts`.
+3. [BE] `GET /api/account/limits` (lists `account_reauth` too).
+4. [BE] Move `lib/account/testing/fakeStorage.ts` → `/tests/fakes/supabaseStorage.ts`,
+   update imports, and remove the `lib/account/testing/` folder.
+
+**Acceptance:**
+- The 11th re-auth attempt in a UTC day returns 429 without calling GoTrue (route
+  test asserts no `signInWithPassword` call).
+- An RPC failure returns 500 and makes no GoTrue call.
+- pgTAP confirms the RPC only ever charges `auth.uid()`.
+- Deletion cancels queued tasks.
+- Nothing under `lib/` or `app/` imports `/tests/**`.
 
 ### M1.5 Job ingestion v2 core [BE]
 Implements §13.3.3, 13.6.2, 13.6.4–13.6.7, 13.13.4 (list/detail/write changes).
@@ -530,7 +573,8 @@ deletion completeness including the new tables.
 | M1.2 | Background task infrastructure (0007/0008, worker, kicks) | BE | — | 🟢 |
 | M1.3 | QA: task infra and Claude layer (pgTAP harness) | QA | M1.1, M1.2 | |
 | M1.4a | Account deletion backend | BE | — | 🟢 |
-| M1.4b | Settings page and deletion UI | FE | M1.4a | |
+| M1.4b | Settings page and deletion UI | FE | M1.4a (form); M1.4c (limits panel, 429) | |
+| M1.4c | Account hardening: `account_reauth` limit, cancel-tasks gate flip and move, limits endpoint, test-fake move | BE | M1.2 + 0007 applied | |
 | M1.5 | Job ingestion v2 core (0009, adapters interface, dedupe, expiry, RPC writes) | BE | M1.2 | |
 | M1.6 | USAJOBS, Greenhouse, Lever adapters | BE | M1.5, Q4 | |
 | M1.7 | Jobs board UI updates | FE | M1.5 | |

@@ -12,11 +12,7 @@ import {
 } from "@/lib/storage/resumeFiles";
 import { DAILY_RATE_LIMITS, checkRateLimit } from "@/lib/claude/rateLimit";
 import { analyzeResume } from "@/lib/claude/prompts/analyzeResume";
-import {
-  ClaudeResponseValidationError,
-  parseResumeAnalysisResponse,
-} from "@/lib/claude/parse";
-import { ClaudeApiError } from "@/lib/claude/client";
+import { ClaudeApiError } from "@/lib/claude/errors";
 import { toResumeAnalysis } from "@/types/domain";
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -28,7 +24,8 @@ type RouteContext = { params: Promise<{ id: string }> };
  * Flow: auth -> ownership check (404) -> daily rate-limit check (429) ->
  * resolve `extracted_text` (extracting from the stored file first if this
  * is the first analysis, 422 on failure) -> mark `resumes.status =
- * 'processing'` -> call Claude -> validate its response -> insert a
+ * 'processing'` -> call Claude (structured output + semantic validation,
+ * with one retry on invalid output, all inside `analyzeResume`) -> insert a
  * `resume_analyses` row -> mark `resumes.status = 'analyzed'`. Any failure
  * from the Claude call onward is caught and always resolves the resume's
  * status to `'failed'` (never left stuck on `'processing'`), then returns
@@ -158,14 +155,13 @@ export async function POST(_request: Request, { params }: RouteContext) {
   // because a later bookkeeping update has a hiccup.
   let analysis;
   try {
-    const message = await analyzeResume(resumeText);
-    const result = parseResumeAnalysisResponse(message);
+    const outcome = await analyzeResume(resumeText, { userId: user.id });
 
     analysis = await createAnalysis(supabase, {
       resumeId: id,
       userId: user.id,
-      model: message.model,
-      result,
+      model: outcome.model,
+      result: outcome.value,
     });
   } catch (err) {
     // Never leave the resume stuck on 'processing' — always resolve to
@@ -179,12 +175,13 @@ export async function POST(_request: Request, { params }: RouteContext) {
       },
     );
 
-    if (
-      err instanceof ClaudeApiError ||
-      err instanceof ClaudeResponseValidationError
-    ) {
+    // Every Claude-layer failure (unavailable, refused, truncated, invalid
+    // output, bad request) is a ClaudeApiError subclass.
+    if (err instanceof ClaudeApiError) {
+      // `code` and `message` are PII-free by construction (lib/claude/errors.ts).
       console.error(
         "POST /api/resumes/:id/analyze: Claude analysis failed:",
+        err.code,
         err.message,
       );
       return NextResponse.json(

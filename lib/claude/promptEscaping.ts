@@ -1,53 +1,101 @@
 /**
- * Shared delimiter-escaping helper used by every `lib/claude/prompts/*`
- * module that wraps untrusted user-supplied text in an XML-ish delimiter
- * tag before sending it to Claude (see the "Injection-hardening approach"
- * docstring in `lib/claude/prompts/analyzeResume.ts` for the full three-
- * layer rationale — this module is layer 2, delimiter-escaping, factored
- * out so it isn't duplicated per-tag-name).
+ * Delimiter escaping and wrapping for untrusted prompt content, per
+ * docs/ARCHITECTURE.md §13.5.5 (reviewer-blocking). Extends the v1 module
+ * (§5) rather than replacing its approach.
  *
- * Originally lived only in `analyzeResume.ts` scoped to the literal word
- * "resume_text". `matchResumeToJob.ts` (M5) needs the exact same escaping
- * behavior for a SECOND, independently-untrusted tag word
- * ("job_description_text") — job descriptions are shared, community-
- * submitted content (any authenticated user can submit one, per
- * docs/ARCHITECTURE.md §1/§5) that gets matched against OTHER users'
- * resumes, so it's just as adversarial-capable as resume text and must get
- * the identical hardening treatment, not a weaker copy-pasted variant.
- * Generalized here over an arbitrary `tagWord` so both call sites share one
- * audited implementation.
+ * ---- The model ----
+ * Every untrusted string (resume text, listing text, fetched page text) and
+ * every untrusted-derived string (a machine-extracted profile, narration role
+ * data) enters a prompt only through `wrapUntrusted(tag, text, attrs?)`. That
+ * function:
+ *   1. escapes `text` with `escapeUntrusted()` against every word in
+ *      `RESERVED_TAG_WORDS`, not just its own tag, so no block can forge
+ *      another block's open/close tag (cross-tag forgery); and
+ *   2. wraps the result in `<tag ...attrs>` ... `</tag>`, where `tag` must be
+ *      a reserved word and `attrs` are server-generated only (validated
+ *      against a strict charset, so user text can never reach an attribute).
+ *
+ * The system prompt (`UNTRUSTED_DATA_RULES` in promptCommon.ts) tells Claude
+ * that everything inside these tags is data, never instructions.
+ *
+ * ---- What `escapeUntrusted()` neutralizes ----
+ * Any open, close, or self-closing tag head for a reserved word, in one pass:
+ *   - case-insensitive (`</RESUME_TEXT>`);
+ *   - whitespace around and *within* the word (`</ resume_te xt >`,
+ *     `</resume_\ntext>`), since an attacker controls the exact bytes;
+ *   - invisible characters spliced into the word (stripped from the whole
+ *     text first, see `INVISIBLE_CHAR_RANGES`);
+ *   - attributes (`<job_posting id="J1">`, `<resume_text role="system">`);
+ *   - an unterminated tag head (`</resume_text` at end of text or before a
+ *     newline), which a model could still read as a delimiter.
+ * The `<` (and the closing `>`, if present) are replaced with full-width
+ * look-alikes (`＜` U+FF1C, `＞` U+FF1E). Everything between them is kept
+ * verbatim, so no submitted text is lost and quoted-back text stays readable,
+ * but it no longer parses as one of our delimiters. Unrelated angle-bracket
+ * text (`<React>`, `C++ <templates>`, `<resume_textual>`) is untouched.
  */
 
+/** Tags that carry meaning in Kalify prompts (§13.5.5 item 1). */
+export const RESERVED_TAG_WORDS = [
+  "resume_text",
+  "job_description_text",
+  "job_posting",
+  "candidate_profile",
+  "fetched_page_text",
+  "role_data",
+  "market_data",
+] as const;
+
+export type ReservedTagWord = (typeof RESERVED_TAG_WORDS)[number];
+
 /**
- * Code points of zero-width/invisible Unicode characters an adversary could
- * splice into the literal tag word to defeat a naive whitespace-only
- * tolerant regex — `\s` does not match any of these in JavaScript. Built
- * from numeric code points (via `String.fromCharCode`) rather than
- * embedding the literal invisible characters in this file's source, so the
- * exact set is unambiguous to read/audit and can't be silently mangled by
- * an editor/encoding round-trip:
- *   - U+200B zero-width space
- *   - U+200C zero-width non-joiner
- *   - U+200D zero-width joiner
- *   - U+2060 word joiner
- *   - U+FEFF zero-width no-break space / BOM
+ * Invisible / zero-width / formatting code points an adversary could splice
+ * into a tag word to defeat a whitespace-tolerant regex (`\s` matches none
+ * of them), or use to hide instructions from a human reviewer while the
+ * model still reads them. Built from numeric code points so the set is
+ * unambiguous to audit. Stripped from the whole text before matching. None
+ * carry meaning in resume or listing content.
  *   - U+00AD soft hyphen
- * Stripped from the text entirely before tag-matching, since none of these
- * carry legitimate meaning in resume or job-description content.
+ *   - U+180E Mongolian vowel separator
+ *   - U+200B–U+200F zero-width space / non-joiner / joiner, LRM, RLM
+ *   - U+202A–U+202E bidi embedding / override controls
+ *   - U+2060–U+2064 word joiner, invisible operators
+ *   - U+2066–U+2069 bidi isolate controls
+ *   - U+FEFF zero-width no-break space / BOM
+ *   - U+E0000–U+E007F Unicode "tag" characters (used for invisible-text
+ *     "ASCII smuggling" aimed at LLMs)
+ * Every code point in the v1 set (U+200B, U+200C, U+200D, U+2060, U+FEFF,
+ * U+00AD) is still covered.
  */
-const INVISIBLE_CHAR_CODE_POINTS = [0x200b, 0x200c, 0x200d, 0x2060, 0xfeff, 0x00ad];
-const INVISIBLE_CHARS = new RegExp(
-  `[${INVISIBLE_CHAR_CODE_POINTS.map((code) => String.fromCharCode(code)).join("")}]`,
-  "g",
+const INVISIBLE_CHAR_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x00ad, 0x00ad],
+  [0x180e, 0x180e],
+  [0x200b, 0x200f],
+  [0x202a, 0x202e],
+  [0x2060, 0x2064],
+  [0x2066, 0x2069],
+  [0xfeff, 0xfeff],
+  [0xe0000, 0xe007f],
+];
+
+function codePointClassPart([from, to]: readonly [number, number]): string {
+  const hex = (cp: number) => `\\u{${cp.toString(16)}}`;
+  return from === to ? hex(from) : `${hex(from)}-${hex(to)}`;
+}
+
+/** Exported for reuse by `normalizeForQuoteMatch` (semanticValidation.ts). */
+export const INVISIBLE_CHARS_PATTERN = new RegExp(
+  `[${INVISIBLE_CHAR_RANGES.map(codePointClassPart).join("")}]`,
+  "gu",
 );
 
+export function stripInvisibleChars(raw: string): string {
+  return raw.replace(INVISIBLE_CHARS_PATTERN, "");
+}
+
 /**
- * Builds a regex fragment matching the literal `word` that tolerates
- * arbitrary whitespace *between every character* (not just around the whole
- * tag) — e.g. `res\nume_text` or `resume_te xt` must still match. Without
- * this, splitting the word itself (rather than just padding around the tag)
- * bypasses escaping entirely, since an attacker fully controls the exact
- * bytes of their submitted content.
+ * Regex fragment matching `word` with arbitrary whitespace between every
+ * character (`res\nume_text`, `resume_te xt`).
  */
 function buildTolerantWordPattern(word: string): string {
   return word
@@ -57,24 +105,83 @@ function buildTolerantWordPattern(word: string): string {
 }
 
 /**
- * Neutralizes any literal occurrence of the `<${tagWord}>` /
- * `</${tagWord}>` delimiter tags inside user-supplied content, so submitted
- * text cannot forge a premature close tag (or a fake open tag) to break out
- * of its data block. Matching is case-insensitive and tolerant of
- * whitespace both around the tag (e.g. `</ resume_text >`) AND *within* the
- * literal word itself (e.g. `</resume_\ntext>`, `</resume_te xt>`), plus
- * zero-width/invisible Unicode characters spliced into the word, since an
- * attacker controls the exact bytes. Replaces matches with full-width
- * look-alike characters so the text remains readable if quoted back (e.g.
- * in an error message or a model-generated rationale), but is no longer
- * parseable as our delimiter.
+ * One pattern for every reserved word (longest first, so no word can shadow a
+ * longer one sharing its prefix):
+ *
+ *   <  \s*  /?  \s*  (word1|word2|...)  (?![letter/digit/_])  [^<>]*  >?
+ *
+ * - `(?![\p{L}\p{N}_])` keeps `<resume_textual>` and `<job_postings>` out.
+ * - `[^<>]*` is the attribute / trailing-whitespace / self-closing-slash
+ *   region (the §13.5.5 pattern's `(\s[^>]*)?\s*`). It also stops at the next
+ *   `<`, so an unterminated head (`</resume_text` followed by more text) is
+ *   still caught without swallowing a following tag.
+ * - `>?` makes the closing bracket optional (unterminated heads).
  */
-export function escapeDelimitedText(raw: string, tagWord: string): string {
-  const withoutInvisibles = raw.replace(INVISIBLE_CHARS, "");
-  const wordPattern = buildTolerantWordPattern(tagWord);
-  const tagPattern = new RegExp(`<\\s*(\\/)?\\s*${wordPattern}\\s*>`, "gi");
+const RESERVED_TAG_PATTERN = new RegExp(
+  `<\\s*\\/?\\s*(?:${[...RESERVED_TAG_WORDS]
+    .sort((a, b) => b.length - a.length)
+    .map(buildTolerantWordPattern)
+    .join("|")})(?![\\p{L}\\p{N}_])[^<>]*>?`,
+  "giu",
+);
 
-  return withoutInvisibles.replace(tagPattern, (_match, closing: string | undefined) =>
-    closing ? `＜/${tagWord}＞` : `＜${tagWord}＞`,
-  );
+const FULLWIDTH_LT = "＜";
+const FULLWIDTH_GT = "＞";
+
+/**
+ * Neutralizes every reserved delimiter tag inside untrusted text, in one
+ * pass (see the module docstring). Idempotent: escaping already-escaped text
+ * is a no-op.
+ */
+export function escapeUntrusted(raw: string): string {
+  return stripInvisibleChars(raw).replace(RESERVED_TAG_PATTERN, (match) => {
+    const head = FULLWIDTH_LT + match.slice(1);
+    return head.endsWith(">") ? head.slice(0, -1) + FULLWIDTH_GT : head;
+  });
+}
+
+/** Attribute names/values are server-generated ids/enums only, e.g. `id="J1"`. */
+const ATTR_NAME_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
+const ATTR_VALUE_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+export class UnsafePromptAttributeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsafePromptAttributeError";
+  }
+}
+
+/**
+ * The only way untrusted content enters a prompt (§13.5.5 item 2). Escapes
+ * `text` against all reserved words and wraps it in `tag`.
+ *
+ * `attrs` must be server-generated (opaque handles like `J1`, enums). This
+ * is enforced: a name or value outside the strict charset throws
+ * `UnsafePromptAttributeError` instead of being escaped, since a value that
+ * fails the check is a programming error (user text routed into an
+ * attribute), not data to sanitize.
+ */
+export function wrapUntrusted(
+  tag: ReservedTagWord,
+  text: string,
+  attrs?: Readonly<Record<string, string>>,
+): string {
+  if (!(RESERVED_TAG_WORDS as readonly string[]).includes(tag)) {
+    throw new UnsafePromptAttributeError(`"${String(tag)}" is not a reserved prompt tag.`);
+  }
+
+  let attrString = "";
+  for (const [name, value] of Object.entries(attrs ?? {})) {
+    if (!ATTR_NAME_PATTERN.test(name)) {
+      throw new UnsafePromptAttributeError("Prompt tag attribute name is not server-safe.");
+    }
+    if (!ATTR_VALUE_PATTERN.test(value)) {
+      throw new UnsafePromptAttributeError(
+        `Prompt tag attribute "${name}" value is not server-safe.`,
+      );
+    }
+    attrString += ` ${name}="${value}"`;
+  }
+
+  return `<${tag}${attrString}>\n${escapeUntrusted(text)}\n</${tag}>`;
 }
