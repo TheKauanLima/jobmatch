@@ -49,7 +49,7 @@ export class ClaudeApiError extends Error {
   }
 }
 
-/** Default Claude model for JobMatch's structured-extraction calls. */
+/** Default Claude model for Kalify's structured-extraction calls. */
 export const CLAUDE_MODEL = "claude-sonnet-5";
 
 let cachedClient: Anthropic | null = null;

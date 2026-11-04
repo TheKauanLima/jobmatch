@@ -132,7 +132,7 @@ export async function fetchThemuseJobsPage(
   let response: Response;
   try {
     response = await fetch(url, {
-      headers: { "User-Agent": "JobMatch/1.0 (+https://github.com)" },
+      headers: { "User-Agent": "Kalify/1.0 (+https://github.com)" },
     });
   } catch (err) {
     throw new ThemuseApiError(

@@ -84,8 +84,8 @@ export default async function JobsPage({ searchParams }: JobsPageProps) {
         Job descriptions
       </h1>
       <p className="mt-2 text-sm text-fg-muted">
-        Shared across every JobMatch user — a mix of postings the community
-        has submitted and internship/entry-level listings JobMatch pulls in
+        Shared across every Kalify user — a mix of postings the community
+        has submitted and internship/entry-level listings Kalify pulls in
         automatically from The Muse. Submit your own below, or browse and
         match your resume against what&apos;s here.
       </p>

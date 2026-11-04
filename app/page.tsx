@@ -77,7 +77,7 @@ export default function Home() {
             See it in action
           </h2>
           <p className="mt-2 max-w-2xl text-sm text-fg-muted">
-            A sample resume excerpt and the kind of analysis JobMatch
+            A sample resume excerpt and the kind of analysis Kalify
             generates for it — not real data, just an example.
           </p>
           <div className="mt-8">
