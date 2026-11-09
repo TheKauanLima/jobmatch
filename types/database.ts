@@ -234,6 +234,11 @@ export interface Database {
           last_error_code: string | null;
           last_error_message: string | null;
           result: Json | null;
+          /** Dead-task hook outbox (§13.4.5). */
+          on_dead_handled_at: string | null;
+          on_dead_attempts: number;
+          on_dead_locked_by: string | null;
+          on_dead_locked_until: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -259,6 +264,10 @@ export interface Database {
           last_error_code?: string | null;
           last_error_message?: string | null;
           result?: Json | null;
+          on_dead_handled_at?: string | null;
+          on_dead_attempts?: number;
+          on_dead_locked_by?: string | null;
+          on_dead_locked_until?: string | null;
           created_at?: string;
           updated_at?: string;
         };
@@ -427,8 +436,54 @@ export interface Database {
       };
       purge_finished_tasks: {
         Args: Record<string, never>;
-        /** Number of rows deleted. */
+        /** Rows deleted (dead rows only once their onDead hook is handled). */
         Returns: number;
+      };
+      /**
+       * Stale-lease sweep: dead-letters running tasks of any kind whose
+       * lease expired more than `p_older_than` ago (Postgres interval text,
+       * default '6 hours'), code `lease_expired`. Returns the count.
+       */
+      dead_letter_stale_tasks: {
+        Args: { p_older_than?: string };
+        Returns: number;
+      };
+      /** Dead-task hook outbox: lock pending hooks of known kinds (§13.4.5). */
+      claim_dead_task_hooks: {
+        Args: {
+          p_worker_id: string;
+          p_kinds: string[];
+          p_limit: number;
+          p_task_id?: string | null;
+        };
+        Returns: Database["public"]["Tables"]["background_tasks"]["Row"][];
+      };
+      /** Mark a hook handled (fenced). false = fenced out / already handled. */
+      complete_dead_task_hook: {
+        Args: { p_id: string; p_worker_id: string; p_gave_up?: boolean };
+        Returns: boolean;
+      };
+      /**
+       * Release a claimed-but-unrun hook: clears the lock and refunds the
+       * attempt (fenced). false = fenced out / already handled.
+       */
+      release_dead_task_hook: {
+        Args: { p_id: string; p_worker_id: string };
+        Returns: boolean;
+      };
+      /**
+       * Global-budget deferral: moves claimable queued tasks of `p_kinds`
+       * to `p_until` + jitter without claiming them. Returns deferred rows.
+       */
+      defer_queued_tasks: {
+        Args: {
+          p_task_class: BackgroundTaskClass;
+          p_kinds: string[];
+          p_until: string;
+          p_max_jitter_seconds?: number;
+          p_limit?: number;
+        };
+        Returns: Database["public"]["Tables"]["background_tasks"]["Row"][];
       };
       // --- 0007: worker read helpers (service_role only) ----------------
       ai_spend_summary: {

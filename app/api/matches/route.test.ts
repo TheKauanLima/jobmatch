@@ -82,7 +82,8 @@ vi.mock("@/lib/claude/prompts/matchResumeToJob", async () => {
   return { ...actual, matchResumeToJob: mockMatchResumeToJob };
 });
 
-const { GET, POST } = await import("@/app/api/matches/route");
+const routeModule = await import("@/app/api/matches/route");
+const { GET, POST } = routeModule;
 const { UnauthorizedError } = await import("@/lib/auth/session");
 const {
   ClaudeApiError,
@@ -501,7 +502,7 @@ describe("POST /api/matches", () => {
     expect(mockMatchResumeToJob).toHaveBeenCalledWith(
       ownedResume.extracted_text,
       jobDescription.description,
-      { userId: "user-1" },
+      { userId: "user-1", signal: expect.any(AbortSignal) },
     );
     expect(mockCreateMatch).toHaveBeenCalledWith(
       expect.anything(),
@@ -633,5 +634,45 @@ describe("POST /api/matches", () => {
       postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
     );
     expect(res.status).toBe(500);
+  });
+});
+
+describe("POST /api/matches — deadline (review B1)", () => {
+  it("exports maxDuration = 300, above the 270 s Claude deadline", () => {
+    expect(routeModule.maxDuration).toBe(300);
+  });
+
+  it("when the deadline fires mid-assessment: JSON 502 and nothing persisted", async () => {
+    const deadline = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResume);
+    mockGetLatestAnalysis.mockResolvedValue(someAnalysis);
+    mockGetJobDescriptionById.mockResolvedValue(jobDescription);
+    mockCheckRateLimit.mockResolvedValue({ allowed: true, count: 0, limit: 20 });
+    mockMatchResumeToJob.mockImplementation(
+      (_r: string, _j: string, ctx: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener("abort", () =>
+            reject(
+              new ClaudeApiError("Claude call aborted (matchResumeToJob).", {
+                code: "ai_unavailable",
+                retryable: true,
+              }),
+            ),
+          );
+          setTimeout(() => deadline.abort(), 0);
+        }),
+    );
+
+    const res = await POST(
+      postRequest({ resume_id: RESUME_UUID, job_description_id: JOB_DESCRIPTION_UUID }),
+    );
+
+    expect(timeoutSpy).toHaveBeenCalledWith(270_000);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "Match assessment failed. Please try again." });
+    expect(mockCreateMatch).not.toHaveBeenCalled();
+    timeoutSpy.mockRestore();
   });
 });

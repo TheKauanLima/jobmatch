@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { TaskError } from "@/lib/tasks/errors";
-import type { TaskContext, TaskHandlerResult } from "@/lib/tasks/types";
+import type { BackgroundTaskRow, TaskContext, TaskHandlerResult } from "@/lib/tasks/types";
 
 /**
  * `maintenance.noop` — test kind only (M1.2 acceptance, M1.3 QA). Makes no
@@ -11,8 +11,11 @@ import type { TaskContext, TaskHandlerResult } from "@/lib/tasks/types";
  *   {"force_fail": true}                   → retryable internal_error each
  *                                            attempt → backoff → ends dead
  *   {"force_fail": true, "retryable": false} → dead on the first attempt
- *   {"snooze_seconds": 30}                 → snoozes once (no attempt used),
+ *   {"snooze_seconds": 30}                 → snoozes once, on the task's very
+ *                                            first claim (no attempt used),
  *                                            then succeeds
+ *   {"snooze_seconds": 30, "force_fail": true} → snoozes once, then fails
+ *                                            with backoff until dead
  *   {"sleep_ms": 2000}                     → waits (honors the abort signal)
  *
  * Enqueue from SQL, e.g.:
@@ -41,9 +44,11 @@ export async function runNoopTask(
     await sleep(payload.sleep_ms, signal);
   }
 
-  // Snooze only once: the snooze reason is left in last_error_code, so the
-  // re-claimed attempt proceeds instead of snoozing forever.
-  if (payload.snooze_seconds && task.last_error_code !== NOOP_SNOOZE_REASON) {
+  // Snooze at most once, ever: only on the task's very first claim. (Not
+  // keyed off last_error_code: snooze_task preserves a prior error code, so
+  // after a failure that check would never see the snooze and would snooze
+  // forever with the attempt refunded each time.)
+  if (payload.snooze_seconds && isFirstClaim(task)) {
     return {
       outcome: "snooze",
       seconds: payload.snooze_seconds,
@@ -60,6 +65,23 @@ export async function runNoopTask(
   }
 
   return { outcome: "succeeded", result: { noop: true, attempt: task.attempts } };
+}
+
+/**
+ * True only on the first time this task was ever claimed. `claim_tasks`
+ * sets `started_at` on the first claim only (kept across snoozes, retries
+ * and reclaims) and sets `locked_until = claim time + lease_seconds` on every
+ * claim, so the two line up exactly on the first claim and never again.
+ * Both come from the same SQL clock value, so sub-millisecond digits match;
+ * the 1 ms tolerance only absorbs Date.parse truncation.
+ */
+export function isFirstClaim(
+  task: Pick<BackgroundTaskRow, "started_at" | "locked_until" | "lease_seconds">,
+): boolean {
+  if (!task.started_at || !task.locked_until) return false;
+  const started = Date.parse(task.started_at);
+  const claimedAt = Date.parse(task.locked_until) - task.lease_seconds * 1000;
+  return Number.isFinite(started) && Number.isFinite(claimedAt) && Math.abs(claimedAt - started) < 1;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

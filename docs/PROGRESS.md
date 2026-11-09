@@ -81,6 +81,61 @@ this file at the end of every work session.
 6. Email provider — Resend; blocks Phase 5.
 7. Custom listing visibility — explicit choice, Private pre-highlighted.
 
+---
+
+## Sessions 2026-11-05 and 2026-11-09
+
+### Done
+- **M1.1 — Claude layer v2: APPROVED** (review → CHANGES REQUIRED → fixed → re-review
+  APPROVED WITH NITS, doc nits applied). Fixes: v1 analyze/match routes export
+  `maxDuration = 300` with a hard 270s deadline (`callStructured` races the SDK
+  promise against the signal because the SDK's retry sleep ignores it; 120s
+  per-attempt timeout) so a resume can never be left `processing`; price table adds
+  claude-opus-5 / sonnet-5 / opus-4-8 with an explicit $5/$25 unknown-model ceiling and
+  strict id matching; escaping hardened (NFKC, `\p{Default_Ignorable_Code_Point}`,
+  repeated slashes).
+- **M1.1b added to roadmap:** restore `enum` constraints on the wire schema for small
+  closed enums (after a 25-call enforcement probe); taxonomy values stay free text.
+  Must land before M2.2/M2.3.
+- **M1.2 — Background task infrastructure: APPROVED** (review → APPROVED WITH NITS →
+  fix pass → re-review APPROVED WITH NITS, "safe to apply" → final nits fixed and
+  verified by the orchestrator). Additions from review: dead-task hook outbox
+  (`claim_dead_task_hooks` / `complete_dead_task_hook` / `release_dead_task_hook`,
+  swept every tick + fast path), stale-lease sweep (`dead_letter_stale_tasks`, cron
+  `kalify-stale-leases`), over-budget deferral without claiming
+  (`defer_queued_tasks`), preview deployments refuse to act as the worker (403),
+  two-key advisory locks, DB call timeouts, alertable `[ALERT][...]` log lines.
+  Usage sink wired into the worker and both v1 routes. 919 tests; SQL validated on
+  PGlite (123 checks). All 19 functions explicitly revoke PUBLIC execute (verified).
+- §13 kept in sync with every review outcome; ROADMAP gained M1.1b, M1.4c, and quote
+  display tasks in M3.2/M3.6 (show original text, not NFKC-normalized quotes).
+
+### Blocked — waiting on the user
+- **Apply 0007 + 0008 to the live database.** The Supabase connector disconnected
+  from the session. Either reconnect it (claude.ai connector settings) so the
+  orchestrator applies and verifies, or paste the SQL into the Supabase SQL Editor.
+  Until applied, the v1 routes log `[ALERT][usageSink] failed to record` (harmless;
+  AI spend just isn't recorded).
+
+### Next steps (in order)
+1. Apply 0007 → 0008; verify: 4 `kalify-*` cron jobs; functions owned by postgres
+   with `search_path=""`; anon/authenticated can't execute service functions;
+   authenticated has no USAGE on `private`; advisors show only the expected
+   "RLS enabled, no policy" notices on `background_tasks` / `ai_usage_events`.
+2. Regenerate `types/database.ts` from the live schema and diff it against the
+   hand-written one.
+3. User: generate `WORKER_SECRET`; set `WORKER_SECRET` + `APP_BASE_URL` on Vercel
+   **Production only**; deploy; then create Vault secrets `kalify_worker_url` and
+   `kalify_worker_secret`; check Deployment Protection doesn't block
+   `/api/worker/tick`. Then run the M1.2 acceptance check (`maintenance.noop`).
+4. M1.4c (flip `CANCEL_TASKS_FOR_USER_ENABLED`, move the RPC to
+   `lib/supabase/queries/tasks.ts`, `account_reauth` route wiring,
+   `GET /api/account/limits`, move test fake to `/tests/fakes/`).
+5. M1.3 QA (pgTAP + two-connection concurrency script — reviewer listed exactly
+   what it must cover), M1.1b, M1.4b settings UI, then M1.5 ingestion.
+6. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
+   `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
+
 ### User to-dos (not blocking current work)
 - Check `CRON_SECRET` is set in Vercel (needed for the daily job sync).
 - Enable leaked-password protection in Supabase Auth settings.

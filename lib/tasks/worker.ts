@@ -1,7 +1,11 @@
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
+  claimDeadTaskHooks,
   claimTasks,
+  completeDeadTaskHook,
   completeTask,
+  releaseDeadTaskHook,
+  deferQueuedTasks,
   failTask,
   hasClaimableTasks,
   snoozeTask,
@@ -10,8 +14,10 @@ import {
 } from "@/lib/supabase/queries/tasks";
 import { getAiSpendSince } from "@/lib/supabase/queries/usage";
 import {
+  BUDGET_SNOOZE_MAX_JITTER_SECONDS,
   checkGlobalAiBudget,
   getGlobalDailyAiBudgetUsd,
+  nextUtcMidnight,
   secondsUntilBudgetReset,
   type BudgetStatus,
 } from "@/lib/tasks/budget";
@@ -51,8 +57,14 @@ import type { Json } from "@/types/database";
  * - Loop: claim → run concurrently → as each finishes, claim more → stop
  *   claiming at 240 s → await in-flight → return.
  * - Global AI budget (§13.9.4): checked before claiming AI-calling kinds.
- *   Over budget → those tasks are snoozed to the next UTC midnight + jitter
- *   without running. Check failed → AI kinds are not claimed this round.
+ *   Over budget → AI kinds are NOT claimed; their claimable queued tasks are
+ *   deferred in one SQL statement (`defer_queued_tasks`) to the next UTC
+ *   midnight + jitter. Deferral never claims, so it can't consume an attempt,
+ *   mark a task started, or disturb retry tracking, and a failed deferral
+ *   just leaves the tasks queued. Check failed → AI kinds aren't claimed.
+ * - Every PostgREST call the loop makes carries `AbortSignal.timeout(
+ *   WORKER_DB_TIMEOUT_MS)`, so a hung call can't keep a tick alive until the
+ *   platform's 300 s kill.
  * - Self-chaining: if at least one task was processed and claimable `user`
  *   tasks remain, kick once. The every-minute cron tick is the backstop.
  *
@@ -78,6 +90,26 @@ export const MAX_SNOOZE_SECONDS = 7 * 24 * 60 * 60;
 
 /** `background_tasks.result` is a small summary; larger results are replaced. */
 export const MAX_RESULT_BYTES = 4096;
+
+/** Per-call timeout for the loop's own PostgREST calls (claim/complete/...). */
+export const WORKER_DB_TIMEOUT_MS = 15_000;
+
+/** Max tasks deferred per class per tick when over the AI budget. */
+export const BUDGET_DEFER_BATCH = 200;
+
+/** Dead-task hook outbox (§13.4.5). */
+export const DEAD_HOOK_BUDGET_MS = 20_000;
+export const DEAD_HOOK_SWEEP_LIMIT = 20;
+export const DEAD_HOOK_MAX_ATTEMPTS = 10;
+/** Per-hook timeout; stays well under the SQL hook lock (120 s). */
+export const DEAD_HOOK_TIMEOUT_MS = 15_000;
+/** The sweep claims hooks in batches of this size (unrun rows are released). */
+export const DEAD_HOOK_CLAIM_BATCH = 5;
+/**
+ * Worst-case time the fast path can take: claim + hook + completion, each
+ * bounded by its own timeout. Skipped unless this much hard budget remains.
+ */
+export const DEAD_HOOK_FAST_PATH_RESERVE_MS = DEAD_HOOK_TIMEOUT_MS + 2 * WORKER_DB_TIMEOUT_MS;
 
 const REASON_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
@@ -112,19 +144,53 @@ export interface WorkerStore {
   }): Promise<boolean>;
   /** Total USD spent since `since` (summed in SQL). */
   getAiSpendSince(since: Date): Promise<number>;
+  /** Budget deferral without claiming (`defer_queued_tasks`). */
+  defer(args: {
+    taskClass: TaskClass;
+    kinds: string[];
+    until: Date;
+    maxJitterSeconds: number;
+    limit: number;
+  }): Promise<BackgroundTaskRow[]>;
+  /** Dead-task hook outbox: lock pending hooks (`claim_dead_task_hooks`). */
+  claimDeadHooks(args: {
+    workerId: string;
+    kinds: string[];
+    limit: number;
+    taskId?: string | null;
+  }): Promise<BackgroundTaskRow[]>;
+  /** Mark a hook handled (`complete_dead_task_hook`); false = fenced out. */
+  completeDeadHook(args: { id: string; workerId: string; gaveUp: boolean }): Promise<boolean>;
+  /** Give back a claimed-but-unrun hook (`release_dead_task_hook`). */
+  releaseDeadHook(args: { id: string; workerId: string }): Promise<boolean>;
 }
 
-export function createWorkerStore(admin: AdminClient): WorkerStore {
+/**
+ * The production store. Each call gets a fresh `AbortSignal.timeout`, so a
+ * hung PostgREST request fails fast instead of pinning the tick. (Applied
+ * per call rather than via a custom `fetch` on the shared admin client, so
+ * `lib/supabase/admin.ts` behaves exactly as before for every other caller.)
+ */
+export function createWorkerStore(
+  admin: AdminClient,
+  options: { timeoutMs?: number } = {},
+): WorkerStore {
+  const timeoutMs = options.timeoutMs ?? WORKER_DB_TIMEOUT_MS;
+  const opts = () => ({ signal: AbortSignal.timeout(timeoutMs) });
   return {
-    claim: (args) => claimTasks(admin, args),
-    complete: (id, workerId, result) => completeTask(admin, id, workerId, result),
-    fail: (args) => failTask(admin, args),
-    snooze: (args) => snoozeTask(admin, args),
-    hasClaimableTasks: (args) => hasClaimableTasks(admin, args),
+    claim: (args) => claimTasks(admin, args, opts()),
+    complete: (id, workerId, result) => completeTask(admin, id, workerId, result, opts()),
+    fail: (args) => failTask(admin, args, opts()),
+    snooze: (args) => snoozeTask(admin, args, opts()),
+    hasClaimableTasks: (args) => hasClaimableTasks(admin, args, opts()),
     getAiSpendSince: async (since) => {
-      const rows = await getAiSpendSince(admin, since);
+      const rows = await getAiSpendSince(admin, since, opts());
       return rows.reduce((sum, row) => sum + row.costUsd, 0);
     },
+    defer: (args) => deferQueuedTasks(admin, args, opts()),
+    claimDeadHooks: (args) => claimDeadTaskHooks(admin, args, opts()),
+    completeDeadHook: (args) => completeDeadTaskHook(admin, args, opts()),
+    releaseDeadHook: (args) => releaseDeadTaskHook(admin, args, opts()),
   };
 }
 
@@ -135,8 +201,13 @@ export type WorkerLogSink = (
   fields: LogFields,
 ) => void;
 
+/**
+ * Lines logged with `alert: true` get a stable `[ALERT][worker]` prefix so
+ * log-based alerting can match them (e.g. "onDead gave up").
+ */
 const consoleLogSink: WorkerLogSink = (level, message, fields) => {
-  const line = `[worker] ${message} ${JSON.stringify(fields)}`;
+  const prefix = fields.alert === true ? "[ALERT][worker]" : "[worker]";
+  const line = `${prefix} ${message} ${JSON.stringify(fields)}`;
   if (level === "error") console.error(line);
   else if (level === "warn") console.warn(line);
   else console.info(line);
@@ -162,11 +233,24 @@ export interface WorkerTickSummary {
   retried: number;
   dead: number;
   snoozed: number;
+  /** Queued AI tasks deferred (not claimed) because the global budget is spent. */
+  budgetDeferred: number;
+  /** Running tasks snoozed because their handler threw `budget_exhausted`. */
   budgetSnoozed: number;
   /** complete/fail/snooze was a no-op because another worker now holds the task. */
   fencedOut: number;
   /** A complete/fail/snooze call itself errored; lease expiry will recover. */
   storeErrors: number;
+  /** onDead hooks marked handled (including kinds with no hook). */
+  deadHooksHandled: number;
+  /** onDead hooks that threw and were left pending for a later tick. */
+  deadHooksFailed: number;
+  /** onDead hooks given up after DEAD_HOOK_MAX_ATTEMPTS (alerted). */
+  deadHooksGaveUp: number;
+  /** Hooks claimed by the sweep but released unrun (budget ran out). */
+  deadHooksReleased: number;
+  /** Fast-path deliveries skipped near the hard budget (sweep delivers). */
+  deadHooksDeferredToSweep: number;
   kicked: boolean;
   stopReason: WorkerStopReason;
   durationMs: number;
@@ -206,9 +290,15 @@ export async function runWorkerTick(
     retried: 0,
     dead: 0,
     snoozed: 0,
+    budgetDeferred: 0,
     budgetSnoozed: 0,
     fencedOut: 0,
     storeErrors: 0,
+    deadHooksHandled: 0,
+    deadHooksFailed: 0,
+    deadHooksGaveUp: 0,
+    deadHooksReleased: 0,
+    deadHooksDeferredToSweep: 0,
     kicked: false,
     stopReason: "idle",
     durationMs: 0,
@@ -244,21 +334,31 @@ export async function runWorkerTick(
     }
   };
 
+  /**
+   * Snoozes a running task. Retried once on error: if both attempts fail,
+   * the lease expires and the reclaim consumes an attempt, which is
+   * acceptable only because snooze is used for tasks that genuinely ran.
+   */
   const safeSnooze = async (row: BackgroundTaskRow, seconds: number, reason: string) => {
-    try {
-      const ok = await store.snooze({ id: row.id, workerId: invocationId, seconds, reason });
-      if (!ok) {
-        summary.fencedOut++;
-        taskLogger(row).warn("snooze_task fenced out (lease lost)");
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const ok = await store.snooze({ id: row.id, workerId: invocationId, seconds, reason });
+        if (!ok) {
+          summary.fencedOut++;
+          taskLogger(row).warn("snooze_task fenced out (lease lost)");
+        }
+        return ok;
+      } catch (err) {
+        summary.storeErrors++;
+        taskLogger(row).error(
+          attempt === 1
+            ? "snooze_task errored; retrying once"
+            : "snooze_task errored twice; lease expiry will recover",
+          { error: safeErrorName(err) },
+        );
       }
-      return ok;
-    } catch (err) {
-      summary.storeErrors++;
-      taskLogger(row).error("snooze_task errored; lease expiry will recover", {
-        error: safeErrorName(err),
-      });
-      return false;
     }
+    return false;
   };
 
   const safeFail = async (
@@ -297,44 +397,207 @@ export async function runWorkerTick(
     }
   };
 
-  const runOnDead = async (
-    def: TaskDefinition,
-    row: BackgroundTaskRow,
-    payload: unknown,
-    errorCode: string,
-  ) => {
-    if (!def.onDead) return;
-    try {
-      await def.onDead({ task: row, payload, admin: deps.admin, errorCode, log: taskLogger(row) });
-    } catch (err) {
-      taskLogger(row).error("onDead hook errored", { error: safeErrorName(err) });
-    }
-  };
-
   const parsePayload = (def: TaskDefinition, row: BackgroundTaskRow) =>
     def.payloadSchema.safeParse(row.payload);
 
-  // ---- per-task execution ------------------------------------------------
+  // ---- dead-task hook outbox (§13.4.5) -------------------------------------
 
-  const budgetSnooze = async (row: BackgroundTaskRow, def: TaskDefinition) => {
-    const seconds = secondsUntilBudgetReset(new Date(deps.now()), deps.random);
-    const ok = await safeSnooze(row, seconds, "budget_exhausted");
-    if (!ok) return;
-    summary.budgetSnoozed++;
-    if (def.onBudgetDelayed) {
-      const parsed = parsePayload(def, row);
-      try {
-        await def.onBudgetDelayed({
+  const completeHook = async (row: BackgroundTaskRow, gaveUp: boolean) => {
+    try {
+      const ok = await store.completeDeadHook({ id: row.id, workerId: invocationId, gaveUp });
+      if (!ok) taskLogger(row).warn("complete_dead_task_hook fenced out (hook lock lost)");
+      return ok;
+    } catch (err) {
+      summary.storeErrors++;
+      taskLogger(row).error("complete_dead_task_hook errored; hook will be redelivered", {
+        error: safeErrorName(err),
+      });
+      return false;
+    }
+  };
+
+  /**
+   * Runs one claimed hook. Success (or a kind without `onDead`) → handled.
+   * Throw → left pending (the 120 s hook lock expires and a later tick
+   * redelivers), unless this was attempt DEAD_HOOK_MAX_ATTEMPTS → give up
+   * with an alertable log line.
+   */
+  const processDeadHook = async (row: BackgroundTaskRow) => {
+    const def = getTaskDefinition(row.kind, registry);
+    if (!def) return; // unreachable: hooks are only claimed for registered kinds
+    const tlog = taskLogger(row);
+
+    if (!def.onDead) {
+      if (await completeHook(row, false)) summary.deadHooksHandled++;
+      return;
+    }
+
+    const parsed = parsePayload(def, row);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new TaskDeadlineError()), DEAD_HOOK_TIMEOUT_MS);
+    try {
+      const hook = Promise.resolve().then(() =>
+        def.onDead!({
           task: row,
           payload: parsed.success ? parsed.data : null,
           admin: deps.admin,
-          log: taskLogger(row),
-        });
+          errorCode: row.last_error_code ?? "internal_error",
+          signal: controller.signal,
+          log: tlog,
+        }),
+      );
+      await raceWithAbort(hook, controller.signal);
+    } catch (err) {
+      clearTimeout(timer);
+      const fields = { code: row.last_error_code, hook_attempt: row.on_dead_attempts, error: safeErrorName(err) };
+      if (row.on_dead_attempts >= DEAD_HOOK_MAX_ATTEMPTS) {
+        if (await completeHook(row, true)) summary.deadHooksGaveUp++;
+        tlog.error("onDead gave up", { ...fields, alert: true });
+      } else {
+        summary.deadHooksFailed++;
+        tlog.warn("onDead hook failed; will be redelivered", fields);
+      }
+      return;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (await completeHook(row, false)) summary.deadHooksHandled++;
+  };
+
+  const claimHooks = async (args: { kinds: string[]; limit: number; taskId?: string }) => {
+    try {
+      return await store.claimDeadHooks({ workerId: invocationId, ...args });
+    } catch (err) {
+      log("warn", "claim_dead_task_hooks errored; hooks stay pending", { error: safeErrorName(err) });
+      return [];
+    }
+  };
+
+  /**
+   * Gives back hooks this worker claimed but did not run: clears the lock
+   * and refunds the attempt (`release_dead_task_hook`), so a hook that keeps
+   * getting skipped behind slow ones never drifts toward the give-up limit.
+   * A failed release only costs one inflated attempt and a 120 s wait.
+   */
+  const releaseHooks = async (rows: BackgroundTaskRow[]) => {
+    for (const row of rows) {
+      try {
+        if (await store.releaseDeadHook({ id: row.id, workerId: invocationId })) {
+          summary.deadHooksReleased++;
+        } else {
+          taskLogger(row).warn("release_dead_task_hook fenced out (hook lock lost)");
+        }
       } catch (err) {
-        taskLogger(row).error("onBudgetDelayed hook errored", { error: safeErrorName(err) });
+        summary.storeErrors++;
+        taskLogger(row).error("release_dead_task_hook errored; lock expires in 120 s", {
+          error: safeErrorName(err),
+        });
       }
     }
   };
+
+  /**
+   * Sweep: every tick, before claiming tasks; up to DEAD_HOOK_BUDGET_MS and
+   * DEAD_HOOK_SWEEP_LIMIT hooks. Claims in small batches so it never holds
+   * many more rows than the remaining budget can run; whatever is still
+   * unrun when the budget runs out is released, not left locked.
+   */
+  const sweepDeadHooks = async () => {
+    const sweepStart = deps.now();
+    const kinds = Object.keys(registry);
+    let claimedTotal = 0;
+
+    while (claimedTotal < DEAD_HOOK_SWEEP_LIMIT && deps.now() - sweepStart < DEAD_HOOK_BUDGET_MS) {
+      const requested = Math.min(DEAD_HOOK_CLAIM_BATCH, DEAD_HOOK_SWEEP_LIMIT - claimedTotal);
+      const batch = await claimHooks({ kinds, limit: requested });
+      claimedTotal += batch.length;
+
+      for (let i = 0; i < batch.length; i++) {
+        if (deps.now() - sweepStart >= DEAD_HOOK_BUDGET_MS) {
+          const unrun = batch.slice(i);
+          log("warn", "dead-hook sweep budget used up; releasing unrun hooks", { released: unrun.length });
+          await releaseHooks(unrun);
+          return;
+        }
+        await processDeadHook(batch[i]);
+      }
+
+      if (batch.length < requested) return; // nothing more pending (or claim failed)
+    }
+  };
+
+  /**
+   * Fast path: right after this worker's own fail_task returned 'dead'.
+   * Skipped when the tick is too close to its hard budget to fit a claim, a
+   * hook and a completion (the next tick's sweep delivers it instead), so
+   * this latency optimization can never push the invocation past the
+   * platform's 300 s limit.
+   */
+  const deliverDeadHookNow = async (row: BackgroundTaskRow) => {
+    if (deps.now() - startedAt + DEAD_HOOK_FAST_PATH_RESERVE_MS >= WORKER_HARD_BUDGET_MS) {
+      summary.deadHooksDeferredToSweep++;
+      taskLogger(row).info("fast-path onDead skipped near the hard budget; next sweep delivers it");
+      return;
+    }
+    const rows = await claimHooks({ kinds: [row.kind], limit: 1, taskId: row.id });
+    for (const claimed of rows) await processDeadHook(claimed);
+  };
+
+  // ---- budget delay hooks ------------------------------------------------
+
+  const runOnBudgetDelayed = async (row: BackgroundTaskRow, def: TaskDefinition | undefined) => {
+    if (!def?.onBudgetDelayed) return;
+    const parsed = parsePayload(def, row);
+    try {
+      await def.onBudgetDelayed({
+        task: row,
+        payload: parsed.success ? parsed.data : null,
+        admin: deps.admin,
+        log: taskLogger(row),
+      });
+    } catch (err) {
+      taskLogger(row).error("onBudgetDelayed hook errored", { error: safeErrorName(err) });
+    }
+  };
+
+  /** A running handler threw `budget_exhausted` (e.g. ingest budget). */
+  const budgetSnoozeRunning = async (row: BackgroundTaskRow, def: TaskDefinition) => {
+    const seconds = secondsUntilBudgetReset(new Date(deps.now()), deps.random);
+    if (!(await safeSnooze(row, seconds, "budget_exhausted"))) return;
+    summary.budgetSnoozed++;
+    await runOnBudgetDelayed(row, def);
+  };
+
+  /** Over the global budget: defer (never claim) queued AI tasks of a class. */
+  const deferredClasses = new Set<TaskClass>();
+  const deferAiTasks = async (taskClass: TaskClass, aiKinds: string[]) => {
+    if (deferredClasses.has(taskClass) || aiKinds.length === 0) return;
+    deferredClasses.add(taskClass); // once per class per tick; next tick continues
+    let rows: BackgroundTaskRow[];
+    try {
+      rows = await store.defer({
+        taskClass,
+        kinds: aiKinds,
+        until: nextUtcMidnight(new Date(deps.now())),
+        maxJitterSeconds: BUDGET_SNOOZE_MAX_JITTER_SECONDS,
+        limit: BUDGET_DEFER_BATCH,
+      });
+    } catch (err) {
+      // Nothing was claimed, so nothing is lost: the tasks stay queued and
+      // the next tick (still over budget) tries again.
+      log("warn", "defer_queued_tasks errored; AI tasks stay queued", {
+        task_class: taskClass,
+        error: safeErrorName(err),
+      });
+      return;
+    }
+    summary.budgetDeferred += rows.length;
+    for (const row of rows) {
+      await runOnBudgetDelayed(row, getTaskDefinition(row.kind, registry));
+    }
+  };
+
+  // ---- per-task execution ------------------------------------------------
 
   const runTask = async (row: BackgroundTaskRow, def: TaskDefinition | undefined) => {
     const tlog = taskLogger(row);
@@ -360,7 +623,7 @@ export async function runWorkerTick(
         retryable: false,
         message: `Payload failed validation at: ${paths}`,
       });
-      if (status === "dead") await runOnDead(def, row, null, "unknown_payload");
+      if (status === "dead") await deliverDeadHookNow(row);
       return;
     }
     const payload = parsed.data;
@@ -393,7 +656,7 @@ export async function runWorkerTick(
 
       if (err instanceof TaskError && err.code === "budget_exhausted") {
         // §13.4.5: budget_exhausted is a snooze, not a failure.
-        await budgetSnooze(row, def);
+        await budgetSnoozeRunning(row, def);
         return;
       }
 
@@ -402,7 +665,7 @@ export async function runWorkerTick(
         timedOut: controller.signal.aborted,
       });
       const status = await safeFail(row, classified);
-      if (status === "dead") await runOnDead(def, row, payload, classified.code);
+      if (status === "dead") await deliverDeadHookNow(row);
       return;
     } finally {
       clearTimeout(timer);
@@ -429,7 +692,7 @@ export async function runWorkerTick(
       );
       if (status.exhausted && !budgetWarned) {
         budgetWarned = true;
-        log("warn", "global daily AI budget exhausted; AI tasks snoozed to next UTC midnight", {
+        log("warn", "global daily AI budget exhausted; AI tasks deferred to next UTC midnight", {
           spent_usd: Number(status.spentUsd.toFixed(4)),
           budget_usd: status.budgetUsd,
         });
@@ -458,6 +721,13 @@ export async function runWorkerTick(
     background: kindsForClass("background", registry),
   };
 
+  // Deliver pending onDead hooks first (outbox sweep, §13.4.5). This covers
+  // tasks killed in SQL (lease_expired, stale-lease sweep) and fast-path
+  // deliveries interrupted by a dying worker.
+  if (deps.now() - startedAt < WORKER_SOFT_STOP_MS) {
+    await sweepDeadHooks();
+  }
+
   for (;;) {
     const elapsed = deps.now() - startedAt;
     if (elapsed >= WORKER_SOFT_STOP_MS) {
@@ -480,13 +750,13 @@ export async function runWorkerTick(
       if (fitting.length === 0) continue;
 
       let claimKinds = fitting;
-      let budgetExhausted = false;
-      if (fitting.some((kind) => registry[kind].usesAi)) {
+      const aiKinds = fitting.filter((kind) => registry[kind].usesAi);
+      if (aiKinds.length > 0) {
         budget ??= await checkBudget();
-        if (budget === "error") {
+        if (budget === "error" || budget.exhausted) {
+          // Fail closed / over budget: never claim AI kinds.
           claimKinds = fitting.filter((kind) => !registry[kind].usesAi);
-        } else if (budget.exhausted) {
-          budgetExhausted = true;
+          if (budget !== "error") await deferAiTasks(taskClass, aiKinds);
         }
       }
       if (claimKinds.length === 0) continue;
@@ -510,13 +780,11 @@ export async function runWorkerTick(
       }
 
       for (const row of rows) {
-        const def = getTaskDefinition(row.kind, registry);
-        const work =
-          budgetExhausted && def?.usesAi ? budgetSnooze(row, def) : runTask(row, def);
+        const work = runTask(row, getTaskDefinition(row.kind, registry));
         const slotId = nextSlotId++;
         const promise = work
           .catch((err) => {
-            // runTask/budgetSnooze already catch everything; belt and braces.
+            // runTask already catches everything; belt and braces.
             log("error", "task run escaped its error handling", {
               task_id: row.id,
               kind: row.kind,

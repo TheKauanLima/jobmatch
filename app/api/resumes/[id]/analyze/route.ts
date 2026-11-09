@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import "@/lib/tasks/registerUsageSink";
 import { requireSession, UnauthorizedError } from "@/lib/auth/session";
 import { createClient } from "@/lib/supabase/server";
 import { getResumeById, updateResume } from "@/lib/supabase/queries/resumes";
@@ -13,9 +14,18 @@ import {
 import { DAILY_RATE_LIMITS, checkRateLimit } from "@/lib/claude/rateLimit";
 import { analyzeResume } from "@/lib/claude/prompts/analyzeResume";
 import { ClaudeApiError } from "@/lib/claude/errors";
+import { SYNC_ROUTE_CLAUDE_DEADLINE_MS } from "@/lib/claude/config";
 import { toResumeAnalysis } from "@/types/domain";
 
 type RouteContext = { params: Promise<{ id: string }> };
+
+/**
+ * Must exceed `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s), so the deadline
+ * always fires first and the catch below still runs: the resume is marked
+ * 'failed' and the client gets a JSON 502, never a platform 504 with the
+ * resume stuck on 'processing'. Matches app/api/worker/tick/route.ts.
+ */
+export const maxDuration = 300;
 
 /**
  * POST /api/resumes/:id/analyze — run Claude strengths/weaknesses
@@ -35,6 +45,10 @@ type RouteContext = { params: Promise<{ id: string }> };
  * per the no-PII-in-logs rule (see CLAUDE.md).
  */
 export async function POST(_request: Request, { params }: RouteContext) {
+  // Started first, so time spent on auth/extraction counts against it too
+  // (see `maxDuration` above). Bounds the whole Claude step, retries included.
+  const claudeDeadline = AbortSignal.timeout(SYNC_ROUTE_CLAUDE_DEADLINE_MS);
+
   let user;
   try {
     ({ user } = await requireSession());
@@ -155,7 +169,10 @@ export async function POST(_request: Request, { params }: RouteContext) {
   // because a later bookkeeping update has a hiccup.
   let analysis;
   try {
-    const outcome = await analyzeResume(resumeText, { userId: user.id });
+    const outcome = await analyzeResume(resumeText, {
+      userId: user.id,
+      signal: claudeDeadline,
+    });
 
     analysis = await createAnalysis(supabase, {
       resumeId: id,

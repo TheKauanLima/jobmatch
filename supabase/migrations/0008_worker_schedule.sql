@@ -8,6 +8,7 @@
 --   * cron jobs (UTC):
 --       kalify-worker-tick    * * * * *    private.invoke_worker_tick()
 --       kalify-purge-tasks    15 4 * * *   public.purge_finished_tasks()
+--       kalify-stale-leases   5 * * * *    public.dead_letter_stale_tasks()
 --       kalify-cron-history   30 4 * * *   prune cron.job_run_details > 7 days
 --
 -- Vault secrets are created MANUALLY per environment, never committed
@@ -97,7 +98,8 @@ comment on function private.invoke_worker_tick is
   'pg_cron target for kalify-worker-tick (docs/ARCHITECTURE.md §13.3.2): POST {"trigger":"cron"} to Vault kalify_worker_url with Bearer kalify_worker_secret via pg_net. Fails closed (warning + skip) when the secrets are missing.';
 
 revoke execute on function private.invoke_worker_tick() from public, anon, authenticated;
-grant execute on function private.invoke_worker_tick() to service_role;
+-- Deliberately no grant to service_role: the only caller is pg_cron, which
+-- runs the job as its owner (postgres, the function's owner).
 
 -- ---------------------------------------------------------------------
 -- Cron jobs
@@ -112,7 +114,7 @@ begin
   for v_jobid in
     select j.jobid
     from cron.job j
-    where j.jobname in ('kalify-worker-tick', 'kalify-purge-tasks', 'kalify-cron-history')
+    where j.jobname in ('kalify-worker-tick', 'kalify-purge-tasks', 'kalify-stale-leases', 'kalify-cron-history')
   loop
     perform cron.unschedule(v_jobid);
   end loop;
@@ -129,6 +131,14 @@ select cron.schedule(
   'kalify-purge-tasks',
   '15 4 * * *',
   $cmd$select public.purge_finished_tasks();$cmd$
+);
+
+-- Hourly stale-lease sweep (§13.3.1): frees tasks of unregistered kinds
+-- stuck in `running` after their worker died.
+select cron.schedule(
+  'kalify-stale-leases',
+  '5 * * * *',
+  $cmd$select public.dead_letter_stale_tasks();$cmd$
 );
 
 select cron.schedule(

@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 
 import { createAdminClient } from "@/lib/supabase/admin";
-import { getTaskCounts, listRecentDeadTasks } from "@/lib/supabase/queries/tasks";
+import {
+  countPendingDeadHooks,
+  getTaskCounts,
+  listRecentDeadTasks,
+} from "@/lib/supabase/queries/tasks";
 import { getAiSpendSince } from "@/lib/supabase/queries/usage";
 import { startOfUtcDay } from "@/lib/tasks/budget";
 import { safeErrorName } from "@/lib/tasks/errors";
@@ -16,6 +20,7 @@ import { checkWorkerAuth } from "@/lib/tasks/workerAuth";
  *   {
  *     counts: { [kind]: { [status]: n } },
  *     recent_dead: [{ id, kind, code, attempts, finished_at }],   // 20 most recent
+ *     dead_hooks_pending: n,      // dead rows whose onDead hook isn't handled (§13.4.5)
  *     spend_today: { anthropic: usd, voyage: usd },               // since 00:00 UTC
  *     spend_today_by_operation: [{ provider, operation, cost_usd, calls }]
  *   }
@@ -36,9 +41,10 @@ export async function GET(request: Request) {
 
   try {
     const admin = createAdminClient();
-    const [counts, recentDead, spend] = await Promise.all([
+    const [counts, recentDead, deadHooksPending, spend] = await Promise.all([
       getTaskCounts(admin),
       listRecentDeadTasks(admin, 20),
+      countPendingDeadHooks(admin),
       getAiSpendSince(admin, startOfUtcDay(new Date())),
     ]);
 
@@ -51,6 +57,7 @@ export async function GET(request: Request) {
       {
         counts,
         recent_dead: recentDead,
+        dead_hooks_pending: deadHooksPending,
         spend_today: spendToday,
         spend_today_by_operation: spend.map((row) => ({
           provider: row.provider,

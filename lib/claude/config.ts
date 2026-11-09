@@ -19,6 +19,29 @@ import type { ReservedTagWord } from "@/lib/claude/promptEscaping";
 
 export const CLAUDE_DEFAULT_MODEL = "claude-opus-5-5";
 
+/**
+ * Deadline budget for the synchronous v1 routes (POST /api/resumes/:id/analyze,
+ * POST /api/matches), which export `maxDuration = 300`.
+ *
+ * - `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s): the route creates
+ *   `AbortSignal.timeout(...)` with it at the very start of the handler and
+ *   passes it as `ctx.signal`. `callStructured` races every SDK call against
+ *   that signal, so the deadline bounds the whole Claude step: the SDK's
+ *   internal retry and its un-abortable Retry-After backoff sleep included, and
+ *   `retryOnceOnInvalidOutput` too (a retry never starts once the signal has
+ *   fired). On expiry the call fails as `ClaudeApiError` (`ai_unavailable`),
+ *   which the route turns into a JSON 502 and marks the resume `failed`. The
+ *   remaining 30 s of `maxDuration` cover the DB writes after it.
+ * - `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` (120 s): the per-request SDK timeout for
+ *   the v1 tasks. Two complete attempts (an invalid output, then the single
+ *   retry) take at most 240 s, so the common failure path finishes inside the
+ *   deadline. Live calls took 5-9 s, so 120 s is ample headroom. Only the
+ *   pathological path (a timeout, then the SDK's timeout retry, then more)
+ *   reaches the deadline, and that ends as a clean 502.
+ */
+export const SYNC_ROUTE_CLAUDE_DEADLINE_MS = 270_000;
+export const SYNC_ROUTE_ATTEMPT_TIMEOUT_MS = 120_000;
+
 export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
@@ -104,11 +127,13 @@ export const CLAUDE_TASKS = {
   },
 
   // ---- v1 tasks (lib/claude/prompts/*), migrated in M1.1, deleted in M3.9 ----
+  // These run inside a synchronous user request, so their per-attempt timeout
+  // is shorter than the v2 worker tasks: see SYNC_ROUTE_CLAUDE_DEADLINE_MS.
   analyzeResume: {
     model: CLAUDE_DEFAULT_MODEL,
     effort: "medium",
     maxTokens: 16_000,
-    timeoutMs: 160_000,
+    timeoutMs: SYNC_ROUTE_ATTEMPT_TIMEOUT_MS,
     mode: "sync",
     promptVersion: "analyze-v2",
     untrustedInputs: ["resume_text"],
@@ -118,7 +143,7 @@ export const CLAUDE_TASKS = {
     model: CLAUDE_DEFAULT_MODEL,
     effort: "medium",
     maxTokens: 16_000,
-    timeoutMs: 160_000,
+    timeoutMs: SYNC_ROUTE_ATTEMPT_TIMEOUT_MS,
     mode: "sync",
     promptVersion: "match-v2",
     untrustedInputs: ["resume_text", "job_description_text"],

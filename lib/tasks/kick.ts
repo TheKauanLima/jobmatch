@@ -10,8 +10,11 @@
  *   backstop.
  * - Requires `WORKER_SECRET`. That variable is set on **production only**
  *   (§13.4.2, §13.18), so preview/local deployments never kick, and never
- *   reach the production worker.
+ *   reach the production worker. Enforced in code too: a logged no-op when
+ *   `VERCEL_ENV` is set and isn't `production`.
  */
+
+import { isNonProductionDeployment } from "@/lib/tasks/workerAuth";
 
 export const KICK_TIMEOUT_MS = 3_000;
 export const WORKER_TICK_PATH = "/api/worker/tick";
@@ -50,6 +53,12 @@ export interface KickOptions {
 export async function kickWorker(options: KickOptions = {}): Promise<boolean> {
   const env = options.env ?? process.env;
   const fetchImpl = options.fetchImpl ?? fetch;
+
+  if (isNonProductionDeployment(env)) {
+    // Preview code must never wake the production worker (§13.4.2).
+    console.info(`[kickWorker] skipped on non-production deployment (VERCEL_ENV=${env.VERCEL_ENV}).`);
+    return false;
+  }
 
   const secret = env.WORKER_SECRET?.trim();
   if (!secret) {

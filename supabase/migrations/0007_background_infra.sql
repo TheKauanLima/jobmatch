@@ -9,6 +9,10 @@
 --   * task functions: enqueue_task, claim_tasks, complete_task, fail_task,
 --     snooze_task, extend_task_lease, cancel_tasks_for_user,
 --     purge_finished_tasks                      (service_role only)
+--   * housekeeping / budget helpers: dead_letter_stale_tasks,
+--     defer_queued_tasks                        (service_role only)
+--   * dead-task hook outbox: claim_dead_task_hooks,
+--     complete_dead_task_hook, release_dead_task_hook (service_role only)
 --   * private.consume_rate_limit               (service_role only)
 --   * public.get_my_rate_limits                (authenticated user RPC)
 --   * public.consume_account_reauth_attempt    (authenticated user RPC)
@@ -45,6 +49,27 @@ revoke all on schema private from public, anon, authenticated;
 -- service_role gets USAGE only so the explicit EXECUTE grants on private
 -- functions below are meaningful. It gets no table privileges here.
 grant usage on schema private to service_role;
+
+-- Default privileges for objects created later in `private` (by the role
+-- running migrations). Defense in depth only, and limited by Postgres
+-- semantics: per-schema default privileges can ADD to, but never remove,
+-- the global defaults. In particular Postgres's built-in global default
+-- "EXECUTE on functions to PUBLIC" is NOT removed by the functions line
+-- below, so every private function still needs (and gets) an explicit
+-- `revoke execute ... from public, anon, authenticated`. These lines do
+-- remove any schema-scoped default grants that may exist for `private`.
+alter default privileges in schema private revoke all on tables from public, anon, authenticated;
+alter default privileges in schema private revoke all on sequences from public, anon, authenticated;
+alter default privileges in schema private revoke all on functions from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- Advisory lock namespaces (two-key pg_advisory_xact_lock(int4, int4)):
+--   410701  claim_tasks, keyed by hashtext(task_class)
+--   410702  private.consume_rate_limit, keyed by hashtext(user_id || ':' || kind)
+-- (§13.3.1 calls these NS_CLAIM and NS_RATE_LIMIT.) Any future lock user
+-- must add its own namespace constant here.
+-- Distinct first keys keep the two lock families from ever colliding.
+-- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
 -- background_tasks (server-only)
@@ -91,6 +116,14 @@ create table public.background_tasks (
     check (last_error_message is null or char_length(last_error_message) <= 500),
   -- Small summary (counts, ids).
   result jsonb,
+  -- Dead-task hook outbox (§13.4.5): a `dead` row's onDead hook is delivered
+  -- at least once by the worker via claim_dead_task_hooks /
+  -- complete_dead_task_hook, whichever path (TS or SQL) killed the task.
+  on_dead_handled_at timestamptz,
+  on_dead_attempts integer not null default 0
+    check (on_dead_attempts >= 0),
+  on_dead_locked_by text,
+  on_dead_locked_until timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -125,6 +158,11 @@ create index background_tasks_finished_at_idx
 -- Supports the `on delete set null` from child tasks without a seq scan.
 create index background_tasks_parent_task_id_idx
   on public.background_tasks (parent_task_id);
+
+-- Dead-task hook sweep (§13.4.5): pending hooks in finished_at order.
+create index background_tasks_on_dead_pending_idx
+  on public.background_tasks (finished_at)
+  where status = 'dead' and on_dead_handled_at is null;
 
 create trigger background_tasks_set_updated_at
   before update on public.background_tasks
@@ -356,10 +394,68 @@ $$;
 comment on function public.enqueue_task is
   'Enqueue a background task (docs/ARCHITECTURE.md §13.3.1). Idempotent on dedupe_key while a task with that key is queued/running: returns the existing task id. service_role only.';
 
+-- dead_letter_stale_tasks ---------------------------------------------
+-- Stale-lease housekeeping (§13.3.1): dead-letters ANY `running` task whose
+-- lease expired more than p_older_than ago (default 6 hours), regardless of
+-- kind or attempts, with code `lease_expired`.
+--
+-- Why: claim_tasks only reclaims / dead-letters expired leases of kinds the
+-- calling worker knows (p_kinds). A task whose kind was later removed or
+-- renamed, or that only a preview deployment knew, would otherwise stay
+-- `running` forever once its worker died, and keep blocking its dedupe key.
+-- Six hours is far beyond any lease (max 300 s) plus cron cadence, so any
+-- deployment that knows the kind has long had the chance to reclaim it.
+-- The distinct last_error_message tells these apart from final-attempt
+-- expiries in claim_tasks. Rows dead-lettered here enter the dead-task hook
+-- outbox like any other dead task. Scheduled hourly by pg_cron (0008,
+-- `kalify-stale-leases`). Returns the number of tasks dead-lettered.
+create function public.dead_letter_stale_tasks(
+  p_older_than interval default interval '6 hours'
+)
+returns integer
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := clock_timestamp();
+  v_count integer;
+begin
+  if p_older_than is null or p_older_than < interval '10 minutes' then
+    -- Guard against dead-lettering live work with a tiny threshold.
+    raise exception 'validation_older_than_too_small';
+  end if;
+
+  with stale as (
+    select t.id
+    from public.background_tasks t
+    where t.status = 'running'
+      and t.locked_until <= v_now - p_older_than
+    for update skip locked
+  )
+  update public.background_tasks t
+     set status = 'dead',
+         last_error_code = 'lease_expired',
+         last_error_message = 'Lease expired long ago and no deployment reclaimed it (stale-lease sweep; kind may be unregistered).',
+         locked_until = null,
+         finished_at = v_now
+    from stale x
+   where t.id = x.id;
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+comment on function public.dead_letter_stale_tasks is
+  'Stale-lease sweep (docs/ARCHITECTURE.md §13.3.1): dead-letter running tasks of any kind whose lease expired more than p_older_than ago (default 6 h), code lease_expired. Scheduled hourly (kalify-stale-leases). service_role only.';
+
 -- claim_tasks ---------------------------------------------------------
 -- 1. Serialize claimers per class with an advisory xact lock so the
 --    concurrency cap is global across concurrent worker invocations.
 -- 2. Dead-letter expired leases already at max_attempts (lease_expired).
+--    (Stale leases of kinds no worker knows: dead_letter_stale_tasks.)
 -- 3. running_now = live leases in the class (all kinds).
 -- 4. Claim least(p_limit, p_max_running - running_now) claimable rows of
 --    p_kinds, priority desc, run_after asc, FOR UPDATE SKIP LOCKED.
@@ -393,7 +489,7 @@ begin
     return;
   end if;
 
-  perform pg_advisory_xact_lock(hashtext('kalify.claim.' || p_task_class));
+  perform pg_advisory_xact_lock(410701, hashtext(p_task_class));
 
   -- Read the clock after acquiring the lock so a claimer that waited sees
   -- the leases the previous holder just committed as live.
@@ -569,10 +665,15 @@ comment on function public.fail_task is
   'Record a failed attempt. Fenced on locked_by/status. Requeues with run_after = now() + delay when retryable and attempts < max_attempts, else dead. Returns the new status, or NULL when fenced out. service_role only.';
 
 -- snooze_task ---------------------------------------------------------
--- Re-queue WITHOUT consuming an attempt (attempts - 1 undoes the claim's
--- increment). For "batch not ready yet" and "budget exhausted".
--- p_reason is a machine code (e.g. 'budget_exhausted'), stored in
--- last_error_code. Fenced; returns false when this worker no longer holds
+-- Re-queue a task THAT IS RUNNING without consuming an attempt (attempts - 1
+-- undoes the claim's increment). For "batch not ready yet" and for a
+-- handler that hits a budget mid-run. (The worker's global-budget deferral
+-- of not-yet-started tasks uses defer_queued_tasks instead and never claims.)
+-- p_reason is a machine code (e.g. 'batch_not_ready'). It is stored in
+-- last_error_code only when that is empty: a previous attempt's real error
+-- code is preserved, because the worker's "ai_invalid_output: one more try,
+-- then dead" rule reads the previous attempt's code. started_at is kept: the
+-- task did start. Fenced; returns false when this worker no longer holds
 -- the task.
 create function public.snooze_task(
   p_id uuid,
@@ -593,11 +694,13 @@ begin
          run_after = clock_timestamp() + make_interval(secs => greatest(coalesce(p_seconds, 0), 0)),
          locked_by = null,
          locked_until = null,
-         last_error_code = case
-           when p_reason ~ '^[a-z][a-z0-9_]{0,63}$' then p_reason
-           else 'snoozed'
-         end,
-         last_error_message = null
+         last_error_code = coalesce(
+           t.last_error_code,
+           case
+             when p_reason ~ '^[a-z][a-z0-9_]{0,63}$' then p_reason
+             else 'snoozed'
+           end
+         )
    where t.id = p_id
      and t.locked_by = p_worker_id
      and t.status = 'running';
@@ -607,7 +710,69 @@ end;
 $$;
 
 comment on function public.snooze_task is
-  'Re-queue a running task after p_seconds without consuming an attempt. Fenced; returns false when fenced out. service_role only.';
+  'Re-queue a running task after p_seconds without consuming an attempt; keeps a prior last_error_code. Fenced; returns false when fenced out. service_role only.';
+
+-- defer_queued_tasks --------------------------------------------------
+-- Global AI budget (§13.9.4): pushes CLAIMABLE queued tasks of p_kinds in
+-- p_task_class to p_until plus a per-task random 0..p_max_jitter_seconds,
+-- WITHOUT claiming them. Nothing else changes: attempts, started_at,
+-- locks and last_error_code are untouched, so a deferral can never consume
+-- an attempt, never marks a task as started, and never disturbs retry
+-- tracking. Bounded by p_limit per call (the next tick continues).
+-- Returns the deferred rows (post-update) so the worker can run the kind's
+-- idempotent onBudgetDelayed hook (e.g. set resume_reports.notice).
+create function public.defer_queued_tasks(
+  p_task_class text,
+  p_kinds text[],
+  p_until timestamptz,
+  p_max_jitter_seconds integer default 900,
+  p_limit integer default 200
+)
+returns setof public.background_tasks
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := clock_timestamp();
+begin
+  if p_task_class is null or p_task_class not in ('user', 'background') then
+    raise exception 'validation_task_class_invalid';
+  end if;
+  if p_until is null then
+    raise exception 'validation_until_required';
+  end if;
+  if p_kinds is null or cardinality(p_kinds) = 0 or coalesce(p_limit, 0) <= 0 then
+    return;
+  end if;
+
+  return query
+  with due as (
+    select t.id
+    from public.background_tasks t
+    where t.task_class = p_task_class
+      and t.kind = any(p_kinds)
+      and t.status = 'queued'
+      and t.run_after <= v_now
+    order by t.priority desc, t.run_after asc
+    limit p_limit
+    for update skip locked
+  ),
+  deferred as (
+    update public.background_tasks t
+       set run_after = greatest(p_until, v_now)
+             + make_interval(secs => floor(random() * (greatest(coalesce(p_max_jitter_seconds, 0), 0) + 1)))
+      from due d
+     where t.id = d.id
+    returning t.*
+  )
+  select * from deferred;
+end;
+$$;
+
+comment on function public.defer_queued_tasks is
+  'Global AI budget deferral (docs/ARCHITECTURE.md §13.9.4): move claimable queued tasks of p_kinds to p_until + jitter without claiming them (no attempt used, started_at/last_error_code untouched). Returns the deferred rows. service_role only.';
 
 -- extend_task_lease ---------------------------------------------------
 -- Heartbeat for long tasks. Never shortens an existing lease.
@@ -678,7 +843,10 @@ comment on function public.cancel_tasks_for_user is
   'Cancel every queued task belonging to p_user_id (account deletion). Returns the number cancelled. service_role only.';
 
 -- purge_finished_tasks ------------------------------------------------
--- Daily housekeeping (pg_cron, migration 0008).
+-- Daily housekeeping (pg_cron, migration 0008). Dead rows are deleted only
+-- once their onDead hook has been handled (§13.4.5); unhandled ones are kept
+-- and surface as dead_hooks_pending in GET /api/worker/status.
+-- Returns the number of rows deleted.
 create function public.purge_finished_tasks()
 returns integer
 language plpgsql
@@ -693,6 +861,7 @@ begin
    where (t.status in ('succeeded', 'cancelled')
           and t.finished_at < now() - interval '14 days')
       or (t.status = 'dead'
+          and t.on_dead_handled_at is not null
           and t.finished_at < now() - interval '30 days');
 
   get diagnostics v_count = row_count;
@@ -701,7 +870,141 @@ end;
 $$;
 
 comment on function public.purge_finished_tasks is
-  'Delete succeeded/cancelled tasks finished > 14 days ago and dead tasks finished > 30 days ago. Returns rows deleted. service_role only (scheduled by pg_cron).';
+  'Delete succeeded/cancelled tasks finished > 14 days ago and dead tasks finished > 30 days ago whose onDead hook was handled. Returns rows deleted. service_role only (scheduled by pg_cron).';
+
+-- ---------------------------------------------------------------------
+-- Dead-task hook outbox (service_role only), §13.4.5
+-- ---------------------------------------------------------------------
+-- Tasks can go `dead` in SQL with no TS running (claim_tasks lease_expired,
+-- dead_letter_stale_tasks), so onDead is delivered from the row itself:
+-- every dead row starts with on_dead_handled_at null, and the worker claims
+-- and completes hooks here. Delivery is at-least-once; hooks are idempotent.
+
+-- claim_dead_task_hooks -------------------------------------------------
+-- Locks up to p_limit pending hooks (dead, unhandled, kind known to the
+-- caller, hook lock free or expired) for 120 s and increments
+-- on_dead_attempts. With p_task_id, only that row is considered (the
+-- worker's fast path right after its own fail_task returned 'dead').
+create function public.claim_dead_task_hooks(
+  p_worker_id text,
+  p_kinds text[],
+  p_limit integer,
+  p_task_id uuid default null
+)
+returns setof public.background_tasks
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := clock_timestamp();
+begin
+  if p_worker_id is null or char_length(p_worker_id) = 0 then
+    raise exception 'validation_worker_id_required';
+  end if;
+  if p_kinds is null or cardinality(p_kinds) = 0 or coalesce(p_limit, 0) <= 0 then
+    return;
+  end if;
+
+  return query
+  with pending as (
+    select t.id
+    from public.background_tasks t
+    where t.status = 'dead'
+      and t.on_dead_handled_at is null
+      and t.kind = any(p_kinds)
+      and (t.on_dead_locked_until is null or t.on_dead_locked_until <= v_now)
+      and (p_task_id is null or t.id = p_task_id)
+    order by t.finished_at asc nulls first
+    limit p_limit
+    for update skip locked
+  ),
+  claimed as (
+    update public.background_tasks t
+       set on_dead_locked_by = p_worker_id,
+           on_dead_locked_until = v_now + interval '120 seconds',
+           on_dead_attempts = t.on_dead_attempts + 1
+      from pending x
+     where t.id = x.id
+    returning t.*
+  )
+  select * from claimed;
+end;
+$$;
+
+comment on function public.claim_dead_task_hooks is
+  'Dead-task hook outbox (docs/ARCHITECTURE.md §13.4.5): lock up to p_limit pending onDead hooks of known kinds for 120 s (optionally one task), incrementing on_dead_attempts. service_role only.';
+
+-- complete_dead_task_hook ------------------------------------------------
+-- Fenced on on_dead_locked_by. Marks the hook handled and clears its lock.
+-- p_gave_up additionally records a no-PII note in last_error_message
+-- (last_error_code keeps the original failure code).
+create function public.complete_dead_task_hook(
+  p_id uuid,
+  p_worker_id text,
+  p_gave_up boolean default false
+)
+returns boolean
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+begin
+  update public.background_tasks t
+     set on_dead_handled_at = clock_timestamp(),
+         on_dead_locked_by = null,
+         on_dead_locked_until = null,
+         last_error_message = case
+           when coalesce(p_gave_up, false)
+             then 'onDead hook gave up after ' || t.on_dead_attempts || ' attempts'
+           else t.last_error_message
+         end
+   where t.id = p_id
+     and t.status = 'dead'
+     and t.on_dead_handled_at is null
+     and t.on_dead_locked_by = p_worker_id;
+
+  return found;
+end;
+$$;
+
+comment on function public.complete_dead_task_hook is
+  'Mark a dead task''s onDead hook handled (fenced on on_dead_locked_by). p_gave_up records a no-PII note in last_error_message. Returns false when fenced out or already handled. service_role only.';
+
+-- release_dead_task_hook -------------------------------------------------
+-- Gives back a hook this worker claimed but did NOT run (e.g. the sweep ran
+-- out of its time budget): clears the lock and undoes the claim's attempt
+-- increment, so a hook that keeps getting skipped behind slow ones can
+-- never reach the give-up threshold without having run. Fenced on
+-- on_dead_locked_by; returns false when fenced out or already handled.
+create function public.release_dead_task_hook(
+  p_id uuid,
+  p_worker_id text
+)
+returns boolean
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+begin
+  update public.background_tasks t
+     set on_dead_locked_by = null,
+         on_dead_locked_until = null,
+         on_dead_attempts = greatest(t.on_dead_attempts - 1, 0)
+   where t.id = p_id
+     and t.status = 'dead'
+     and t.on_dead_handled_at is null
+     and t.on_dead_locked_by = p_worker_id;
+
+  return found;
+end;
+$$;
+
+comment on function public.release_dead_task_hook is
+  'Release a claimed-but-unrun onDead hook: clear its lock and refund the attempt (fenced on on_dead_locked_by). Returns false when fenced out or already handled. service_role only.';
 
 -- ---------------------------------------------------------------------
 -- Worker read helpers (service_role only)
@@ -795,7 +1098,7 @@ begin
 
   -- Serializes concurrent consumes for the same user+kind so two requests
   -- at limit-1 cannot both succeed.
-  perform pg_advisory_xact_lock(hashtext(p_user_id::text || p_kind));
+  perform pg_advisory_xact_lock(410702, hashtext(p_user_id::text || ':' || p_kind));
 
   select count(*)::integer into v_used
   from public.rate_limit_events e
@@ -913,6 +1216,21 @@ grant execute on function public.extend_task_lease(uuid, text, integer) to servi
 
 revoke execute on function public.cancel_tasks_for_user(uuid) from public, anon, authenticated;
 grant execute on function public.cancel_tasks_for_user(uuid) to service_role;
+
+revoke execute on function public.dead_letter_stale_tasks(interval) from public, anon, authenticated;
+grant execute on function public.dead_letter_stale_tasks(interval) to service_role;
+
+revoke execute on function public.claim_dead_task_hooks(text, text[], integer, uuid) from public, anon, authenticated;
+grant execute on function public.claim_dead_task_hooks(text, text[], integer, uuid) to service_role;
+
+revoke execute on function public.complete_dead_task_hook(uuid, text, boolean) from public, anon, authenticated;
+grant execute on function public.complete_dead_task_hook(uuid, text, boolean) to service_role;
+
+revoke execute on function public.release_dead_task_hook(uuid, text) from public, anon, authenticated;
+grant execute on function public.release_dead_task_hook(uuid, text) to service_role;
+
+revoke execute on function public.defer_queued_tasks(text, text[], timestamptz, integer, integer) from public, anon, authenticated;
+grant execute on function public.defer_queued_tasks(text, text[], timestamptz, integer, integer) to service_role;
 
 revoke execute on function public.purge_finished_tasks() from public, anon, authenticated;
 grant execute on function public.purge_finished_tasks() to service_role;

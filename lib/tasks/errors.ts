@@ -36,7 +36,9 @@ export type TaskErrorCode = (typeof TASK_ERROR_CODES)[number];
  * Default retryability per code (§13.4.5 table). `ai_invalid_output` is
  * "yes, once more, then dead" — see `classifyTaskError`. `budget_exhausted`
  * never reaches `fail_task`: the worker turns it into a snooze.
- * `lease_expired` is set only by `claim_tasks` in SQL.
+ * `lease_expired` is set only in SQL: by `claim_tasks` (lease expired on the
+ * final attempt) and by `dead_letter_stale_tasks` (lease expired > 6 h ago,
+ * any kind).
  */
 export const DEFAULT_RETRYABLE: Record<TaskErrorCode, boolean> = {
   ai_unavailable: true,
@@ -94,7 +96,6 @@ export const MAX_ERROR_MESSAGE_LENGTH = 500;
 export function sanitizeErrorMessage(message: unknown): string | null {
   if (typeof message !== "string") return null;
   const cleaned = message
-    // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();

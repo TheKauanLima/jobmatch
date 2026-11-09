@@ -49,6 +49,26 @@ Implements §13.5.1–13.5.3, 13.5.5, 13.5.6 (helpers). Depends on: nothing.
   classification, and escaping with attributes plus zero-width splitting.
 - `parse.ts` is reduced to (or replaced by) semantic validation.
 
+### M1.1b Structured-output `enum` restore [BE]
+Implements the §13.5.2 "Decision on `enum`" block. Depends on: M1.1 merged. **Must
+land before M2.2 and M2.3**, the first enum-heavy schemas. Small (one PR).
+1. [BE] `scripts/evals/structured-output-probe.ts` (manual, real key): 20 sync + 5
+   batch runs on `claude-opus-5-5` with an out-of-enum-pushing prompt. Record the
+   result in §13.5.2 next to the decision block, either "enforced" or "not enforced".
+2. [BE] `lib/claude/outputFormat.ts#buildOutputFormat` with `restoreEnums`,
+   `WIRE_ENUM_MAX_VALUES = 64`, and `WIRE_ENUM_RESTORE` (set from the probe result).
+   Use it in both `callStructured` and the batch request builder.
+3. [BE] Tests per §13.5.2 decision item 5: wire-schema snapshots, enum-path coverage,
+   nullable→`null`, no other keywords added, the oversized-enum guard, and
+   sync/batch parity.
+
+**Acceptance:**
+- The probe result is recorded.
+- With `WIRE_ENUM_RESTORE = true`, every closed enum in the M1.1-migrated schemas
+  appears on the wire, and a live call still returns `end_turn`.
+- With it set to `false`, the wire schema is byte-identical to the helper output.
+- No data-driven vocabulary (skill/role slugs) is a `z.enum`.
+
 ### M1.2 🟢 Background task infrastructure [BE]
 Implements §13.3.1, 13.3.2, 13.4. Depends on: nothing (in parallel with M1.1).
 1. [BE] Migration `0007_background_infra.sql`: `private` schema, `background_tasks`,
@@ -63,6 +83,19 @@ Implements §13.3.1, 13.3.2, 13.4. Depends on: nothing (in parallel with M1.1).
    budget check in the worker.
 5. [BE] Write ops notes in the PR description: Vault secrets to create, plus
    `WORKER_SECRET`/`APP_BASE_URL` set on production only.
+6. [BE] **Review fix pass**, folded into 0007/0008 before they are applied:
+   - the dead-task hook outbox: columns, `claim_dead_task_hooks`,
+     `complete_dead_task_hook`, the worker sweep plus fast path, and purge only once
+     handled (§13.4.5);
+   - `dead_letter_stale_tasks` plus the `kalify-stale-leases` cron;
+   - two-key advisory locks;
+   - default-privilege revoke on `private`;
+   - no `service_role` grant on `invoke_worker_tick`;
+   - the `VERCEL_ENV` production guard on tick and kick;
+   - admin-call timeouts;
+   - `dead_hooks_pending` in the status route.
+
+   Tests per §13.4.5.
 
 **Acceptance:**
 - After the user or orchestrator creates the Vault secrets, a `maintenance.noop` task
@@ -349,11 +382,20 @@ M2.3, M2.4.
 Implements §13.5.4(3), 13.5.6 (critique rules). Depends on: M3.1.
 1. [BE] `lib/claude/tasks/critiqueResume.ts` (rubric, student guidance,
    fabrication guard) and the `resume.critique` handler, replacing the stub.
+2. [BE] Map quotes back to the original text, per §13.13.2 "Displaying quoted text".
+   - `semanticValidation.ts#locateQuoteInSource`: NFKC plus invisible-character
+     normalization, keeping an offset map back to the original.
+   - Store `original_text` as the **original-source span**, never Claude's NFKC quote.
+   - Apply the same helper to every quote field: profile evidence (retrofit M2.3 if it
+     shipped without it), `evidence_quote`, and fit-check `resume_line` /
+     `resume_evidence`.
 
 **Acceptance:**
 - On 5 synthetic resumes: exactly 5 dimensions; every `original_text` is verbatim;
   no rewrite introduces an unbracketed number.
 - The `dropped_items` count is recorded.
+- Fixtures containing `m²`, `™`, `½`, full-width digits, and `ﬁ` produce stored quotes
+  identical to the original substrings.
 
 ### M3.3 Retrieval scoring and role discovery [BE]
 Implements §13.8.3, 13.8.4, 13.8.6 (estimate). Depends on: M3.1.
@@ -404,8 +446,12 @@ until then).
    `RoleCard` with jobs (assessed vs "Estimated match" label), retry button,
    error-code copy, and the delayed-budget notice.
 3. [FE] `/resumes/[id]` links to the latest report and offers "Refresh matches".
+4. [FE] Quoted resume text (`original_text`, evidence quotes) is displayed and
+   highlighted **from the API's original-source strings** (§13.13.2 "Displaying quoted
+   text"). Never re-normalize, and never search the resume with an NFKC string.
 
 **Acceptance:**
+- A resume containing `m²` / `™` shows those exact characters in line feedback.
 - Progress updates without reload.
 - Polling stops on terminal states and pauses while the tab is hidden.
 - The page is usable at phone width.
@@ -570,6 +616,7 @@ deletion completeness including the new tables.
 | ID | Title | Owner | Depends on | Start now |
 |---|---|---|---|---|
 | M1.1 | Claude layer v2 foundation (structured outputs, Opus 5.5, delete repair/retry) | BE | — | 🟢 |
+| M1.1b | Structured-output `enum` restore (probe + `buildOutputFormat`) | BE | M1.1; before M2.2/M2.3 | |
 | M1.2 | Background task infrastructure (0007/0008, worker, kicks) | BE | — | 🟢 |
 | M1.3 | QA: task infra and Claude layer (pgTAP harness) | QA | M1.1, M1.2 | |
 | M1.4a | Account deletion backend | BE | — | 🟢 |
@@ -580,8 +627,8 @@ deletion completeness including the new tables.
 | M1.7 | Jobs board UI updates | FE | M1.5 | |
 | M1.8 | QA: Phase 1 gate | QA | M1.4–M1.7 | |
 | M2.1 | Skills and role-family taxonomy | BE | M1.5 (migration order; data authoring can start now) | |
-| M2.2 | Job requirement extraction (batch + sync) | BE | M2.1, M1.5, M1.1 | |
-| M2.3 | Resume profile extraction | BE | M2.1, M1.2, M1.1 | |
+| M2.2 | Job requirement extraction (batch + sync) | BE | M2.1, M1.5, M1.1, M1.1b | |
+| M2.3 | Resume profile extraction | BE | M2.1, M1.2, M1.1, M1.1b | |
 | M2.4 | Embeddings and `match_candidates` | BE | M2.2, M2.3, Q1 | |
 | M2.5 | Extraction model eval harness | QA+BE | M2.2 | |
 | M2.6 | QA: Phase 2 gate | QA | M2.1–M2.4 | |

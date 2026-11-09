@@ -22,15 +22,26 @@ export type ModelPrice = {
 };
 
 /**
- * Prices as stated 2026-11-04 (§13.17). Thinking tokens are billed as
- * output and are already included in `usage.output_tokens`.
- * Keys are matched as exact ids or as a prefix (dated snapshots such as
- * `claude-opus-5-5-YYYYMMDD` price like their alias).
+ * List prices per MTok (input/output). Thinking tokens are billed as output
+ * and are already included in `usage.output_tokens`.
+ *
+ * Besides the models we request (§13.17), the table must cover every model
+ * the server-side refusal fallback can serve, because pricing uses the
+ * SERVING model. Older Opus fallbacks cost more than Opus 5.5.
+ *
+ * A key matches only an exact model id or a dated snapshot of it
+ * (`<key>-YYYYMMDD`), never an arbitrary suffix: a future
+ * `claude-opus-5-6` must fall through to `UNKNOWN_MODEL_PRICE` with
+ * `priceKnown: false` and a warning, not silently price as `claude-opus-5`.
  */
 export const PRICES: Readonly<Record<string, ModelPrice>> = {
   "claude-opus-5-5": { inputPerMTok: 4, outputPerMTok: 20 },
   "claude-sonnet-5-5": { inputPerMTok: 2, outputPerMTok: 10 },
   "claude-haiku-5-5": { inputPerMTok: 0.1, outputPerMTok: 0.5 },
+  // Refusal-fallback targets (and other models that may serve a response).
+  "claude-opus-5": { inputPerMTok: 5, outputPerMTok: 25 },
+  "claude-sonnet-5": { inputPerMTok: 2, outputPerMTok: 10 },
+  "claude-opus-4-8": { inputPerMTok: 5, outputPerMTok: 25 },
 };
 
 /**
@@ -47,14 +58,15 @@ export const CACHE_READ_MULTIPLIER = 0.1;
 export const BATCH_DISCOUNT = 0.5;
 
 /**
- * Used when the serving model isn't in `PRICES` (e.g. an unannounced
- * fallback model). We price at the most expensive known rate so the global
- * spend guard (§13.9.4) over-counts rather than under-counts, and we log a
- * warning (model id only) so someone adds the price.
+ * Ceiling price for a serving model that isn't in `PRICES` (e.g. an
+ * unannounced fallback model). It is an explicit constant, not derived from the
+ * table, and it is at least the highest list input price AND the highest
+ * list output price (checked independently by usage.test.ts). The global
+ * spend guard (§13.9.4) sums these costs, so an unknown model must
+ * over-count, never under-count. The call is also flagged
+ * `priceKnown: false` and logged (model id only) so someone adds the price.
  */
-const MOST_EXPENSIVE_PRICE: ModelPrice = Object.values(PRICES).reduce((max, p) =>
-  p.outputPerMTok > max.outputPerMTok ? p : max,
-);
+export const UNKNOWN_MODEL_PRICE: ModelPrice = { inputPerMTok: 5, outputPerMTok: 25 };
 
 /**
  * The subset of the SDK's (beta) `Usage` shape this module reads. Declared
@@ -102,15 +114,19 @@ export type UsageSummary = TokenCounts & {
   priceKnown: boolean;
 };
 
+const DATED_SNAPSHOT_SUFFIX = /^-\d{8}$/;
+
+/** Exact id, or `<key>-YYYYMMDD`. Anything else is unknown (null). */
 export function lookupPrice(model: string): ModelPrice | null {
-  if (PRICES[model]) {
+  if (Object.prototype.hasOwnProperty.call(PRICES, model)) {
     return PRICES[model];
   }
-  // Longest matching prefix, so a dated snapshot id still prices correctly.
-  const key = Object.keys(PRICES)
-    .filter((k) => model.startsWith(`${k}-`))
-    .sort((a, b) => b.length - a.length)[0];
-  return key ? PRICES[key] : null;
+  for (const key of Object.keys(PRICES)) {
+    if (model.startsWith(key) && DATED_SNAPSHOT_SUFFIX.test(model.slice(key.length))) {
+      return PRICES[key];
+    }
+  }
+  return null;
 }
 
 function n(value: number | null | undefined): number {
@@ -128,7 +144,7 @@ type PricedPart = {
 
 function costOfPart(part: PricedPart): { cost: number; known: boolean } {
   const price = lookupPrice(part.model);
-  const p = price ?? MOST_EXPENSIVE_PRICE;
+  const p = price ?? UNKNOWN_MODEL_PRICE;
 
   const cacheWriteTotal = n(part.cache_creation_input_tokens);
   const write1h = Math.min(n(part.cache_creation?.ephemeral_1h_input_tokens), cacheWriteTotal);

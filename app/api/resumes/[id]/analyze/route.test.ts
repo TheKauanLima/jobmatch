@@ -72,7 +72,8 @@ vi.mock("@/lib/claude/prompts/analyzeResume", async () => {
   return { ...actual, analyzeResume: mockAnalyzeResume };
 });
 
-const { POST } = await import("@/app/api/resumes/[id]/analyze/route");
+const routeModule = await import("@/app/api/resumes/[id]/analyze/route");
+const { POST } = routeModule;
 const { UnauthorizedError } = await import("@/lib/auth/session");
 const {
   ClaudeApiError,
@@ -299,7 +300,7 @@ describe("POST /api/resumes/:id/analyze — text extraction", () => {
         extractedText: "Newly extracted resume text.",
       }),
     );
-    expect(mockAnalyzeResume).toHaveBeenCalledWith("Newly extracted resume text.", { userId: "user-1" });
+    expect(mockAnalyzeResume).toHaveBeenCalledWith("Newly extracted resume text.", { userId: "user-1", signal: expect.any(AbortSignal) });
   });
 
   it("uses the already-stored extracted_text without re-downloading when present", async () => {
@@ -317,7 +318,7 @@ describe("POST /api/resumes/:id/analyze — text extraction", () => {
 
     expect(mockDownloadResumeFile).not.toHaveBeenCalled();
     expect(mockExtractResumeText).not.toHaveBeenCalled();
-    expect(mockAnalyzeResume).toHaveBeenCalledWith(ownedResumeWithText.extracted_text, { userId: "user-1" });
+    expect(mockAnalyzeResume).toHaveBeenCalledWith(ownedResumeWithText.extracted_text, { userId: "user-1", signal: expect.any(AbortSignal) });
     // Should not clobber extracted_text with an explicit re-write when it
     // was already present — only 'status: processing' is sent.
     expect(mockUpdateResume).toHaveBeenCalledWith(
@@ -507,5 +508,47 @@ describe("POST /api/resumes/:id/analyze — M1.1 Claude layer v2 integration", (
     expect(logged).toContain("ai_truncated");
     expect(logged).not.toContain(ownedResumeWithText.extracted_text);
     errorSpy.mockRestore();
+  });
+});
+
+describe("POST /api/resumes/:id/analyze — deadline (review B1)", () => {
+  it("exports maxDuration = 300, above the 270 s Claude deadline", async () => {
+    const { SYNC_ROUTE_CLAUDE_DEADLINE_MS } = await import("@/lib/claude/config");
+    expect(routeModule.maxDuration).toBe(300);
+    expect(SYNC_ROUTE_CLAUDE_DEADLINE_MS).toBe(270_000);
+    expect(SYNC_ROUTE_CLAUDE_DEADLINE_MS).toBeLessThan(routeModule.maxDuration * 1000);
+  });
+
+  it("when the deadline fires mid-analysis: JSON 502, resume marked 'failed', nothing persisted", async () => {
+    const deadline = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockGetResumeById.mockResolvedValue(ownedResumeWithText);
+    // Behaves like the real analyzeResume: rejects with the abort-mapped
+    // ClaudeApiError as soon as ctx.signal fires.
+    mockAnalyzeResume.mockImplementation(
+      (_text: string, ctx: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener("abort", () =>
+            reject(
+              new ClaudeApiError("Claude call aborted (analyzeResume).", {
+                code: "ai_unavailable",
+                retryable: true,
+              }),
+            ),
+          );
+          setTimeout(() => deadline.abort(), 0);
+        }),
+    );
+
+    const res = await POST(makeRequest(), makeContext());
+
+    expect(timeoutSpy).toHaveBeenCalledWith(270_000);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "Resume analysis failed. Please try again." });
+    expect(mockCreateAnalysis).not.toHaveBeenCalled();
+    const statusUpdates = mockUpdateResume.mock.calls.map((call) => call[3]?.status);
+    expect(statusUpdates).toEqual(["processing", "failed"]);
+    timeoutSpy.mockRestore();
   });
 });

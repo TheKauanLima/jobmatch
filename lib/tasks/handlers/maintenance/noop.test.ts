@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isFirstClaim,
   NOOP_SNOOZE_REASON,
   noopPayloadSchema,
   runNoopTask,
@@ -8,6 +9,18 @@ import {
 } from "@/lib/tasks/handlers/maintenance/noop";
 import { TaskError } from "@/lib/tasks/errors";
 import type { BackgroundTaskRow, TaskContext } from "@/lib/tasks/types";
+
+/** Row timestamps as claim_tasks leaves them on the first / a later claim. */
+const FIRST_CLAIM = {
+  started_at: "2026-11-09T12:00:00.000Z",
+  locked_until: "2026-11-09T12:01:00.000Z",
+  lease_seconds: 60,
+};
+const LATER_CLAIM = {
+  started_at: "2026-11-09T12:00:00.000Z",
+  locked_until: "2026-11-09T12:10:00.000Z",
+  lease_seconds: 60,
+};
 
 function ctx(payload: NoopPayload, task: Partial<BackgroundTaskRow> = {}, signal = new AbortController().signal) {
   return {
@@ -40,15 +53,45 @@ describe("maintenance.noop", () => {
     expect((err as TaskError).retryable).toBe(false);
   });
 
-  it("snoozes once, then succeeds on the re-claim", async () => {
-    await expect(runNoopTask(ctx({ snooze_seconds: 30 }))).resolves.toEqual({
+  it("snoozes on the first claim only, then succeeds on the re-claim", async () => {
+    await expect(runNoopTask(ctx({ snooze_seconds: 30 }, FIRST_CLAIM))).resolves.toEqual({
       outcome: "snooze",
       seconds: 30,
       reason: NOOP_SNOOZE_REASON,
     });
+    await expect(runNoopTask(ctx({ snooze_seconds: 30 }, LATER_CLAIM))).resolves.toMatchObject({
+      outcome: "succeeded",
+    });
+  });
+
+  it("does not depend on last_error_code (snooze_task preserves prior codes)", async () => {
+    // Regression: after a failure the code is internal_error, never the
+    // snooze reason; keying off it would snooze forever.
     await expect(
-      runNoopTask(ctx({ snooze_seconds: 30 }, { last_error_code: NOOP_SNOOZE_REASON })),
-    ).resolves.toMatchObject({ outcome: "succeeded" });
+      runNoopTask(ctx({ snooze_seconds: 30, force_fail: true }, { ...LATER_CLAIM, last_error_code: "internal_error" })),
+    ).rejects.toBeInstanceOf(TaskError);
+  });
+
+  describe("isFirstClaim", () => {
+    it("is true only when started_at == locked_until − lease", () => {
+      expect(isFirstClaim(FIRST_CLAIM)).toBe(true);
+      expect(isFirstClaim(LATER_CLAIM)).toBe(false);
+    });
+
+    it("tolerates PostgREST microsecond timestamps", () => {
+      expect(
+        isFirstClaim({
+          started_at: "2026-11-09T12:00:00.123456+00:00",
+          locked_until: "2026-11-09T12:01:00.123456+00:00",
+          lease_seconds: 60,
+        }),
+      ).toBe(true);
+    });
+
+    it("is false when either timestamp is missing", () => {
+      expect(isFirstClaim({ started_at: null, locked_until: FIRST_CLAIM.locked_until, lease_seconds: 60 })).toBe(false);
+      expect(isFirstClaim({ started_at: FIRST_CLAIM.started_at, locked_until: null, lease_seconds: 60 })).toBe(false);
+    });
   });
 
   it("sleep honors the abort signal", async () => {

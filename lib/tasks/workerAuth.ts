@@ -12,6 +12,19 @@ import { createHash, timingSafeEqual } from "node:crypto";
  *   comparison is constant-time and doesn't leak the secret's length.
  */
 
+/**
+ * True on a Vercel deployment that is NOT production (`VERCEL_ENV` is
+ * `preview` or `development`). Previews share the production database, so
+ * preview code must never drain the queue or kick the production worker
+ * (§13.4.2). An unset `VERCEL_ENV` (local dev, tests) is allowed.
+ */
+export function isNonProductionDeployment(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const vercelEnv = env.VERCEL_ENV?.trim();
+  return Boolean(vercelEnv) && vercelEnv !== "production";
+}
+
 export type WorkerAuthResult =
   | { ok: true }
   | { ok: false; status: 401 | 500; error: string };

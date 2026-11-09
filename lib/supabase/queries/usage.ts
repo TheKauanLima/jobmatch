@@ -52,10 +52,12 @@ export interface AiSpendRow {
 export async function getAiSpendSince(
   admin: AdminClient,
   since: Date,
+  options?: { signal?: AbortSignal },
 ): Promise<AiSpendRow[]> {
-  const { data, error } = await admin.rpc("ai_spend_summary", {
+  const query = admin.rpc("ai_spend_summary", {
     p_since: since.toISOString(),
   });
+  const { data, error } = await (options?.signal ? query.abortSignal(options.signal) : query);
   if (error) throw new UsageQueryError("ai_spend_summary", error);
 
   return (data ?? []).map((row) => ({

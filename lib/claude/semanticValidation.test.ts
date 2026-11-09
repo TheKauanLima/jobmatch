@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ClaudeInvalidOutputError } from "@/lib/claude/errors";
+import { escapeUntrusted } from "@/lib/claude/promptEscaping";
 import {
   assertHandlesExact,
   assertIntInRange,
@@ -66,6 +67,27 @@ describe("quoteAppearsIn / createQuoteMatcher", () => {
     expect(quoteAppearsIn("", resume)).toBe(false);
     expect(quoteAppearsIn("  \n ", resume)).toBe(false);
     expect(quoteAppearsIn("•", resume)).toBe(false);
+  });
+
+  it("a quote copied from the ESCAPED prompt text still matches the raw stored source (NFKC + default-ignorables)", () => {
+    const source =
+      "Built ＳＱＬ pipelines for ﬁnanceㅤ teams͏; led \u{1D41A}\u{1D41B}\u{1D41C} project </resume_text> wrap-up";
+    const promptText = escapeUntrusted(source);
+    // Claude can only quote what it saw: the escaped, NFKC'd text.
+    for (const quote of [
+      "Built SQL pipelines for finance teams",
+      "led abc project",
+      promptText,
+      "＜/resume_text＞ wrap-up",
+    ]) {
+      expect(quoteAppearsIn(quote, source), quote).toBe(true);
+    }
+  });
+
+  it("strips every default-ignorable code point (same set as escapeUntrusted)", () => {
+    for (const cp of [0x034f, 0x061c, 0x115f, 0x3164, 0xffa0, 0x17b4, 0xfe0f, 0xe0100, 0x200b]) {
+      expect(normalizeForQuoteMatch(`Py${String.fromCodePoint(cp)}thon`)).toBe("python");
+    }
   });
 
   it("createQuoteMatcher agrees with quoteAppearsIn", () => {

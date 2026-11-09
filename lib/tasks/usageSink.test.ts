@@ -11,7 +11,7 @@ vi.mock("@/lib/supabase/admin", () => ({
   }),
 }));
 
-const { createDatabaseUsageSink, toUsageRow } = await import("@/lib/tasks/usageSink");
+const { createDatabaseUsageSink, toUsageRow, USAGE_SINK_ALERT_PREFIX } = await import("@/lib/tasks/usageSink");
 type AiUsageEvent = Parameters<typeof toUsageRow>[0];
 
 const USER = "11111111-1111-4111-8111-111111111111";
@@ -126,6 +126,8 @@ describe("createDatabaseUsageSink", () => {
 
     await expect(sink(event)).resolves.toBeUndefined();
     const logged = error.mock.calls.flat().join(" ");
+    expect(String(error.mock.calls[0][0]).startsWith("[ALERT][usageSink] failed to record")).toBe(true);
+    expect(USAGE_SINK_ALERT_PREFIX).toBe("[ALERT][usageSink] failed to record");
     expect(logged).toContain("UsageQueryError");
     expect(logged).toContain("23514");
     expect(logged).toContain("req_123");
@@ -142,12 +144,30 @@ describe("createDatabaseUsageSink", () => {
     expect(mockInsert).not.toHaveBeenCalled();
   });
 
-  it("skips (and logs) unstorable events", async () => {
+  it("skips unstorable events with an alertable log line", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const sink = createDatabaseUsageSink({ getAdmin: () => ({}) as never });
     await sink({ ...event, provider: "openai" as never });
     expect(mockInsert).not.toHaveBeenCalled();
-    expect(error).toHaveBeenCalled();
+    expect(String(error.mock.calls[0][0])).toContain(USAGE_SINK_ALERT_PREFIX);
+  });
+
+  it("an invalid cost is stored as 0 but alerted (that spend is invisible to the budget)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sink = createDatabaseUsageSink({ getAdmin: () => ({}) as never });
+    await sink({ ...event, costUsd: Number.NaN });
+    expect(mockInsert.mock.calls[0][1]).toMatchObject({ cost_usd: 0 });
+    expect(String(error.mock.calls[0][0])).toContain(USAGE_SINK_ALERT_PREFIX);
+  });
+
+  it("alert lines carry no PII-bearing fields", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInsert.mockRejectedValue(new Error("Jane Doe row data"));
+    const sink = createDatabaseUsageSink({ getAdmin: () => ({}) as never });
+    await sink(event);
+    const logged = error.mock.calls.flat().join(" ");
+    expect(logged).not.toContain("Jane");
+    expect(logged).not.toContain(USER);
   });
 
   it("is assignable to the Claude layer's UsageSink (M1.1 registration)", async () => {

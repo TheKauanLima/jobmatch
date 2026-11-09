@@ -23,8 +23,11 @@
  *   - case-insensitive (`</RESUME_TEXT>`);
  *   - whitespace around and *within* the word (`</ resume_te xt >`,
  *     `</resume_\ntext>`), since an attacker controls the exact bytes;
- *   - invisible characters spliced into the word (stripped from the whole
- *     text first, see `INVISIBLE_CHAR_RANGES`);
+ *   - invisible characters spliced into the word (every
+ *     `Default_Ignorable_Code_Point`, stripped from the whole text first);
+ *   - Unicode look-alikes folded by NFKC (math letters, full-width or
+ *     small-form brackets), see `escapeUntrusted`;
+ *   - repeated slashes (`<//resume_text>`);
  *   - attributes (`<job_posting id="J1">`, `<resume_text role="system">`);
  *   - an unterminated tag head (`</resume_text` at end of text or before a
  *     newline), which a model could still read as a delimiter.
@@ -49,46 +52,30 @@ export const RESERVED_TAG_WORDS = [
 export type ReservedTagWord = (typeof RESERVED_TAG_WORDS)[number];
 
 /**
- * Invisible / zero-width / formatting code points an adversary could splice
- * into a tag word to defeat a whitespace-tolerant regex (`\s` matches none
- * of them), or use to hide instructions from a human reviewer while the
- * model still reads them. Built from numeric code points so the set is
- * unambiguous to audit. Stripped from the whole text before matching. None
- * carry meaning in resume or listing content.
- *   - U+00AD soft hyphen
- *   - U+180E Mongolian vowel separator
- *   - U+200B–U+200F zero-width space / non-joiner / joiner, LRM, RLM
- *   - U+202A–U+202E bidi embedding / override controls
- *   - U+2060–U+2064 word joiner, invisible operators
- *   - U+2066–U+2069 bidi isolate controls
- *   - U+FEFF zero-width no-break space / BOM
- *   - U+E0000–U+E007F Unicode "tag" characters (used for invisible-text
- *     "ASCII smuggling" aimed at LLMs)
- * Every code point in the v1 set (U+200B, U+200C, U+200D, U+2060, U+FEFF,
- * U+00AD) is still covered.
+ * Invisible code points an adversary could splice into a tag word to defeat
+ * a whitespace-tolerant regex (`\s` matches none of them), or use to hide
+ * instructions from a human reviewer while the model still reads them.
+ *
+ * We strip the whole Unicode `Default_Ignorable_Code_Point` property rather
+ * than a hand-picked list. The M1.1 hand-written list missed U+034F, U+061C,
+ * the Hangul fillers (U+115F, U+1160, U+3164, U+FFA0), U+17B4/5, and the
+ * variation selectors (U+FE00–FE0F, U+E0100–E01EF), as the M1.1 review found.
+ * The property is a superset of the earlier sets: soft hyphen, zero-width
+ * space/joiners, LRM/RLM, bidi controls, word joiner and invisible
+ * operators, BOM, Mongolian vowel separator, and the U+E0000 "tag" block used
+ * for "ASCII smuggling" aimed at LLMs. None carry meaning in resume or
+ * listing text. The cost is that emoji sequences lose joiners and variation
+ * selectors, which is harmless for analysis.
+ *
+ * Built with the RegExp constructor because TypeScript would otherwise reject
+ * a property-escape literal at the ES2017 target.
  */
-const INVISIBLE_CHAR_RANGES: ReadonlyArray<readonly [number, number]> = [
-  [0x00ad, 0x00ad],
-  [0x180e, 0x180e],
-  [0x200b, 0x200f],
-  [0x202a, 0x202e],
-  [0x2060, 0x2064],
-  [0x2066, 0x2069],
-  [0xfeff, 0xfeff],
-  [0xe0000, 0xe007f],
-];
+export const INVISIBLE_CHARS_PATTERN = new RegExp("\\p{Default_Ignorable_Code_Point}", "gu");
 
-function codePointClassPart([from, to]: readonly [number, number]): string {
-  const hex = (cp: number) => `\\u{${cp.toString(16)}}`;
-  return from === to ? hex(from) : `${hex(from)}-${hex(to)}`;
-}
-
-/** Exported for reuse by `normalizeForQuoteMatch` (semanticValidation.ts). */
-export const INVISIBLE_CHARS_PATTERN = new RegExp(
-  `[${INVISIBLE_CHAR_RANGES.map(codePointClassPart).join("")}]`,
-  "gu",
-);
-
+/**
+ * Shared with `normalizeForQuoteMatch` (semanticValidation.ts), so a quote
+ * copied from escaped prompt text still matches the stored source.
+ */
 export function stripInvisibleChars(raw: string): string {
   return raw.replace(INVISIBLE_CHARS_PATTERN, "");
 }
@@ -108,8 +95,9 @@ function buildTolerantWordPattern(word: string): string {
  * One pattern for every reserved word (longest first, so no word can shadow a
  * longer one sharing its prefix):
  *
- *   <  \s*  /?  \s*  (word1|word2|...)  (?![letter/digit/_])  [^<>]*  >?
+ *   <  \s*  (/\s*)*  (word1|word2|...)  (?![letter/digit/_])  [^<>]*  >?
  *
+ * - `(/\s*)*` accepts any number of slashes (`<//resume_text>`), not just one.
  * - `(?![\p{L}\p{N}_])` keeps `<resume_textual>` and `<job_postings>` out.
  * - `[^<>]*` is the attribute / trailing-whitespace / self-closing-slash
  *   region (the §13.5.5 pattern's `(\s[^>]*)?\s*`). It also stops at the next
@@ -118,7 +106,7 @@ function buildTolerantWordPattern(word: string): string {
  * - `>?` makes the closing bracket optional (unterminated heads).
  */
 const RESERVED_TAG_PATTERN = new RegExp(
-  `<\\s*\\/?\\s*(?:${[...RESERVED_TAG_WORDS]
+  `<\\s*(?:\\/\\s*)*(?:${[...RESERVED_TAG_WORDS]
     .sort((a, b) => b.length - a.length)
     .map(buildTolerantWordPattern)
     .join("|")})(?![\\p{L}\\p{N}_])[^<>]*>?`,
@@ -130,11 +118,24 @@ const FULLWIDTH_GT = "＞";
 
 /**
  * Neutralizes every reserved delimiter tag inside untrusted text, in one
- * pass (see the module docstring). Idempotent: escaping already-escaped text
- * is a no-op.
+ * pass (see the module docstring).
+ *
+ * The text is NFKC-normalized first, then invisible characters are
+ * stripped, and only then matched. NFKC folds look-alikes a model would
+ * still read as our delimiters into ASCII, so they get neutralized like the
+ * real thing: mathematical alphanumerics (`</𝐫esume_text>`), full-width and
+ * small-form brackets (`＜/resume_text＞`, `﹤/resume_text﹥`), the Kelvin
+ * sign, the long s, and so on. The returned text is therefore NFKC, plus our
+ * full-width `＜ ＞` replacements. `normalizeForQuoteMatch` applies the same
+ * NFKC and invisible-character normalization to both sides, so quotes Claude
+ * copies from the prompt still match the stored source. Cross-script
+ * homoglyphs (e.g. Cyrillic `е`) are not folded by NFKC, which is accepted.
+ *
+ * Idempotent: escaping already-escaped text returns it unchanged. NFKC turns
+ * our `＜ ＞` back into `< >`, and the pattern immediately re-neutralizes them.
  */
 export function escapeUntrusted(raw: string): string {
-  return stripInvisibleChars(raw).replace(RESERVED_TAG_PATTERN, (match) => {
+  return stripInvisibleChars(raw.normalize("NFKC")).replace(RESERVED_TAG_PATTERN, (match) => {
     const head = FULLWIDTH_LT + match.slice(1);
     return head.endsWith(">") ? head.slice(0, -1) + FULLWIDTH_GT : head;
   });

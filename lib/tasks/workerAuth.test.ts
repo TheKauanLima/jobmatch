@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { checkWorkerAuth } from "@/lib/tasks/workerAuth";
+import { checkWorkerAuth, isNonProductionDeployment } from "@/lib/tasks/workerAuth";
 
 function req(headers: Record<string, string> = {}) {
   return new Request("http://localhost/api/worker/tick", { method: "POST", headers });
@@ -34,5 +34,18 @@ describe("checkWorkerAuth", () => {
 
   it("accepts the right secret", () => {
     expect(checkWorkerAuth(req({ authorization: `Bearer ${env.WORKER_SECRET}` }), env)).toEqual({ ok: true });
+  });
+});
+
+describe("isNonProductionDeployment", () => {
+  it("is true for Vercel preview/development deployments", () => {
+    expect(isNonProductionDeployment({ VERCEL_ENV: "preview" })).toBe(true);
+    expect(isNonProductionDeployment({ VERCEL_ENV: "development" })).toBe(true);
+  });
+
+  it("is false on production and when VERCEL_ENV is unset (local dev, tests)", () => {
+    expect(isNonProductionDeployment({ VERCEL_ENV: "production" })).toBe(false);
+    expect(isNonProductionDeployment({})).toBe(false);
+    expect(isNonProductionDeployment({ VERCEL_ENV: "  " })).toBe(false);
   });
 });

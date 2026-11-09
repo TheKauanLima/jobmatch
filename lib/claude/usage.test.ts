@@ -7,6 +7,7 @@ import {
   recordUsage,
   setUsageSink,
   summarizeUsage,
+  UNKNOWN_MODEL_PRICE,
   type UsageEvent,
 } from "@/lib/claude/usage";
 
@@ -39,10 +40,47 @@ describe("PRICES / lookupPrice (§13.17)", () => {
     expect(PRICES["claude-haiku-5-5"]).toEqual({ inputPerMTok: 0.1, outputPerMTok: 0.5 });
   });
 
-  it("prices dated snapshot ids like their alias, and returns null for unknown models", () => {
+  it("covers the refusal-fallback targets at their list prices", () => {
+    expect(PRICES["claude-opus-5"]).toEqual({ inputPerMTok: 5, outputPerMTok: 25 });
+    expect(PRICES["claude-sonnet-5"]).toEqual({ inputPerMTok: 2, outputPerMTok: 10 });
+    expect(PRICES["claude-opus-4-8"]).toEqual({ inputPerMTok: 5, outputPerMTok: 25 });
+  });
+
+  it("UNKNOWN_MODEL_PRICE is a ceiling: >= every list input price AND every list output price", () => {
+    for (const [model, price] of Object.entries(PRICES)) {
+      expect(UNKNOWN_MODEL_PRICE.inputPerMTok, model).toBeGreaterThanOrEqual(price.inputPerMTok);
+      expect(UNKNOWN_MODEL_PRICE.outputPerMTok, model).toBeGreaterThanOrEqual(price.outputPerMTok);
+    }
+    expect(UNKNOWN_MODEL_PRICE.inputPerMTok).toBeGreaterThanOrEqual(5);
+    expect(UNKNOWN_MODEL_PRICE.outputPerMTok).toBeGreaterThanOrEqual(25);
+  });
+
+  it("matches exact ids and dated snapshots of them", () => {
+    expect(lookupPrice("claude-opus-5-5")).toEqual(PRICES["claude-opus-5-5"]);
+    expect(lookupPrice("claude-opus-5")).toEqual(PRICES["claude-opus-5"]);
     expect(lookupPrice("claude-opus-5-5-20261101")).toEqual(PRICES["claude-opus-5-5"]);
-    expect(lookupPrice("claude-opus-5")).toBeNull();
-    expect(lookupPrice("some-other-model")).toBeNull();
+    expect(lookupPrice("claude-opus-5-20260115")).toEqual(PRICES["claude-opus-5"]);
+    expect(lookupPrice("claude-opus-4-8-20251201")).toEqual(PRICES["claude-opus-4-8"]);
+  });
+
+  it.each([
+    "claude-opus-5-6", // a future model must NOT price as claude-opus-5
+    "claude-opus-5-5-fast",
+    "claude-opus-5-2026",
+    "claude-opus-5-202611011",
+    "claude-sonnet-5-5-latest",
+    "claude-opus",
+    "some-other-model",
+    "toString", // no prototype lookups
+    "constructor",
+  ])("treats %j as unknown (null)", (model) => {
+    expect(lookupPrice(model)).toBeNull();
+  });
+
+  it("a near-miss model id is priced at the ceiling with priceKnown: false", () => {
+    expect(
+      costFromUsage("claude-opus-5-6", { input_tokens: 1_000_000, output_tokens: 1_000_000 }),
+    ).toEqual({ costUsd: 30, priceKnown: false });
   });
 });
 
@@ -125,10 +163,41 @@ describe("costFromUsage", () => {
     expect(costUsd).toBe(4);
   });
 
-  it("prices an unknown model at the most expensive known rate and flags it", () => {
+  it("prices an unknown model at the explicit ceiling ($5/$25) and flags it", () => {
     expect(
       costFromUsage("claude-future-9", { input_tokens: 1_000_000, output_tokens: 1_000_000 }),
-    ).toEqual({ costUsd: 24, priceKnown: false });
+    ).toEqual({ costUsd: 30, priceKnown: false });
+  });
+
+  it("prices a fallback hop served by claude-opus-4-8 at $5/$25", () => {
+    const { costUsd, priceKnown } = costFromUsage("claude-opus-4-8", {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      iterations: [
+        { type: "message", model: "claude-opus-5-5", input_tokens: 1_000_000, output_tokens: 0 },
+        {
+          type: "fallback_message",
+          model: "claude-opus-4-8",
+          input_tokens: 1_000_000,
+          output_tokens: 1_000_000,
+        },
+      ],
+    });
+    // declined Opus 5.5 hop: 1M in * $4; served Opus 4.8 hop: 1M in * $5 + 1M out * $25
+    expect(costUsd).toBe(4 + 5 + 25);
+    expect(priceKnown).toBe(true);
+  });
+
+  it("flags priceKnown: false if any hop's model is unknown", () => {
+    const { priceKnown } = costFromUsage("claude-opus-5-5", {
+      input_tokens: 0,
+      output_tokens: 0,
+      iterations: [
+        { type: "message", model: "claude-opus-5-5", input_tokens: 1, output_tokens: 0 },
+        { type: "fallback_message", model: "claude-mystery-1", input_tokens: 1, output_tokens: 1 },
+      ],
+    });
+    expect(priceKnown).toBe(false);
   });
 
   it("ignores null/negative/non-finite counts", () => {

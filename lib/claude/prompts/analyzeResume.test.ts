@@ -5,7 +5,12 @@ import {
   __resetClaudeClientForTests,
   __setClaudeClientForTests,
 } from "@/lib/claude/client";
-import { ClaudeInvalidOutputError, ClaudeRefusalError } from "@/lib/claude/errors";
+import {
+  ClaudeApiError,
+  ClaudeInvalidOutputError,
+  ClaudeRefusalError,
+  ClaudeTruncatedError,
+} from "@/lib/claude/errors";
 import { resumeAnalysisResultSchema } from "@/lib/claude/parse";
 import { UNTRUSTED_DATA_RULES } from "@/lib/claude/promptCommon";
 import {
@@ -157,6 +162,32 @@ describe("analyzeResume (run)", () => {
       ClaudeInvalidOutputError,
     );
     expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("a max_tokens stop makes exactly one API call (truncation is not retried)", async () => {
+    reply(validAnalysis, { stop_reason: "max_tokens" });
+    await expect(analyzeResume("resume", { userId: null })).rejects.toBeInstanceOf(
+      ClaudeTruncatedError,
+    );
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an expired deadline (ctx.signal) fails fast as ClaudeApiError without calling the API", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const err = await analyzeResume("resume", { userId: null, signal: controller.signal }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ClaudeApiError);
+    expect(err).toMatchObject({ code: "ai_unavailable" });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("forwards ctx.signal to the SDK request", async () => {
+    reply(validAnalysis);
+    const signal = new AbortController().signal;
+    await analyzeResume("resume", { userId: null, signal });
+    expect(create).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ signal }));
   });
 
   it("does not retry a refusal", async () => {

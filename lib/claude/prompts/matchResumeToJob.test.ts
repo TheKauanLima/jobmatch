@@ -5,7 +5,7 @@ import {
   __resetClaudeClientForTests,
   __setClaudeClientForTests,
 } from "@/lib/claude/client";
-import { ClaudeInvalidOutputError } from "@/lib/claude/errors";
+import { ClaudeInvalidOutputError, ClaudeTruncatedError } from "@/lib/claude/errors";
 import { matchResultSchema } from "@/lib/claude/parse";
 import { UNTRUSTED_DATA_RULES } from "@/lib/claude/promptCommon";
 import {
@@ -167,6 +167,34 @@ describe("matchResumeToJob (run)", () => {
       ClaudeInvalidOutputError,
     );
     expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("a max_tokens stop makes exactly one API call (truncation is not retried)", async () => {
+    create.mockReturnValueOnce({
+      withResponse: async () => ({
+        data: {
+          model: "claude-opus-5-5",
+          stop_reason: "max_tokens",
+          stop_details: null,
+          content: [{ type: "text", text: '{"score": 7' }],
+          usage: { input_tokens: 10, output_tokens: 16_000 },
+        },
+        request_id: "req_m",
+      }),
+    });
+    await expect(matchResumeToJob("r", "j", { userId: null })).rejects.toBeInstanceOf(
+      ClaudeTruncatedError,
+    );
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an expired deadline (ctx.signal) fails fast as ClaudeApiError without calling the API", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      matchResumeToJob("r", "j", { userId: null, signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "ClaudeApiError", code: "ai_unavailable" });
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("treats a non-integer score as invalid output (schema level)", async () => {

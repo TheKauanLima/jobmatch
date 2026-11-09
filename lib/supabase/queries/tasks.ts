@@ -36,6 +36,25 @@ export class TaskQueryError extends Error {
   }
 }
 
+/**
+ * Per-call options. `signal` aborts the underlying PostgREST request (the
+ * worker passes `AbortSignal.timeout(...)` so a hung call can't keep a tick
+ * alive until the platform's hard kill). An aborted call surfaces as a
+ * `TaskQueryError`. Note that the database may still have committed the
+ * statement; every caller tolerates that (leases expire and are reclaimed).
+ */
+export interface QueryOptions {
+  signal?: AbortSignal;
+}
+
+/** Attaches `signal` to a PostgREST builder when one is given. */
+function withSignal<B extends { abortSignal(signal: AbortSignal): B }>(
+  builder: B,
+  options: QueryOptions | undefined,
+): B {
+  return options?.signal ? builder.abortSignal(options.signal) : builder;
+}
+
 export interface EnqueueTaskRowArgs {
   kind: string;
   taskClass: BackgroundTaskClass;
@@ -85,16 +104,20 @@ export async function claimTasks(
     maxRunning: number;
     limit: number;
   },
+  options?: QueryOptions,
 ): Promise<BackgroundTaskRow[]> {
   if (args.kinds.length === 0 || args.limit <= 0) return [];
 
-  const { data, error } = await admin.rpc("claim_tasks", {
-    p_worker_id: args.workerId,
-    p_task_class: args.taskClass,
-    p_kinds: args.kinds,
-    p_max_running: args.maxRunning,
-    p_limit: args.limit,
-  });
+  const { data, error } = await withSignal(
+    admin.rpc("claim_tasks", {
+      p_worker_id: args.workerId,
+      p_task_class: args.taskClass,
+      p_kinds: args.kinds,
+      p_max_running: args.maxRunning,
+      p_limit: args.limit,
+    }),
+    options,
+  );
 
   if (error) throw new TaskQueryError("claim_tasks", error);
   return (data ?? []) as BackgroundTaskRow[];
@@ -106,12 +129,16 @@ export async function completeTask(
   id: string,
   workerId: string,
   result: Json | null,
+  options?: QueryOptions,
 ): Promise<boolean> {
-  const { data, error } = await admin.rpc("complete_task", {
-    p_id: id,
-    p_worker_id: workerId,
-    p_result: result,
-  });
+  const { data, error } = await withSignal(
+    admin.rpc("complete_task", {
+      p_id: id,
+      p_worker_id: workerId,
+      p_result: result,
+    }),
+    options,
+  );
   if (error) throw new TaskQueryError("complete_task", error);
   return data === true;
 }
@@ -127,15 +154,19 @@ export async function failTask(
     retryable: boolean;
     retryDelaySeconds: number;
   },
+  options?: QueryOptions,
 ): Promise<"queued" | "dead" | null> {
-  const { data, error } = await admin.rpc("fail_task", {
-    p_id: args.id,
-    p_worker_id: args.workerId,
-    p_error_code: args.errorCode,
-    p_error_message: args.errorMessage,
-    p_retryable: args.retryable,
-    p_retry_delay_seconds: args.retryDelaySeconds,
-  });
+  const { data, error } = await withSignal(
+    admin.rpc("fail_task", {
+      p_id: args.id,
+      p_worker_id: args.workerId,
+      p_error_code: args.errorCode,
+      p_error_message: args.errorMessage,
+      p_retryable: args.retryable,
+      p_retry_delay_seconds: args.retryDelaySeconds,
+    }),
+    options,
+  );
   if (error) throw new TaskQueryError("fail_task", error);
   return data === "queued" || data === "dead" ? data : null;
 }
@@ -144,15 +175,51 @@ export async function failTask(
 export async function snoozeTask(
   admin: AdminClient,
   args: { id: string; workerId: string; seconds: number; reason: string },
+  options?: QueryOptions,
 ): Promise<boolean> {
-  const { data, error } = await admin.rpc("snooze_task", {
-    p_id: args.id,
-    p_worker_id: args.workerId,
-    p_seconds: args.seconds,
-    p_reason: args.reason,
-  });
+  const { data, error } = await withSignal(
+    admin.rpc("snooze_task", {
+      p_id: args.id,
+      p_worker_id: args.workerId,
+      p_seconds: args.seconds,
+      p_reason: args.reason,
+    }),
+    options,
+  );
   if (error) throw new TaskQueryError("snooze_task", error);
   return data === true;
+}
+
+/**
+ * Global-budget deferral (§13.9.4): moves claimable queued tasks of `kinds`
+ * to `until` + random jitter WITHOUT claiming them (no attempt consumed,
+ * started_at / last_error_code untouched). Returns the deferred rows.
+ */
+export async function deferQueuedTasks(
+  admin: AdminClient,
+  args: {
+    taskClass: BackgroundTaskClass;
+    kinds: string[];
+    until: Date;
+    maxJitterSeconds: number;
+    limit: number;
+  },
+  options?: QueryOptions,
+): Promise<BackgroundTaskRow[]> {
+  if (args.kinds.length === 0 || args.limit <= 0) return [];
+
+  const { data, error } = await withSignal(
+    admin.rpc("defer_queued_tasks", {
+      p_task_class: args.taskClass,
+      p_kinds: args.kinds,
+      p_until: args.until.toISOString(),
+      p_max_jitter_seconds: args.maxJitterSeconds,
+      p_limit: args.limit,
+    }),
+    options,
+  );
+  if (error) throw new TaskQueryError("defer_queued_tasks", error);
+  return (data ?? []) as BackgroundTaskRow[];
 }
 
 /** false = fenced out. */
@@ -196,20 +263,100 @@ export async function cancelTasksForUser(
 export async function hasClaimableTasks(
   admin: AdminClient,
   args: { taskClass: BackgroundTaskClass; kinds: string[]; now: Date },
+  options?: QueryOptions,
 ): Promise<boolean> {
   if (args.kinds.length === 0) return false;
 
-  const { data, error } = await admin
-    .from("background_tasks")
-    .select("id")
-    .eq("status", "queued")
-    .eq("task_class", args.taskClass)
-    .in("kind", args.kinds)
-    .lte("run_after", args.now.toISOString())
-    .limit(1);
+  const { data, error } = await withSignal(
+    admin
+      .from("background_tasks")
+      .select("id")
+      .eq("status", "queued")
+      .eq("task_class", args.taskClass)
+      .in("kind", args.kinds)
+      .lte("run_after", args.now.toISOString())
+      .limit(1),
+    options,
+  );
 
   if (error) throw new TaskQueryError("has_claimable_tasks", error);
   return (data ?? []).length > 0;
+}
+
+/**
+ * Dead-task hook outbox (§13.4.5): locks up to `limit` pending onDead hooks
+ * of `kinds` for 120 s (incrementing `on_dead_attempts`). With `taskId`,
+ * only that task is considered (the worker's fast path).
+ */
+export async function claimDeadTaskHooks(
+  admin: AdminClient,
+  args: { workerId: string; kinds: string[]; limit: number; taskId?: string | null },
+  options?: QueryOptions,
+): Promise<BackgroundTaskRow[]> {
+  if (args.kinds.length === 0 || args.limit <= 0) return [];
+  const { data, error } = await withSignal(
+    admin.rpc("claim_dead_task_hooks", {
+      p_worker_id: args.workerId,
+      p_kinds: args.kinds,
+      p_limit: args.limit,
+      p_task_id: args.taskId ?? null,
+    }),
+    options,
+  );
+  if (error) throw new TaskQueryError("claim_dead_task_hooks", error);
+  return (data ?? []) as BackgroundTaskRow[];
+}
+
+/** Marks a hook handled. false = fenced out or already handled. */
+export async function completeDeadTaskHook(
+  admin: AdminClient,
+  args: { id: string; workerId: string; gaveUp: boolean },
+  options?: QueryOptions,
+): Promise<boolean> {
+  const { data, error } = await withSignal(
+    admin.rpc("complete_dead_task_hook", {
+      p_id: args.id,
+      p_worker_id: args.workerId,
+      p_gave_up: args.gaveUp,
+    }),
+    options,
+  );
+  if (error) throw new TaskQueryError("complete_dead_task_hook", error);
+  return data === true;
+}
+
+/**
+ * Releases a claimed-but-unrun hook (clears the lock, refunds the attempt).
+ * false = fenced out or already handled.
+ */
+export async function releaseDeadTaskHook(
+  admin: AdminClient,
+  args: { id: string; workerId: string },
+  options?: QueryOptions,
+): Promise<boolean> {
+  const { data, error } = await withSignal(
+    admin.rpc("release_dead_task_hook", {
+      p_id: args.id,
+      p_worker_id: args.workerId,
+    }),
+    options,
+  );
+  if (error) throw new TaskQueryError("release_dead_task_hook", error);
+  return data === true;
+}
+
+/**
+ * Dead tasks whose onDead hook hasn't been handled (status route's
+ * `dead_hooks_pending`). A HEAD count, so it isn't capped by max_rows.
+ */
+export async function countPendingDeadHooks(admin: AdminClient): Promise<number> {
+  const { count, error } = await admin
+    .from("background_tasks")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "dead")
+    .is("on_dead_handled_at", null);
+  if (error) throw new TaskQueryError("count_pending_dead_hooks", error);
+  return count ?? 0;
 }
 
 export type TaskCounts = Record<string, Partial<Record<BackgroundTaskStatus, number>>>;

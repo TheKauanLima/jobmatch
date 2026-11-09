@@ -50,13 +50,20 @@ export type TaskHandlerResult =
   | { outcome: "succeeded"; result?: Json }
   | { outcome: "snooze"; seconds: number; reason: string };
 
-/** Passed to `onDead` after `fail_task` returned `dead`. */
+/**
+ * Passed to `onDead`, delivered through the dead-task hook outbox
+ * (§13.4.5), whichever path killed the task (`fail_task`, `claim_tasks`
+ * lease_expired, the stale-lease sweep).
+ */
 export interface DeadTaskContext<P> {
   task: BackgroundTaskRow;
-  /** null when the payload itself failed validation (`unknown_payload`). */
+  /** null when the payload fails `payloadSchema` (e.g. `unknown_payload`). */
   payload: P | null;
   admin: AdminClient;
+  /** `task.last_error_code` (e.g. `lease_expired`, `ai_refused`). */
   errorCode: string;
+  /** Fires at the per-hook timeout; pass it to any database call. */
+  signal: AbortSignal;
   log: TaskLogger;
 }
 
@@ -87,9 +94,21 @@ export interface TaskDefinition<S extends z.ZodType = z.ZodType> {
   payloadSchema: S;
   handler: (ctx: TaskContext<z.output<S>>) => Promise<TaskHandlerResult>;
   /**
-   * Called once when the task ends `dead`, in the same worker path that
-   * called `fail_task` (§13.4.5): set the root row (report stage, match,
-   * import) to `failed` with a user-safe error code. Must be idempotent.
+   * Runs when the task is `dead`, to set the root row (report stage, match,
+   * import) to `failed` with a user-safe error code and apply the §13.10.4
+   * refund (§13.4.5).
+   *
+   * HOOK CONTRACT (binding):
+   * - Delivered AT LEAST ONCE via the outbox (claim_dead_task_hooks), so it
+   *   may run more than once and must be idempotent.
+   * - Conditional writes only: mark a stage/root row `failed` only if it
+   *   isn't already terminal; refund with `... set refunded_at = now()
+   *   where ref_id = ... and refunded_at is null`; never insert
+   *   unconditionally.
+   * - Must finish well inside the 20 s hook budget: no AI calls and no
+   *   external HTTP. Database writes only, filtered by `task.user_id`.
+   * - Throwing leaves the hook pending; it is retried on a later tick and
+   *   given up (with an alert) after 10 attempts.
    */
   onDead?: (ctx: DeadTaskContext<z.output<S>>) => Promise<void>;
   /**

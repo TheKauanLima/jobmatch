@@ -466,6 +466,13 @@ describe("callStructured — SDK error classification (no usage recorded: nothin
     await expect(callStructured(baseArgs())).rejects.toMatchObject({ retryable: true });
   });
 
+  it("408 -> retryable ai_unavailable (not a bad request)", async () => {
+    rejectWith(apiError(408));
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(ClaudeBadRequestError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, status: 408 });
+  });
+
   it("an SDK-side refusal to send (e.g. the non-streaming guard) -> ClaudeBadRequestError", async () => {
     rejectWith(new Anthropic.AnthropicError("Streaming is required for operations that may take longer than 10 minutes."));
     await expect(callStructured(baseArgs())).rejects.toBeInstanceOf(ClaudeBadRequestError);
@@ -497,6 +504,81 @@ describe("callStructured — SDK error classification (no usage recorded: nothin
   it("classifySdkError passes Claude errors through unchanged", () => {
     const original = new ClaudeTruncatedError("x");
     expect(classifySdkError(original, "analyzeResume")).toBe(original);
+  });
+});
+
+describe("callStructured — caller deadline (ctx.signal) is hard", () => {
+  it("does not call the API at all when the signal has already fired", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const err = await callStructured({ ...baseArgs(), signal: controller.signal }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ClaudeApiError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true });
+    expect(create).not.toHaveBeenCalled();
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  it("rejects as soon as the signal fires, even if the SDK promise never settles (e.g. its un-abortable Retry-After sleep)", async () => {
+    let observed = false;
+    const never = new Promise<never>(() => {});
+    create.mockReturnValueOnce({
+      withResponse: () => {
+        observed = true;
+        return never;
+      },
+    });
+    const started = Date.now();
+    const err = await callStructured({ ...baseArgs(), signal: AbortSignal.timeout(30) }).catch(
+      (e: unknown) => e,
+    );
+    expect(observed).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(err).toBeInstanceOf(ClaudeApiError);
+    expect(err).not.toBeInstanceOf(ClaudeInvalidOutputError);
+    expect((err as Error).message).toContain("aborted");
+  });
+
+  it("a late SDK rejection after the deadline does not become an unhandled rejection", async () => {
+    let rejectLate: (e: unknown) => void = () => {};
+    const late = new Promise<never>((_r, rej) => {
+      rejectLate = rej;
+    });
+    create.mockReturnValueOnce({ withResponse: () => late });
+    const controller = new AbortController();
+    const pending = callStructured({ ...baseArgs(), signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toBeInstanceOf(ClaudeApiError);
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    rejectLate(new Anthropic.APIUserAbortError());
+    await new Promise((r) => setTimeout(r, 10));
+    process.off("unhandledRejection", unhandled);
+    expect(unhandled).not.toHaveBeenCalled();
+  });
+
+  it("an abort is never retried by retryOnceOnInvalidOutput", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      retryOnceOnInvalidOutput(() => callStructured({ ...baseArgs(), signal: controller.signal })),
+    ).rejects.toMatchObject({ code: "ai_unavailable" });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("a deadline that fires during the first attempt stops before the invalid-output retry", async () => {
+    const controller = new AbortController();
+    respondWith(message({ content: [] })); // invalid output -> would normally retry once
+    setUsageSink((e) => {
+      usageEvents.push(e);
+      controller.abort(); // the deadline passes right after the billed response lands
+    });
+    await expect(
+      retryOnceOnInvalidOutput(() => callStructured({ ...baseArgs(), signal: controller.signal })),
+    ).rejects.toMatchObject({ code: "ai_unavailable" });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(usageEvents).toHaveLength(1); // the billed first attempt is still recorded
   });
 });
 

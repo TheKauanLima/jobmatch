@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { after, NextResponse } from "next/server";
 
+import "@/lib/tasks/registerUsageSink";
 import { safeErrorName } from "@/lib/tasks/errors";
 import { runWorkerTick } from "@/lib/tasks/worker";
-import { checkWorkerAuth } from "@/lib/tasks/workerAuth";
+import { checkWorkerAuth, isNonProductionDeployment } from "@/lib/tasks/workerAuth";
 
 /**
  * POST /api/worker/tick — drains the background task queue
@@ -22,7 +23,9 @@ import { checkWorkerAuth } from "@/lib/tasks/workerAuth";
  *
  * Runs on production only: `WORKER_SECRET` must be set on Vercel's
  * Production environment only, never Preview (§13.4.2, §13.18), because
- * previews share the production database.
+ * previews share the production database. Enforced in code as well: when
+ * `VERCEL_ENV` is set and isn't `production`, the route answers 403 before
+ * looking at the secret and never schedules `after()`.
  */
 
 export const maxDuration = 300;
@@ -30,6 +33,16 @@ export const maxDuration = 300;
 export async function POST(request: Request) {
   // The invocation's clock starts with the request, not with `after()`.
   const startedAt = Date.now();
+
+  if (isNonProductionDeployment()) {
+    console.error(
+      `POST /api/worker/tick: refusing to run on a non-production deployment (VERCEL_ENV=${process.env.VERCEL_ENV}); the worker runs on production only.`,
+    );
+    return NextResponse.json(
+      { error: "The worker runs on production only." },
+      { status: 403 },
+    );
+  }
 
   const auth = checkWorkerAuth(request);
   if (!auth.ok) {

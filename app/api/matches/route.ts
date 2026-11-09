@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import "@/lib/tasks/registerUsageSink";
 import { requireSession, UnauthorizedError } from "@/lib/auth/session";
 import { createClient } from "@/lib/supabase/server";
 import { getResumeById } from "@/lib/supabase/queries/resumes";
@@ -16,8 +17,17 @@ import {
 import { DAILY_RATE_LIMITS, checkRateLimit } from "@/lib/claude/rateLimit";
 import { matchResumeToJob } from "@/lib/claude/prompts/matchResumeToJob";
 import { ClaudeApiError } from "@/lib/claude/errors";
+import { SYNC_ROUTE_CLAUDE_DEADLINE_MS } from "@/lib/claude/config";
 import { matchCreateSchema } from "@/lib/validation/schemas";
 import { toMatch, toRecentMatch } from "@/types/domain";
+
+/**
+ * Must exceed `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s), so POST's deadline
+ * always fires first and the client gets the route's JSON 502, never a
+ * platform 504. Matches app/api/worker/tick/route.ts. (GET is unaffected
+ * in practice; it finishes in milliseconds.)
+ */
+export const maxDuration = 300;
 
 /**
  * GET /api/matches — two modes, both fully scoped to the caller (`user.id`
@@ -145,6 +155,10 @@ export async function GET(request: Request) {
  * error messages, per the no-PII-in-logs rule (see CLAUDE.md).
  */
 export async function POST(request: Request) {
+  // Started first, so time spent before Claude counts against it too (see
+  // `maxDuration` above). Bounds the whole Claude step, retries included.
+  const claudeDeadline = AbortSignal.timeout(SYNC_ROUTE_CLAUDE_DEADLINE_MS);
+
   let user;
   try {
     ({ user } = await requireSession());
@@ -262,7 +276,7 @@ export async function POST(request: Request) {
     const outcome = await matchResumeToJob(
       resume.extracted_text,
       jobDescription.description,
-      { userId: user.id },
+      { userId: user.id, signal: claudeDeadline },
     );
 
     match = await createMatch(supabase, {

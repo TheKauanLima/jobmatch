@@ -27,7 +27,18 @@ import type { AiUsageProvider } from "@/types/database";
  *   reconciliation.
  * - Uses the service-role client (the table is server-only). This module
  *   is inside the §13.14 service-role boundary (`lib/tasks/**`).
+ *
+ * UNRECORDED SPEND ESCAPES THE BUDGET (§13.9.4): the global daily AI budget
+ * is computed from `ai_usage_events`, so any event this sink fails to write
+ * (insert error, timeout, unstorable event) is real, billed spend the guard
+ * cannot see. Every such failure is logged with the stable, alertable prefix
+ * `USAGE_SINK_ALERT_PREFIX` ("[ALERT][usageSink] failed to record ...") and
+ * no PII (provider, operation, request id, error class/code only). Alert on
+ * that prefix and reconcile against the provider console when it fires.
  */
+
+/** Stable prefix for log-based alerting on lost usage events. */
+export const USAGE_SINK_ALERT_PREFIX = "[ALERT][usageSink] failed to record";
 
 export interface AiUsageEvent {
   provider: AiUsageProvider;
@@ -129,10 +140,27 @@ export function toUsageRow(
   };
 }
 
+/**
+ * Upper bound on how long a caller waits for the insert. The Claude layer
+ * awaits the sink inline (so failed-but-billed calls are counted before the
+ * result is inspected), which means a hung database connection would
+ * otherwise stall the user's request. On timeout the insert is left to
+ * finish (or fail) in the background and a warning is logged.
+ */
+export const USAGE_SINK_TIMEOUT_MS = 5_000;
+
+export class UsageSinkTimeoutError extends Error {
+  constructor() {
+    super("usage insert timed out");
+    this.name = "UsageSinkTimeoutError";
+  }
+}
+
 export function createDatabaseUsageSink(
-  options: { getAdmin?: () => AdminClient } = {},
+  options: { getAdmin?: () => AdminClient; timeoutMs?: number } = {},
 ): (event: AiUsageEvent) => Promise<void> {
   const getAdmin = options.getAdmin ?? createAdminClient;
+  const timeoutMs = options.timeoutMs ?? USAGE_SINK_TIMEOUT_MS;
   let admin: AdminClient | null = null;
 
   return async (event) => {
@@ -145,18 +173,48 @@ export function createDatabaseUsageSink(
     try {
       const mapped = toUsageRow(event);
       if (mapped.row === null) {
-        console.error(`[usageSink] usage event not recorded (${mapped.reason})`, JSON.stringify(logFields));
+        console.error(`${USAGE_SINK_ALERT_PREFIX} usage event: not storable (${mapped.reason})`, JSON.stringify(logFields));
         return;
       }
       for (const warning of mapped.warnings) {
-        console.warn(`[usageSink] ${warning}`, JSON.stringify(logFields));
+        if (warning.startsWith("invalid cost")) {
+          // Stored as 0: the call's real cost is invisible to the budget.
+          console.error(`${USAGE_SINK_ALERT_PREFIX} usage cost (${warning})`, JSON.stringify(logFields));
+        } else {
+          console.warn(`[usageSink] ${warning}`, JSON.stringify(logFields));
+        }
       }
 
       admin ??= getAdmin();
-      await insertAiUsageEvent(admin, mapped.row);
+      let timedOut = false;
+      const insert = insertAiUsageEvent(admin, mapped.row);
+      // If we stop waiting, a late failure must still be handled (an
+      // unhandled rejection can take down the Node process) and logged.
+      insert.catch((err: unknown) => {
+        if (timedOut) {
+          console.error(
+            `${USAGE_SINK_ALERT_PREFIX} usage event: usage insert failed after timing out`,
+            JSON.stringify({ ...logFields, error: err instanceof Error ? err.name : "unknown" }),
+          );
+        }
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new UsageSinkTimeoutError());
+        }, timeoutMs);
+      });
+      try {
+        await Promise.race([insert, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
       console.error(
-        "[usageSink] failed to record usage event",
+        // On UsageSinkTimeoutError the insert may still land later; it is
+        // alerted anyway because, until then, the budget can't see it.
+        `${USAGE_SINK_ALERT_PREFIX} usage event`,
         JSON.stringify({
           ...logFields,
           error: err instanceof Error ? err.name : "unknown",

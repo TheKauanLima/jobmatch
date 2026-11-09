@@ -38,6 +38,19 @@ describe("resolveWorkerTickUrl", () => {
 describe("kickWorker", () => {
   const env = { WORKER_SECRET: "s3cret", APP_BASE_URL: "https://kalify.app" };
 
+  it("is a logged no-op on a non-production Vercel deployment, even with a secret", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const fetchImpl = vi.fn();
+    expect(await kickWorker({ env: { ...env, VERCEL_ENV: "preview" }, fetchImpl })).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(info.mock.calls.flat().join(" ")).toContain("non-production");
+  });
+
+  it("kicks on production (VERCEL_ENV=production)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+    expect(await kickWorker({ env: { ...env, VERCEL_ENV: "production" }, fetchImpl })).toBe(true);
+  });
+
   it("does nothing without WORKER_SECRET (preview/local)", async () => {
     const fetchImpl = vi.fn();
     expect(await kickWorker({ env: { APP_BASE_URL: "https://kalify.app" }, fetchImpl })).toBe(false);

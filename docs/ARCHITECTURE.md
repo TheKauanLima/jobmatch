@@ -2149,6 +2149,7 @@ stopgap that ended once the live project existed.
 | `last_error_code` | text null | machine code (§13.4.5) |
 | `last_error_message` | text null | ≤ 500 chars, sanitized, **no PII** |
 | `result` | jsonb null | small summary (counts, ids) |
+| `on_dead_handled_at`, `on_dead_attempts`, `on_dead_locked_by`, `on_dead_locked_until` | timestamptz null / int not null default 0 / text null / timestamptz null | dead-task hook outbox (§13.4.5) |
 | `created_at`, `updated_at` | timestamptz | |
 
 Indexes:
@@ -2158,6 +2159,33 @@ Indexes:
 - `(task_class, priority desc, run_after) where status = 'queued'`
 - `(locked_until) where status = 'running'`
 - `(correlation_id)`, `(user_id)`, `(finished_at) where status in ('succeeded','dead','cancelled')`
+- `background_tasks_parent_task_id_idx (parent_task_id)`: supports the `on delete set
+  null` FK.
+- `background_tasks_on_dead_pending_idx (finished_at) where status = 'dead' and
+  on_dead_handled_at is null`, used by the dead-task hook sweep (§13.4.5).
+
+**Advisory locks** use the **two-key form** `pg_advisory_xact_lock(<namespace int4>,
+<key int4>)`. The namespace constants are distinct for claiming and for rate limits:
+- claim: `(NS_CLAIM, hashtext(p_task_class))`
+- rate limit: `(NS_RATE_LIMIT, hashtext(p_user_id::text || ':' || p_kind))`
+
+That way a claim lock can never collide with a rate-limit lock. The constants are
+declared once in 0007, and future lock users must add their own namespace there. This
+replaces the single-key `hashtext('kalify.claim.' || …)` sketch below.
+
+**Default privileges, and what they don't cover.** 0007 runs `alter default privileges
+in schema private revoke all … from public, anon, authenticated;`.
+- **Tables and sequences:** this closes future ones in `private` by default.
+- **Functions:** it does **not** close them. Postgres grants `EXECUTE` to `PUBLIC` on
+  every new function through a *global* default, and a schema-scoped `alter default
+  privileges` cannot remove that.
+- `anon`/`authenticated` are additionally blocked from `private` objects because they
+  have no `USAGE` on the schema, and PostgREST doesn't expose it.
+- **The real control is an explicit `revoke execute on function … from public, anon,
+  authenticated;`** (plus a `grant … to service_role` or `authenticated` only where
+  intended) on **every** function, in `public` and `private` alike. This is mandatory
+  for each new function and is checked by the reviewer (§13.15 item 2) and by pgTAP
+  (§13.16).
 
 Functions (all service_role only):
 - `enqueue_task(p_kind, p_task_class, p_payload, p_user_id, p_dedupe_key, p_priority,
@@ -2182,14 +2210,63 @@ Functions (all service_role only):
   p_retry_delay_seconds) returns text`. If retryable and `attempts < max_attempts`:
   `status='queued'`, `run_after = now() + delay`, lock cleared. Otherwise `status='dead'`.
   Returns the new status.
-- `snooze_task(p_id, p_worker_id, p_seconds, p_reason)`: re-queues **without** using an
-  attempt (`attempts = attempts - 1`). Used for "batch not ready yet" and "budget
-  exhausted".
+- `snooze_task(p_id, p_worker_id, p_seconds, p_reason) returns boolean`: re-queues a
+  **running** task without using an attempt (`attempts = greatest(attempts - 1, 0)`).
+  - Fenced, and keeps `started_at`.
+  - It **preserves an existing `last_error_code`**, writing `p_reason` (or `'snoozed'`)
+    only when the code is empty. That keeps the "`ai_invalid_output`: one more try,
+    then dead" rule working across a snooze. `last_error_message` is left untouched.
+  - Used for genuine snoozes (e.g. "batch not ready yet") and for a running handler
+    that throws `TaskError('budget_exhausted')`. **Not** used for the global-budget
+    deferral; see `defer_queued_tasks`.
+  - The worker's `safeSnooze` retries the call once on error. If both attempts fail,
+    lease expiry recovers the task, at the cost of one attempt.
+- `defer_queued_tasks(p_task_class text, p_kinds text[], p_until timestamptz,
+  p_max_jitter_seconds int default 900, p_limit int default 200) returns setof
+  background_tasks`: the global AI budget deferral (§13.9.4).
+  - Moves up to `p_limit` **claimable queued** tasks (`status='queued' and run_after <=
+    now()`) of `p_kinds` in the class to `greatest(p_until, now())` plus a per-row
+    random 0..`p_max_jitter_seconds`. Selection is `for update skip locked`, ordered by
+    priority then `run_after`.
+  - **It never claims.** `attempts`, `started_at`, locks and `last_error_code` are
+    untouched.
+  - Returns the deferred rows so the worker can run `onBudgetDelayed`.
 - `extend_task_lease(p_id, p_worker_id, p_seconds) returns boolean`: heartbeat for
   long tasks.
 - `cancel_tasks_for_user(p_user_id)`: sets queued tasks to `cancelled` (account deletion).
-- `purge_finished_tasks()`: deletes `succeeded`/`cancelled` older than 14 days and
-  `dead` older than 30 days.
+- `purge_finished_tasks()`: deletes `succeeded`/`cancelled` older than 14 days, and
+  `dead` older than 30 days **only when `on_dead_handled_at is not null`** (§13.4.5).
+- **Stale-lease housekeeping**, `dead_letter_stale_tasks(p_older_than interval default
+  interval '6 hours') returns int` (0007; scheduled in 0008):
+  - Dead-letters **any** `running` task whose `locked_until` is more than **6 hours**
+    in the past, **regardless of kind or attempts**.
+  - It keeps code **`lease_expired`** (orchestrator decision) but uses a **distinct
+    `last_error_message`**, "Lease expired long ago and no deployment reclaimed it
+    (stale-lease sweep; kind may be unregistered).", so these can be told apart from
+    final-attempt expiries in `claim_tasks`.
+  - It raises `validation_older_than_too_small` for a threshold that is null or
+    **under 10 minutes**, which guards against dead-lettering live work.
+  - Why: `claim_tasks` only reclaims or dead-letters kinds a live worker asks for. A
+    kind that was removed or renamed would otherwise sit in `running` forever and
+    block its `dedupe_key` (the live-key unique index).
+  - Rows dead-lettered this way enter the hook outbox like any other dead task.
+  - Runs from the housekeeping cron (§13.3.2).
+- `claim_dead_task_hooks(p_worker_id, p_kinds, p_limit, p_task_id default null)` and
+  `complete_dead_task_hook(p_id, p_worker_id, p_gave_up default false)`: the dead-task
+  hook outbox (§13.4.5). `release_dead_task_hook(p_id uuid, p_worker_id text)
+  returns boolean` gives back a claimed-but-unrun hook without using an attempt.
+  - Fenced on `on_dead_locked_by = p_worker_id and status = 'dead' and
+    on_dead_handled_at is null`.
+  - Clears the hook lock and sets `on_dead_attempts = greatest(on_dead_attempts - 1, 0)`.
+  - Returns false when fenced out or already handled.
+  - service_role only (§13.4.5).
+- `ai_spend_summary(p_since timestamptz)` returns `(provider, operation, cost_usd,
+  calls)` grouped in SQL. `background_task_counts()` returns `(kind, status, n)`.
+  - **These exist because summing client-side would undercount:** PostgREST caps
+    responses at 1,000 rows, so a JS sum over `ai_usage_events` would silently
+    undercount once a day has more than 1,000 calls. That is a budget bypass.
+  - The worker's budget check and `GET /api/worker/status` must use these functions,
+    never a raw select.
 
 **`ai_usage_events`**: server-only. One row per external AI API call actually made,
 including calls that fail after tokens were billed.
@@ -2210,7 +2287,8 @@ including calls that fail after tokens were billed.
 | `request_id` | text null | provider request id, for support tickets |
 | `created_at` | timestamptz | |
 
-Indexes: `(created_at)`, `(user_id, created_at)`.
+Indexes: `(created_at)`, `(user_id, created_at)`, `ai_usage_events_task_id_idx
+(task_id)` (supports the `on delete set null` FK).
 
 **`rate_limit_events`**: owner-select only. Inserted only by security-definer RPCs.
 
@@ -2233,10 +2311,12 @@ job_listing_create 20, job_listing_update 40, account_reauth 10`.
 RPCs enforce them, and a limit passed in as an argument could be forged by a direct
 PostgREST call. `lib/rateLimit.ts` reads them through `get_my_rate_limits()`
 (security definer, returns `{kind, daily_limit, used_today, resets_at}` for
-`auth.uid()`) for UI display.
+`auth.uid()`) for UI display. It **raises `unauthenticated` with SQLSTATE `42501`** when
+`auth.uid()` is null, rather than returning an empty set.
 
 **`private.consume_rate_limit(p_user_id, p_kind, p_ref_id) returns boolean`**: takes
-`pg_advisory_xact_lock(hashtext(p_user_id::text || p_kind))`, counts today's (UTC)
+the two-key rate-limit advisory lock `(NS_RATE_LIMIT, hashtext(p_user_id::text || ':'
+|| p_kind))`, counts today's (UTC)
 non-refunded rows, and inserts one when under the limit. It returns false at the
 limit. Callers turn false into SQLSTATE `P0001` with message `rate_limited:<kind>`,
 which the route maps to `429`. Execute is revoked from `public, anon,
@@ -2262,7 +2342,20 @@ reach it through the security-definer RPCs.
   Full contract in §13.13.7.
 
 #### 13.3.2 Worker schedule (0008)
-- `create extension if not exists pg_cron; create extension if not exists pg_net;`
+- `create extension if not exists pg_cron with schema pg_catalog;` (its objects live in
+  `cron`) and `create extension if not exists pg_net with schema extensions;` (objects
+  in `net`). These are the schemas Supabase's install docs use. Also `grant usage on
+  schema cron to postgres` plus table privileges, so the job owner can maintain
+  `cron.job_run_details`.
+- **`private.invoke_worker_tick() returns bigint`** is the pg_cron target:
+  - `security invoker`, `search_path=''`, run as the cron job owner.
+  - Execute is revoked from `public, anon, authenticated`, and there is **no
+    `service_role` grant**: nothing but pg_cron needs to call it, and the service-role
+    key must not be able to trigger outbound requests carrying the worker secret.
+  - Fails closed with a warning and a skip when either secret is missing or blank,
+    and when the URL isn't `https://` (`http://` is allowed only for
+    localhost/127.0.0.1/host.docker.internal, for local stacks).
+  - Never logs the secret. Returns the pg_net request id, or null when it skips.
 - Vault secrets (created **manually** per environment, never committed):
   `kalify_worker_url` (e.g. `https://<prod-domain>/api/worker/tick`) and
   `kalify_worker_secret` (same value as the Vercel env var `WORKER_SECRET`).
@@ -2270,8 +2363,9 @@ reach it through the security-definer RPCs.
 
 | name | schedule | command |
 |---|---|---|
-| `kalify-worker-tick` | `* * * * *` | `net.http_post(url, headers {Authorization: Bearer <secret>, Content-Type}, body '{"trigger":"cron"}', timeout_milliseconds 5000)`, with url/secret read from `vault.decrypted_secrets` |
+| `kalify-worker-tick` | `* * * * *` | `select private.invoke_worker_tick()`, i.e. `net.http_post(url, headers {Authorization: Bearer <secret>, Content-Type}, body '{"trigger":"cron"}', timeout_milliseconds 5000)` with url/secret read from `vault.decrypted_secrets` |
 | `kalify-purge-tasks` | `15 4 * * *` | `select public.purge_finished_tasks()` |
+| `kalify-stale-leases` | `5 * * * *` | `select public.dead_letter_stale_tasks()` (§13.3.1) |
 | `kalify-cron-history` | `30 4 * * *` | `delete from cron.job_run_details where end_time < now() - interval '7 days'` |
 
 If either Vault secret is missing, the tick command runs `raise warning` and skips
@@ -2826,11 +2920,35 @@ a second.
   project). Preview builds must not set `WORKER_SECRET`/`APP_BASE_URL` to production
   values that would let preview code run as the production worker. The worker runs
   only on production. Recorded as an operational rule; see §13.18.
+  **Enforced in code (0007/0008 fix pass):** the tick route and `kickWorker()` refuse
+  to run when `VERCEL_ENV` is set and is not `'production'`:
+  - the tick route returns `403` without running anything;
+  - the kick is a logged no-op.
+
+  An unset `VERCEL_ENV` (local dev, tests) is allowed. So a misconfigured preview
+  can't drain the shared queue with preview code.
+- **Admin-client calls in the worker have request timeouts** (the queries/tasks
+  wrappers pass an abort signal per call). A hung PostgREST connection fails that call
+  and lets lease expiry recover the task; it can't stall the tick until the platform
+  kills it.
 
 #### 13.4.3 Task registry (`lib/tasks/registry.ts`)
-Each kind declares `{ class, priority, maxAttempts, leaseSeconds, maxDurationMs,
-payloadSchema (zod), handler }`. `leaseSeconds × 1000` must exceed `maxDurationMs` by
-at least 30s. A unit test asserts this for every kind.
+Each kind declares a `TaskDefinition` (`lib/tasks/types.ts`):
+`{ class, priority, maxAttempts, leaseSeconds, maxDurationMs, usesAi, payloadSchema
+(zod), handler, onDead?, onBudgetDelayed? }`. `leaseSeconds × 1000` must exceed
+`maxDurationMs` by at least 30s. A unit test asserts this for every kind.
+- **`usesAi: boolean`**: true when the handler calls a paid AI API (Claude or Voyage).
+  These kinds are gated by the global budget (§13.9.4). From the table below, these
+  are the kinds whose external calls include Claude or Voyage.
+- **`onDead?(ctx: DeadTaskContext)`**: `ctx` is `{ task, payload | null, admin,
+  errorCode, signal, log }`, where `signal` fires after the 15 s per-hook timeout,
+  §13.4.5. It is delivered at least once through the dead-task hook outbox
+  (§13.4.5), whatever path killed the task. It must be idempotent, with no AI or
+  external HTTP calls. It sets the root row to `failed` and refunds per §13.10.4.
+- **`onBudgetDelayed?(ctx: BudgetDelayedContext)`**: `ctx` is `{ task, payload | null,
+  admin, log }`. It runs after a successful budget snooze (§13.9.4), e.g. to set
+  `resume_reports.notice = 'delayed_budget'`. It must be idempotent. Errors are logged
+  and don't affect the snooze.
 
 | kind | class | prio | max att. | lease s | max ms | external calls | dedupe_key |
 |---|---|---|---|---|---|---|---|
@@ -2853,8 +2971,26 @@ at least 30s. A unit test asserts this for every kind.
 | `digest.send_user` | background | 30 | 4 | 240 | 150 000 | Claude, email | `digest:{user_id}:{week}` |
 | `maintenance.backfill_job_keys` | background | 5 | 3 | 270 | 200 000 | none | `backfill-job-keys:v1` |
 
-Handlers receive `{ task, admin, signal, deadline, log }`. `admin` is the service-role
-client. `signal` is an `AbortSignal` that fires at `startedAt + maxDurationMs`, and is
+Handlers receive `{ task, payload, admin, signal, deadline, log }`.
+- `payload` is `task.payload` **already parsed through the kind's `payloadSchema`**.
+  If parsing fails, the handler never runs: the task fails non-retryably with
+  `unknown_payload` (error message = issue paths only), and `onDead` gets
+  `payload: null`.
+- `admin` is the service-role client.
+- **Don't keep per-task state in `last_error_code`.** `snooze_task` preserves a prior
+  `last_error_code`, so it no longer reliably reflects the latest snooze. Handlers must
+  not use it, or `last_error_message`, to remember that they snoozed, or for any other
+  per-task state.
+  - Durable state goes in the handler's own tables, keyed by natural keys (§13.4.4),
+    or in the payload of a continuation task.
+  - Handlers may branch on `task.attempts`. Snoozes refund attempts, though, so
+    "first run" is better detected with `isFirstClaim(task)`, which is true when
+    `started_at == locked_until − lease_seconds`. `maintenance.noop` uses it for its
+    snooze-once behavior (`lib/tasks/handlers/maintenance/noop.ts`).
+  - `background_tasks.result` is write-only from a handler's point of view: it is
+    written on completion, so a later attempt can't read it.
+  - The worker itself reads `last_error_code` only for the "`ai_invalid_output` twice
+    → dead" rule. `signal` is an `AbortSignal` that fires at `startedAt + maxDurationMs`, and is
 passed to Anthropic/Voyage/fetch calls as their `signal`/`timeout`. A handler returns
 one of `{ outcome: 'succeeded', result? }`, `{ outcome: 'snooze', seconds, reason }`,
 or throws a `TaskError` (`code`, `retryable`).
@@ -2897,13 +3033,128 @@ or throws a `TaskError` (`code`, `retryable`).
 | `lease_expired` | (dead at max) | worker died repeatedly |
 | `internal_error` | yes | anything unclassified |
 
-- **Dead letters** stay in `background_tasks` (`status='dead'`) for 30 days with
-  `last_error_code`. **Visibility to the user:** the root row (report stage, match,
-  import) is set to `failed` with a user-safe `error_code` in the same handler path
-  that calls `fail_task` when the result is `dead`. The UI maps codes to copy (§13.13.9).
+- **Dead letters** stay in `background_tasks` (`status='dead'`) with
+  `last_error_code`; retention rules are under "Dead-task hook" below.
+  **Visibility to the user:** each kind's `onDead` hook sets the root row (report
+  stage, match, import) to `failed` with a user-safe `error_code`, and applies the
+  §13.10.4 refund. The UI maps codes to copy (§13.13.9).
+- **Dead-task hook delivery** (decided 2026-11-05; folded into 0007 before it is
+  applied; resolves M1.2 review finding 1).
+  - **Why this exists:** tasks can go `dead` in SQL without any TS code running:
+    - `claim_tasks` dead-letters a task whose lease expired on its final attempt,
+      with code `lease_expired`;
+    - the housekeeping stale-lease sweep dead-letters tasks the same way (§13.3.1);
+    - other SQL paths may be added later.
+
+    So `onDead` is delivered by an **outbox on the task row**, not by the code path
+    that killed it.
+  - **Columns** (`background_tasks`):
+    - `on_dead_handled_at timestamptz null`
+    - `on_dead_attempts int not null default 0`
+    - `on_dead_locked_by text null`
+    - `on_dead_locked_until timestamptz null`
+  - **Index:** `background_tasks_on_dead_pending_idx (finished_at) where status = 'dead'
+    and on_dead_handled_at is null`.
+  - **`claim_dead_task_hooks(p_worker_id text, p_kinds text[], p_limit int, p_task_id
+    uuid default null) returns setof background_tasks`** (service_role only):
+    - Selects `status='dead' and on_dead_handled_at is null and kind = any(p_kinds)
+      and (on_dead_locked_until is null or on_dead_locked_until <= now())`. With
+      `p_task_id`, only that row is considered.
+    - Orders by `finished_at` and uses `for update skip locked`.
+    - Sets `on_dead_locked_by = p_worker_id`,
+      `on_dead_locked_until = now() + interval '120 seconds'`, and
+      `on_dead_attempts += 1`.
+    - Only kinds this deployment knows are claimed, so a kind from newer code waits
+      for a worker that has its hook.
+  - **`complete_dead_task_hook(p_id uuid, p_worker_id text, p_gave_up boolean default
+    false) returns boolean`** (service_role only):
+    - Fenced: acts only when `on_dead_locked_by = p_worker_id`.
+    - Sets `on_dead_handled_at = now()` and clears the lock.
+    - `p_gave_up = true` additionally sets `last_error_message` to
+      `'onDead hook gave up after N attempts'` (no PII).
+  - **Worker behavior** (`lib/tasks/worker.ts`):
+    1. **Every tick, before the claim loop,** call `claim_dead_task_hooks(kinds =
+       every registered kind, limit = 20)` and run each row's hook with a
+       `DeadTaskContext`:
+       - `errorCode = row.last_error_code`;
+       - `payload` parsed through `payloadSchema`, or null if it fails.
+
+       This uses up to `DEAD_HOOK_BUDGET_MS = 20_000` of the tick, and is the
+       mechanism that guarantees delivery.
+    2. **On success:** `complete_dead_task_hook`.
+    3. **On a thrown error:** leave the row unhandled. The lock expires and a later
+       tick retries it. When `on_dead_attempts >= 10`, call
+       `complete_dead_task_hook(..., p_gave_up => true)` and log an alertable
+       `onDead gave up` error line (task id, kind, code).
+    4. **Kinds without `onDead`:** mark handled immediately (no-op).
+    5. **Fast path:** when the worker's own `fail_task` call returns `dead`, it
+       immediately calls `claim_dead_task_hooks(p_task_id => id)` and runs the same
+       hook routine. This is only a latency optimization. If the worker dies
+       mid-hook, the sweep in step 1 redelivers.
+
+    `runOnDead`'s current direct call is replaced by this routine.
+  - **Hook contract (binding):**
+    - **At-least-once and idempotent.** Use only conditional writes:
+      - set a stage or root row to `failed` only if it isn't already terminal;
+      - refund with `update rate_limit_events set refunded_at = now() where ref_id
+        = … and refunded_at is null`;
+      - never insert unconditionally.
+    - **Per-hook timeout:** `DEAD_HOOK_TIMEOUT_MS = 15_000`. `DeadTaskContext`
+      carries a **`signal`** that fires at that point. Hooks must pass it to their
+      DB calls, and the worker races the hook against it. A timed-out hook counts as
+      a failed attempt and is redelivered. Because of the timeout: no AI calls and no
+      external HTTP.
+    - Sweep limits: `DEAD_HOOK_BUDGET_MS = 20_000` per tick and
+      `DEAD_HOOK_SWEEP_LIMIT = 20` rows. Give-up happens at
+      `DEAD_HOOK_MAX_ATTEMPTS = 10`.
+    - **Batched sweep with release (as built).**
+      - The sweep claims in batches of `DEAD_HOOK_CLAIM_BATCH = 5`
+        (`claim_dead_task_hooks(limit = min(5, 20 − claimed so far))`), running each
+        batch before claiming the next.
+      - It stops when 20 rows have been claimed this tick, when a batch comes back
+        short (nothing more pending, or the claim failed), or when the 20 s budget is
+        used up.
+      - When the budget runs out mid-batch, every claimed-but-unrun row is
+        **released** via `release_dead_task_hook(p_id uuid, p_worker_id text) returns
+        boolean`.
+      - That function is service_role only, and fenced on `on_dead_locked_by =
+        p_worker_id`, `status='dead'` and `on_dead_handled_at is null`. It clears the
+        hook lock and sets `on_dead_attempts = greatest(on_dead_attempts − 1, 0)`. A
+        hook that keeps getting skipped behind slow ones therefore never drifts
+        toward the give-up limit, and the next tick can deliver it immediately.
+      - A release that errors or is fenced out falls back to the 120 s lock expiry,
+        costing one inflated attempt.
+    - **Fast path skipped near the end of a tick.** The post-`fail_task` fast path is
+      skipped when `elapsed + DEAD_HOOK_FAST_PATH_RESERVE_MS >= WORKER_HARD_BUDGET_MS`.
+      The reserve is `DEAD_HOOK_TIMEOUT_MS + 2 × WORKER_DB_TIMEOUT_MS` = 45 s (claim +
+      hook + completion). Delivery is then left to the next tick's sweep.
+    - Tick summary counters:
+      - `deadHooksHandled`;
+      - `deadHooksFailed` (left pending for redelivery);
+      - `deadHooksGaveUp` (alerted);
+      - `deadHooksReleased` (claimed but unrun, released);
+      - `deadHooksDeferredToSweep` (fast path skipped near the hard budget).
+  - **Retention:** `purge_finished_tasks()` deletes `dead` rows older than 30 days
+    **only if `on_dead_handled_at is not null`**. Unhandled dead rows are kept and
+    counted in `GET /api/worker/status` as `dead_hooks_pending`.
+  - **Ops alerting** (set up log drains or monitors on these):
+    - any log line prefixed **`[ALERT][usageSink]`** (unrecorded spend, §13.9.4);
+    - any log line prefixed **`[ALERT][worker]`**. The worker adds that prefix to
+      lines logged with `alert: true`, e.g. "onDead gave up".
+    - `dead_hooks_pending > 0` sustained for **more than 1 hour**.
+  - **Tests** (pgTAP and vitest):
+    - a `lease_expired` dead-letter from `claim_tasks` gets its hook run on the next
+      tick;
+    - a hook that throws is retried, and gives up after 10 attempts;
+    - two concurrent ticks never run the same hook concurrently;
+    - a worker killed mid-hook leads to redelivery after 120 s;
+    - the fast path and the sweep together run the hook exactly once when nothing
+      fails;
+    - an unknown kind stays pending.
 - **Operator visibility:** `GET /api/worker/status` (Bearer `WORKER_SECRET`) returns
-  counts by kind/status and the 20 most recent dead tasks (kind, code, finished_at;
-  no payload). Read-only, for ops and qa-tester.
+  counts by kind/status, the 20 most recent dead tasks, the count of unhandled dead
+  hooks, and today's spend. No payloads. Read-only, for ops and qa-tester. The exact
+  shape is in §13.13.8.
 
 #### 13.4.6 Progress surfacing: polling, not Realtime
 **Decision: client polling.** Clients poll `GET /api/reports/:id` (and
@@ -2940,6 +3191,24 @@ lib/claude/
     assessJobFit.ts           (+ .test.ts)
   prompts/, parse.ts   -- v1, migrated in M1.1, deleted in M3.9
 ```
+**Error class names are a fixed contract.** The worker
+(`lib/tasks/errors.ts#classifyTaskError`) maps Claude errors to task codes by the
+error's **`name` string**, not by `instanceof`. That keeps the task core free of any
+`lib/claude`/SDK import, and it also survives duplicate module instances across
+bundles.
+
+| `err.name` | task code |
+|---|---|
+| `ClaudeRefusalError` | `ai_refused` |
+| `ClaudeTruncatedError` | `ai_truncated` |
+| `ClaudeInvalidOutputError` | `ai_invalid_output` |
+| `ClaudeBadRequestError` | `ai_bad_request` |
+| `ClaudeApiError` with `retryable: false` | `ai_bad_request` |
+| `ClaudeApiError` otherwise | `ai_unavailable` |
+
+Renaming any of these classes, or failing to set `this.name`, silently turns AI
+failures into `internal_error`. A unit test pins the names on both sides.
+
 Each `tasks/*.ts` exports exactly: `XSchema` (zod), `type XOutput`, `buildXRequest(input)`
 (pure, for tests), `validateX(output, context) → {value, dropped}` (semantic), and
 `runX(input, ctx) → Promise<{ value, model, usage }>`. Prompts are never inlined
@@ -2957,28 +3226,41 @@ callStructured<T>(args: {
 }): Promise<{ value: T; model: string; stopReason: string; usage: Usage; requestId: string | null }>
 ```
 Behavior, in order:
-1. Build params: `model`, `max_tokens`, `system`, `messages: [{role:'user', content}]`,
-   `output_config: { format: zodOutputFormat(schema), effort }`. **Never** send
-   `tool_choice` (forced `tool_choice` returns 400 on Opus 5.5), `temperature`,
-   `top_p`, `top_k`, or an assistant prefill.
-2. Call via the beta path with server-side refusal fallback:
-   `client.beta.messages.parse({ ...params, betas: ['server-side-fallback-2026-07-01'],
-   fallbacks: 'default' }, { signal, timeout })`.
-   **backend-dev must verify against the installed `@anthropic-ai/sdk` (^0.122) in
-   M1.1:** (a) that `beta.messages.parse` exists and accepts `output_config.format` and
-   `fallbacks`. If it doesn't, call `client.beta.messages.create` with
-   `output_config.format: zodOutputFormat(schema)` (structured output is still
-   enforced server-side), then take the text block and run `schema.parse(JSON.parse(text))`
-   ourselves. (b) That `zodOutputFormat` supports our zod v4 schemas. (c) That
-   unsupported JSON-Schema constraints (numeric min/max, string length) are stripped
-   or handled by the helper. Either way, those constraints are **re-checked in
-   `validateX`**. Record the findings in this section.
+1. Build params (`buildStructuredParams`): `model`, `max_tokens`, `system`,
+   `messages: [{role:'user', content}]`, and `output_config: { format: { type:
+   'json_schema', schema: <wire schema> }, effort }`. The wire schema is
+   `zodOutputFormat(schema).schema`, plus `enum` restoration per the "Decision on
+   `enum`" block below, once M1.1b lands.
+   **Never** send `tool_choice` (forced `tool_choice` returns 400 on Opus 5.5),
+   `temperature`, `top_p`, `top_k`, or an assistant prefill.
+2. **As built (M1.1):** call the beta *create* endpoint with server-side refusal
+   fallback, and keep the raw response:
+   `client.beta.messages.create({ ...params, betas: ['server-side-fallback-2026-07-01'],
+   fallbacks: 'default' }, { signal, timeout: config.timeoutMs }).withResponse()`.
+   - This gives `data` (the message) and `request_id`.
+   - **`beta.messages.parse` is deliberately not used.** The reasons are in the
+     Verified block below: it throws on invalid output, which loses usage and the
+     stop_reason; it loses the request id; and it would parse the declined model's
+     text.
+   - No `structured-outputs-*` beta header is sent; it isn't needed with `create`.
+   - Constraints the helper strips from the wire schema (numeric ranges, string
+     lengths, array sizes) are **re-checked client-side** by the zod schema and
+     `validateX`.
 3. Record usage (`recordUsage`) **before** inspecting the result, so failed-but-billed
    calls are counted. Price by `response.model`, not the requested model.
 4. `stop_reason === 'refusal'` → `ClaudeRefusalError` (non-retryable).
    `'max_tokens'` → `ClaudeTruncatedError` (non-retryable). Anything other than
    `end_turn` → `ClaudeInvalidOutputError`.
-5. `parsed_output == null` → `ClaudeInvalidOutputError` (retryable once).
+5. **Parse it ourselves.**
+   - Take the final answer text: the concatenated `text` blocks **after the last
+     `fallback` boundary block**, if one exists (`finalAnswerText`).
+   - Run `JSON.parse`, then `schema.safeParse`.
+   - **Invalid output** means any of: no text block, text that isn't valid JSON, or a
+     zod failure. Each throws `ClaudeInvalidOutputError` (retryable once at task
+     level; `retryOnceOnInvalidOutput`).
+   - The error message names only the failure kind and the zod issue *paths*. It
+     never includes values, and the `JSON.parse` message (which can quote the output)
+     is dropped.
 6. HTTP 400 → `ClaudeBadRequestError`; 429/5xx/529/network/abort → `ClaudeApiError`
    with `retryable: true`. SDK `maxRetries: 1`; task-level retries handle the rest.
 7. Never log prompt or response content. Log only `task`, `model`, `stop_reason`,
@@ -3008,6 +3290,10 @@ Verify in M1.1.
   `JSON.parse` errors include a snippet).
   (2) `parse` returns a plain Promise (`create(...).then(...)`), so `.withResponse()`
   isn't available and the `request-id` is lost (the spread also drops `_request_id`).
+  (3) *(Reviewer, M1.1 review.)* When the refusal fallback fires, `parse` would also
+  try to parse the **declined model's partial text** that comes before the `fallback`
+  boundary block. That can fail spuriously, or, worse, validate the wrong answer. Our
+  `finalAnswerText` reads only the text after the last boundary.
 - **(b) zod v4:** `zodOutputFormat` imports `zod/v4` and works with our `zod` 4.x
   schemas (it uses `z.toJSONSchema` plus the SDK's `transformJSONSchema`). Objects get
   `additionalProperties: false` and full `required`. Nullable fields become
@@ -3039,6 +3325,88 @@ Verify in M1.1.
   `ai_unavailable` with `retryable: false` (key problem). 408/409 are retryable.
   Other 4xx (404, 413, 422) and SDK-side pre-send errors map to `ClaudeBadRequestError`.
   A missing API key maps to `ai_unavailable` with `retryable: false`.
+- **Abort handling (M1.1 B1/B2 fix):** SDK 0.122's `retryRequest` backoff is a plain
+  `sleep()`. It **ignores the abort signal** and honors `Retry-After` **with no cap**,
+  and the SDK checks `signal.aborted` only before each attempt and on connection-level
+  errors. So `callStructured` **races the SDK promise against `args.signal`**
+  (`raceAbort`), rejecting with `APIUserAbortError` the moment the signal fires. That
+  makes caller deadlines hard.
+  - The abandoned SDK promise is still observed, so it can't become an unhandled
+    rejection.
+  - An **already-aborted signal makes no call at all.**
+  - **Accepted edge case:** a response that lands at the exact instant the deadline
+    fires may lose the race and be dropped. Its usage then goes unrecorded.
+
+**Decision on `enum` (architect, 2026-11-05; resolves the open item in (c) above).**
+Option B, limited to small closed enums, and conditional on a probe. Implemented in
+milestone M1.1b.
+1. **Wire schema = helper output + restored `enum`, nothing else.**
+   - `callStructured` and the batch request builder both get the wire schema from one
+     function, `lib/claude/outputFormat.ts#buildOutputFormat(schema)`.
+   - It takes `zodOutputFormat(schema).schema` (the helper output), then copies
+     **only the `enum` keyword** back from `z.toJSONSchema(schema)` at the same paths,
+     using a recursive `restoreEnums(raw, wire)`. The recursion walks `properties`,
+     `items`, `anyOf`/`oneOf`/`allOf`, and `$defs`/`definitions` with `$ref` targets.
+     The two trees have the same shape, since the helper only removes keywords and adds
+     `additionalProperties`/`required`/descriptions.
+   - Where the wire node's `type` includes `'null'` (a nullable enum) and the enum
+     lacks `null`, append `null`.
+   - The description hint the helper added stays as is.
+   - Numeric/length/array-size keywords are **not** restored. The helper strips them
+     because the API doesn't support them, so they stay client-side in `validateX`.
+2. **Only small, closed enums.** An enum is restored only if it has ≤
+   `WIRE_ENUM_MAX_VALUES = 64` values and every value is a string.
+   - Every closed enum in §13.5.4 qualifies: level, employment/remote type, education
+     level, seniority, proficiency, section, issue types, dimension, fit label,
+     importance, status. The largest has 9 values.
+   - **Data-driven vocabularies must not be enums at all.** That covers skill slugs
+     (~400 and growing), role-family slugs (~35, changed by migrations), and anything
+     sourced from DB rows. They stay `z.string()` / `z.string().nullable()`, and are
+     validated and normalized server-side per §13.5.6 / §13.7.3: a slug not in the
+     vocabulary is nulled or dropped, never treated as a fatal error. Three reasons:
+     - an out-of-vocabulary answer is recoverable through `raw_label` + alias mapping;
+     - a schema that changes whenever the taxonomy changes would defeat any server-side
+       compiled-grammar and prompt caching;
+     - a constrained decoder forced onto one of hundreds of slugs pushes the model to
+       pick the nearest wrong skill instead of honestly returning `null` + `raw_label`.
+   - The vocabulary stays in the cached system prompt.
+   - Output schemas don't use `z.literal`. Use a single-value `z.enum` if ever needed.
+3. **Probe first, then ship.** The API *accepting* `enum` (verified) is not the same
+   as the API *enforcing* it during decoding. Backend-dev runs
+   `scripts/evals/structured-output-probe.ts` (manual, real key):
+   - Schema: `{ color: enum ['red','green'], note: string }`.
+   - User content: a benign prompt that strongly pushes an out-of-enum answer ("The
+     user's favorite color is blue. Report it exactly.").
+   - Runs: 20× sync on `claude-opus-5-5` at effort `low`, plus 5 requests through
+     Message Batches.
+   - Decision rule:
+     - **Enforced** = 0/25 outputs outside the enum, and none failing JSON parse. Then
+       ship the restore in both paths.
+     - **Not enforced** (any out-of-enum value gets through) = don't send restored
+       enums. `buildOutputFormat` returns the helper output unchanged, behind the
+       constant `WIRE_ENUM_RESTORE = false`, which is Option A. Record the result here
+       either way.
+   - **Re-run the probe whenever the SDK major/minor version or a task's model
+     changes.** Its result is recorded next to this block.
+4. **Client-side zod stays authoritative regardless.** `schema.safeParse` runs on
+   every response; a miss → `ai_invalid_output` → one task-level retry (sync). In
+   Batches, the item is marked failed and returns to the stale pool (3-strike rule,
+   §13.6.6).
+   - Why enforcement still matters: a sync retry costs a whole extra call (~$0.10–0.21
+     on Opus for the enum-heavy tasks). In batch, a miss costs a resubmission plus a
+     delay of up to a day for that listing.
+   - Enforced decoding removes that whole class of failure at no cost.
+5. **Tests (M1.1b):**
+   - Snapshot each §13.5.4 task's wire schema.
+   - Assert that every `z.enum` path in the zod schema has `enum` on the wire, and
+     that nullable enums include `null`.
+   - Assert `restoreEnums` adds no keyword other than `enum`, and never touches a node
+     the helper didn't keep.
+   - Add a guard test that fails if any `lib/claude/tasks/*` schema contains a
+     `z.enum` with more than `WIRE_ENUM_MAX_VALUES` values. This catches someone
+     turning the skills vocabulary into an enum.
+   - Add a unit test that the batch builder and `callStructured` produce identical
+     `output_config.format` for the same schema.
 
 **Deleted by M1.1:** `repairListField`, `repairMatchResponseShape`,
 `TAG_COVERAGE_THRESHOLD`, `extractToolUseInput`, the forced-tool definitions, and the
@@ -3061,6 +3429,31 @@ reviewable change.
 | `rerankJobsForRole` | default | `medium` | 16 000 | 160 s | sync | `rerank-v1` | `candidate_profile`, `job_posting` ×≤5 |
 | `narrateRoleFit` | default | `medium` | 12 000 | 160 s | sync | `narrate-v1` | `candidate_profile`, `role_data` |
 | `assessJobFit` | default | `high` | 20 000 | 190 s | sync | `fitcheck-v1` | `resume_text`, `candidate_profile`, `job_description_text` |
+| `analyzeResume` *(legacy v1; deleted in M3.9)* | default | `medium` | 16 000 | 120 s (`SYNC_ROUTE_ATTEMPT_TIMEOUT_MS`) | sync | `analyze-v2` | `resume_text` |
+| `matchResumeToJob` *(legacy v1; deleted in M3.9)* | default | `medium` | 16 000 | 120 s (`SYNC_ROUTE_ATTEMPT_TIMEOUT_MS`) | sync | `match-v2` | `resume_text`, `job_description_text` |
+
+**Timeouts for the legacy rows** (constants in `lib/claude/config.ts`):
+- `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS = 120_000` is the per-request SDK timeout.
+- SDK `maxRetries: 1`.
+- Both sit under the route's overall `SYNC_ROUTE_CLAUDE_DEADLINE_MS = 270_000` and
+  `maxDuration = 300`.
+- Two complete attempts (an invalid output, then the single task-level retry) take at
+  most 240 s, which fits inside the deadline. See §13.13.1.
+
+**Config shape (`ClaudeTaskConfig`, as built).** `CLAUDE_TASKS` is
+`as const satisfies Record<string, ClaudeTaskConfig>`, and `ClaudeTaskName` is
+derived from its keys.
+
+| field | type | meaning |
+|---|---|---|
+| `model` | `string` | requested model id (pricing uses the *served* model, §13.17) |
+| `effort` | `'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | sent as `output_config.effort` |
+| `maxTokens` | `number` | ≤ 20 000 for every task |
+| `timeoutMs` | `number` | per-request SDK `timeout` (also skips the non-streaming size estimate) |
+| `mode` | `'sync' \| 'batch_for_shared_external'` | the latter = shared, externally ingested listing text goes through Message Batches; every other path for that task runs sync |
+| `promptVersion` | `string` | persisted next to outputs (`prompt_version` columns) |
+| `untrustedInputs` | `readonly ReservedTagWord[]` | the reserved tags (§13.5.5) this task's prompt carries. Declarative, for review and tests: a prompt builder must wrap exactly these inputs with `wrapUntrusted`, and the reviewer checks the list against the builder |
+| `legacy` | `true` (optional) | marks v1 tasks kept only until M3.9 removes the v1 routes; new code must not add legacy tasks |
 
 **Caching:** `system` is an array: `[UNTRUSTED_DATA_RULES + task instructions + output
 rubric, taxonomy vocabulary block (where used)]`, with `cache_control: {type:
@@ -3212,11 +3605,54 @@ Persisted as `matches.score/rationale/matched_strengths/gaps` (v1 columns) plus
    `RESERVED_TAG_WORDS = ['resume_text','job_description_text','job_posting',
    'candidate_profile','fetched_page_text','role_data','market_data']` and
    `escapeUntrusted(raw)`, which neutralizes open/close tags for **every** reserved
-   word in a single pass. The pattern also tolerates **attributes**:
-   `<\s*/?\s*{tolerantWord}(\s[^>]*)?\s*>`, keeping the existing whitespace-within-word
-   and invisible-character handling. This generalizes `escapeBothDelimiterTags`. Every
-   untrusted or untrusted-derived string is escaped against all reserved words, not
-   only its own tag.
+   word in a single pass. The actual pattern (`RESERVED_TAG_PATTERN`, flags `giu`) is:
+   `<\s*(?:\/\s*)*(?:{word1}|{word2}|…)(?![\p{L}\p{N}_])[^<>]*>?`.
+   - Each `{word}` is the whitespace-tolerant form, with `\s*` between every
+     character, and longer words are tried first.
+   - `(?:\/\s*)*` accepts zero or more slashes (open, close, `<//…`).
+   - The negative lookahead keeps `<resume_textual>` and `<job_postings>` unmatched.
+   - `[^<>]*` covers attributes, trailing whitespace and self-closing slashes, and
+     stops at the next `<`.
+   - `>?` also catches unterminated heads.
+
+   The `<` (and the `>`, if present) are replaced with `＜`/`＞` (U+FF1C/U+FF1E),
+   and the text in between is kept verbatim. This generalizes
+   `escapeBothDelimiterTags`. Every untrusted or untrusted-derived string is escaped
+   against all reserved words, not only its own tag.
+   **Hardening (M1.1 review follow-up; as built).**
+   `escapeUntrusted(raw)` is
+   `stripInvisibleChars(raw.normalize('NFKC')).replace(RESERVED_TAG_PATTERN, …)`.
+   **Its output is therefore NFKC-normalized text, plus full-width `＜ ＞` where a
+   reserved tag was neutralized.** The steps, in order:
+   1. **NFKC-normalize** the whole text (`text.normalize('NFKC')`). This folds
+      full-width and compatibility forms, e.g. `＜／resume_text＞` or mathematical
+      alphanumerics, into ASCII before matching, so they can't slip past the pattern.
+      Our own full-width replacement output is applied *after* normalization, so
+      escaping stays idempotent: re-escaping normalizes `＜` back to `<`, and the tag
+      is neutralized again.
+   2. **Strip invisible characters** with `\p{Default_Ignorable_Code_Point}` (`u` flag).
+      This replaces the hand-maintained `INVISIBLE_CHAR_RANGES` list and is a superset
+      of it: zero-width characters, bidi controls, soft hyphen, tag characters
+      U+E0000–E007F, variation selectors, and so on.
+   3. **Match tags** with `RESERVED_TAG_PATTERN` above, which also tolerates
+      **repeated slashes** in close tags (`<//resume_text>`, `< / / resume_text >`)
+      via `(?:\/\s*)*`.
+   - **Consequence for display:** the prompt sees NFKC text, so quotes Claude returns
+     (`original_text`, `resume_line`, `resume_evidence`, evidence `quote`s) come back
+     in NFKC form: `m2` for `m²`, `TM` for `™`, `1⁄2` for `½`. See §13.13.2,
+     "Displaying quoted text".
+   - **Semantic quote matching uses the same normalization.**
+     `normalizeForQuoteMatch` (§13.5.6) applies NFKC and the same
+     Default_Ignorable stripping to **both** the quoted string and the source text,
+     sharing one helper with `escapeUntrusted`. A quote taken from escaped or
+     normalized text therefore still matches the stored original.
+   - **Out of scope:** Cyrillic/Greek homoglyphs (e.g. Cyrillic `е` in
+     `rеsume_text`). NFKC doesn't fold them, and a confusables map would risk
+     mangling legitimate non-Latin resume text. This is acceptable: a homoglyph tag
+     is not *our* delimiter, so the model sees it as literal text inside the real,
+     intact block, and the `UNTRUSTED_DATA_RULES` clause covers look-alike tags.
+     Revisit only if the adversarial eval (§13.16) shows a homoglyph tag changing
+     model behavior.
 2. **`wrapUntrusted(tag, text, attrs?)`** is the only way content enters a prompt.
    Attributes are server-generated (`id="J1"`) and never contain user text.
 3. **Shared system clause** `UNTRUSTED_DATA_RULES` (in `promptCommon.ts`) is included
@@ -3602,11 +4038,46 @@ error, code: 'rate_limited', kind, retry_after }`, where `retry_after` is the ne
 midnight, same convention as §5.
 
 #### 13.9.4 Global spend guard
-- `GLOBAL_DAILY_AI_BUDGET_USD` (env, default **15**) is checked by the worker before
-  claiming any AI-calling kind: `sum(cost_usd) where created_at >= today UTC`. Over
-  budget → don't claim AI kinds. If any are queued, snooze them to the next UTC
-  midnight with jitter, set `resume_reports.notice = 'delayed_budget'` on affected
-  reports, and log a warning.
+- `GLOBAL_DAILY_AI_BUDGET_USD` (env, default **15**; `0` pauses all AI work; an
+  invalid value falls back to the default with a warning). The worker checks it once
+  per claim round, before claiming any `usesAi` kind, against today's UTC spend from
+  **`ai_spend_summary(start of UTC day)`**, summed in SQL (§13.3.1).
+- **Over budget (as built after the M1.2 fix pass):**
+  - The worker **never claims AI kinds** while over budget. Instead, **once per class
+    per tick**, it calls `defer_queued_tasks(class, aiKinds, next UTC midnight,
+    900, 200)` (§13.3.1).
+  - That function moves claimable queued AI tasks to next midnight plus per-row
+    0–15 min jitter **without touching `attempts`, `started_at`, locks or
+    `last_error_code`**. A budget delay never uses up an attempt and never marks a
+    task as started. More than 200 due rows are handled by the next tick.
+  - Non-AI kinds in the class are still claimed and run as normal.
+  - **`onBudgetDelayed` runs once per returned row**, e.g. setting
+    `resume_reports.notice = 'delayed_budget'`. It is idempotent, and its errors are
+    logged without affecting the deferral.
+  - **If the deferral call fails**, the tasks simply stay queued; nothing was claimed,
+    so nothing is lost. The next tick tries again.
+  - One warning is logged per tick (`spent_usd`, `budget_usd`). The tick summary
+    counts `budgetDeferred`.
+  - **A running handler that throws `TaskError('budget_exhausted')`** (e.g. the
+    ingest budget, M2.2) is different: its task was claimed, so it goes through
+    `snooze_task` (attempt refunded, prior `last_error_code` kept, `safeSnooze`
+    retried once). Then `onBudgetDelayed` runs, and the summary counts
+    `budgetSnoozed`.
+- **Budget check fails** (spend query errors): **fail closed.** The worker does not
+  claim AI kinds that round; non-AI kinds still run.
+- **The cap is soft. Known overshoot sources, accepted and documented:**
+  1. **In-flight calls finish.** Tasks already running when the threshold is crossed
+     complete, so spend can exceed the budget by up to the concurrently running AI
+     calls (≤ 6 worker slots × one call each, plus v1 route calls).
+  2. **Unrecorded spend escapes the budget.** If the `ai_usage_events` insert fails
+     or exceeds `USAGE_SINK_TIMEOUT_MS` (5 s), the call was billed but never counted.
+     The sink then logs a line prefixed **`[ALERT][usageSink] failed to record`**
+     (`USAGE_SINK_ALERT_PREFIX`). **Alert on it**, because it means real spend the
+     guard can't see; reconcile against the Anthropic console.
+  3. **The v1 synchronous routes** (`/api/resumes/:id/analyze`, v1 `POST
+     /api/matches`) **record** spend through `registerUsageSink` but are **not
+     budget-gated**. They only have the per-user 20/day caps (§5). This lasts until
+     M3.5 (matches async) and M3.9 (analyze deleted).
 - `INGEST_DAILY_BUDGET_USD` (default **5**) and `INGEST_DAILY_EXTRACTION_CAP`
   (default **300**) bound background extraction separately, so ingestion can never
   starve students.
@@ -3794,6 +4265,39 @@ per §13.3.12). Queued tasks for that resume are cancelled before the row delete
 (on Opus 5.5 structured outputs after M1.1) until **M3.9**, then **deleted**. The
 frontend stops calling them in M3.6/M3.7.
 
+**v1 synchronous Claude routes under the M1.1 layer (interim, until M3.5/M3.9).**
+These are `POST /api/resumes/:id/analyze` and the v1 synchronous `POST /api/matches`.
+They are the only routes that still call Claude inline, as a temporary exception to
+the §13.13 "no route calls Claude" rule.
+- Both export **`maxDuration = 300`**, the Hobby maximum.
+- Each bounds the **whole Claude operation** with one overall deadline,
+  **`SYNC_ROUTE_CLAUDE_DEADLINE_MS` = 270 s**:
+  - It is created as `AbortSignal.timeout(...)` at the start of the handler and
+    passed to `callStructured`.
+  - It covers the SDK's own retry (`maxRetries: 1`) and the single task-level
+    `retryOnceOnInvalidOutput` retry.
+  - The per-attempt SDK timeout is **`SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` = 120 s**. That
+    alone is not enough: a timeout plus the SDK's retry plus a task-level retry could
+    exceed the platform limit.
+  - Passing the signal to the SDK alone is not enough either, because the SDK's retry
+    backoff `sleep()` ignores the signal and honors uncapped `Retry-After`.
+    `callStructured` therefore **races the SDK promise against the signal**
+    (`raceAbort`, §13.5.2 Verified block), so the deadline is hard.
+- **On abort/deadline:** return `502`. The analyze route also sets
+  `resumes.status = 'failed'` before responding, so a resume is **never left
+  `processing`** by a platform kill. The ~30 s margin below 300 s exists so this
+  status write and the response always happen.
+- **Every response received before the deadline is recorded** (§13.5.2 step 3). Two
+  gaps are unavoidable and accepted:
+  1. A response that finished server-side but arrives after the deadline is dropped
+     by the race, so it was billed but not recorded.
+  2. An attempt that timed out client-side at 120 s may still be billed by Anthropic
+     even though no response, and so no usage, was received.
+
+  Both under-count; this is overshoot source 2 in §13.9.4.
+- `POST /api/matches` becomes async (`202`) in M3.5, which removes its inline call;
+  the analyze route is deleted in M3.9.
+
 #### 13.13.2 Reports
 **`GET /api/reports/:id`** (new): owner only, `404` otherwise.
 ```jsonc
@@ -3851,6 +4355,31 @@ frontend stops calling them in M3.6/M3.7.
 }
 ```
 Sections are `null` until their stage completes, so the UI renders progressively.
+
+**Displaying quoted text (binding for M3.2 backend and M3.6 frontend).** Claude
+sees NFKC-normalized text (§13.5.5), so the quotes it returns are NFKC, not the
+user's original characters (`m2` vs `m²`, `TM` vs `™`). This covers critique
+`original_text`, fit-check `resume_line`/`resume_evidence`, profile evidence `quote`,
+and requirement `evidence_quote`. **The UI must show the matching span from the
+stored original source text, never the normalized quote.**
+- **Where the mapping happens: on the backend, at validation time.** It reuses the
+  same match that `quoteAppearsIn` already performs.
+- A shared helper, `semanticValidation.ts#locateQuoteInSource(quote, source) → { start,
+  end } | null`, normalizes the source **while keeping an index map from normalized
+  offsets back to original offsets**, finds the normalized quote, and returns the
+  original-text span.
+- The stored value (and the API field, e.g. `original_text`) is
+  `source.slice(start, end)`, the user's exact characters. Items whose quote can't be
+  located are dropped, exactly as today.
+- So API consumers never receive NFKC quotes. The frontend can render
+  `original_text` as is, and any highlighting against the resume text uses these
+  original-text strings.
+- Suggested rewrites and other Claude-authored prose are shown as returned (NFKC is
+  harmless there).
+- Tests:
+  - round-trip fixtures containing `²`, `™`, `½`, full-width digits, ligatures (`ﬁ`),
+    and stripped invisible characters;
+  - the returned span equals the original substring.
 `ETag` = `"<report.updated_at>"`, and the route honors `If-None-Match` → `304` to make
 polling cheap.
 
@@ -4102,9 +4631,21 @@ the same semantics for RFC 8058 one-click.
 
 #### 13.13.8 Worker and cron (machine-to-machine)
 - **`POST /api/worker/tick`**: Bearer `WORKER_SECRET`. `202 { "accepted": true }`.
-  `401`/`500` as §13.4.2.
-- **`GET /api/worker/status`**: Bearer `WORKER_SECRET`. `{ counts: {kind: {status:
-  n}}, recent_dead: [...], spend_today: {anthropic, voyage} }`.
+  `401`/`500` as §13.4.2. `403` when `VERCEL_ENV` is set and is not `production`
+  (§13.4.2).
+- **`GET /api/worker/status`**: Bearer `WORKER_SECRET` (same 500/401 rules),
+  `Cache-Control: no-store`. Metadata only: no payloads, results, or error messages.
+  ```jsonc
+  {
+    "counts": { "<kind>": { "<status>": 0 } },                 // from background_task_counts()
+    "recent_dead": [ { "id", "kind", "code", "attempts", "finished_at" } ],   // 20 most recent
+    "dead_hooks_pending": 0,                                   // dead rows with on_dead_handled_at null (§13.4.5)
+    "spend_today": { "anthropic": 0.0, "voyage": 0.0 },        // USD since 00:00 UTC, from ai_spend_summary()
+    "spend_today_by_operation": [ { "provider", "operation", "cost_usd", "calls" } ]
+  }
+  ```
+  `dead_hooks_pending` arrives with the part-A outbox change; the other fields are as
+  built in M1.2.
 - **`GET /api/cron/sync-jobs`**: kept for manual operator use (Bearer
   `CRON_SECRET`). It now calls `enqueue_source_syncs()` and kicks the worker, and
   returns `202 { enqueued: n }`. It no longer syncs inline. The Vercel cron entry is
@@ -4150,6 +4691,10 @@ the same semantics for RFC 8058 one-click.
   /settings/  DeleteAccountForm, UsageLimits, NotificationPrefs
 /lib
   /tasks/     types.ts, registry.ts, enqueue.ts, kick.ts, worker.ts, errors.ts, budget.ts,
+              workerAuth.ts (Bearer WORKER_SECRET check, timing-safe over SHA-256 digests; tick + status routes),
+              usageSink.ts (ai_usage_events writer: never throws, 5 s timeout, defensive normalization),
+              registerUsageSink.ts (side-effect import that registers usageSink with lib/claude/usage.ts;
+                                    imported by every Claude-calling entry point: worker tick + the two v1 routes),
               handlers/{resume,jobs,ingest,match,import,market,digest,maintenance}/*.ts,
               handlers/resume/advance.ts
   /claude/    (see §13.5.1)
@@ -4194,6 +4739,17 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
 `lib/supabase/queries/{tasks,usage,embeddings,sources}.ts`, `app/api/worker/**`,
 `app/api/cron/**`, `app/api/unsubscribe/**`, and `app/api/reports/[id]/roles/[slug]/jobs`
 (via `lib/matching/candidates.ts`). Anywhere else it's a blocking finding.
+
+**Accepted boundary exception: usage recording from the v1 routes.**
+- `app/api/resumes/[id]/analyze/route.ts` and `app/api/matches/route.ts` import
+  `lib/tasks/registerUsageSink.ts`, so they reach the service-role client
+  **indirectly**, through `usageSink.ts`.
+- This is accepted because the sink only ever **inserts `ai_usage_events` rows**. It
+  never reads, and never touches other tables.
+- The `userId` it writes comes from the route's verified session (passed through
+  `callStructured`'s `usageContext`), never from request input.
+- The exception ends when those routes stop calling Claude inline (M3.5 / M3.9).
+- No other route may import `registerUsageSink` unless it calls Claude.
 
 ### 13.15 Security and privacy review checklist (reviewer uses this for every v2 PR)
 1. **RLS:** every new table has RLS on, and the policies match §13.3 exactly.
@@ -4271,6 +4827,39 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
   fixtures. All fixtures are synthetic (no real resumes).
 
 ### 13.17 Cost model (prices as stated 2026-11-04: Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50 per MTok in/out; Batches 50% off; thinking billed as output)
+**Price table (`lib/claude/usage.ts#PRICES`, USD per MTok input / output):**
+
+| model | input | output | why it's in the table |
+|---|---|---|---|
+| `claude-opus-5-5` | 4 | 20 | default model |
+| `claude-sonnet-5-5` | 2 | 10 | Q2 candidate |
+| `claude-haiku-5-5` | 0.10 | 0.50 | Q2 candidate |
+| `claude-opus-5` | 5 | 25 | previous generation; possible server-side fallback target |
+| `claude-sonnet-5` | 2 | 10 | the v1 model; possible fallback target |
+| `claude-opus-4-8` | 5 | 25 | possible fallback target |
+
+Modifiers: cache writes 1.25× input (5-minute TTL) or 2× (1-hour TTL); cache reads
+0.1× input; Batches 0.5× overall. Each `usage.iterations` hop is priced at its own
+model (§13.5.2).
+
+**Pricing rules (binding):**
+- **Lookup accepts only an exact id, or an exact id plus a dated suffix
+  `-YYYYMMDD`** (regex `^<key>-\d{8}$`). Anything else counts as unknown. A loose
+  prefix match is not allowed, because it would price e.g. `claude-opus-5-5-preview`
+  or `claude-opus-5-turbo` at the wrong row.
+- **Unknown models are priced at an explicit ceiling**, `UNKNOWN_MODEL_PRICE` in
+  `lib/claude/usage.ts`, currently `{ inputPerMTok: 5, outputPerMTok: 25 }`.
+  - Its input rate is ≥ the **highest** input price in the table and its output rate
+    is ≥ the **highest** output price, each maxed independently (today $5 / $25).
+    Raise it whenever a pricier model is added to `PRICES`.
+    It is not the row with the highest output price, since that row's input price may
+    not be the highest.
+  - The result is `priceKnown: false` plus a warning log naming only the model id.
+  - The spend guard (§13.9.4) therefore over-counts rather than under-counts until
+    someone adds the price.
+  - A unit test asserts the ceiling is ≥ every row on both axes, and that dated-suffix
+    and malformed ids resolve as specified.
+
 Assumptions: a typical student resume is ~2,500 tokens. Output-token figures include
 thinking at the chosen effort and are estimates to re-measure from `ai_usage_events`
 after M3. Cache savings are ignored (conservative).

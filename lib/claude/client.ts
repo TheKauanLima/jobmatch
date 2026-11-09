@@ -330,6 +330,42 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
 }
 
 /**
+ * Settles with `promise`, or rejects with `APIUserAbortError` as soon as
+ * `signal` fires, whichever comes first.
+ *
+ * The SDK forwards `signal` to fetch, but it only checks `signal.aborted`
+ * at certain points: before each attempt, and when the request fails with a
+ * connection-level error. Its retry backoff is a plain `sleep()` that honors
+ * `Retry-After` with no cap and ignores the signal (verified in 0.122's
+ * `retryRequest`). Racing here makes the caller's deadline hard. The
+ * abandoned SDK promise is still observed, so it can't become an unhandled
+ * rejection, and it throws `APIUserAbortError` itself once its sleep ends.
+ */
+function raceAbort<R>(promise: Promise<R>, signal: AbortSignal | undefined): Promise<R> {
+  if (!signal) {
+    return promise;
+  }
+  return new Promise<R>((resolve, reject) => {
+    const onAbort = () => reject(new Anthropic.APIUserAbortError());
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
  * The single choke point for synchronous Claude calls (§13.5.2). See the
  * module docstring for the exact behavior. Always resolves to a
  * schema-validated `value` or throws a `ClaudeApiError` subclass.
@@ -355,9 +391,17 @@ export async function callStructured<T>(
   let response: Anthropic.Beta.Messages.BetaMessage;
   let requestId: string | null;
   try {
-    const { data, request_id } = await client.beta.messages
-      .create(params, { signal: args.signal, timeout: config.timeoutMs })
-      .withResponse();
+    // Deadline already passed (e.g. retryOnceOnInvalidOutput after the
+    // deadline fired): don't start a call that can't finish.
+    if (args.signal?.aborted) {
+      throw new Anthropic.APIUserAbortError();
+    }
+    const { data, request_id } = await raceAbort(
+      client.beta.messages
+        .create(params, { signal: args.signal, timeout: config.timeoutMs })
+        .withResponse(),
+      args.signal,
+    );
     response = data;
     requestId = request_id ?? null;
   } catch (err) {
