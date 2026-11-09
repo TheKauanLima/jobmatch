@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  cancelTasksForUser,
+  cancelQueuedTasksForUser,
   claimDeadTaskHooks,
   claimTasks,
   completeDeadTaskHook,
@@ -110,9 +110,9 @@ describe("tasks queries", () => {
     expect(await failTask(rpcClient({ data: null, error: null }).client, failArgs)).toBeNull();
   });
 
-  it("cancelTasksForUser returns the count", async () => {
+  it("cancelQueuedTasksForUser returns the count", async () => {
     const { client, rpc } = rpcClient({ data: 3, error: null });
-    expect(await cancelTasksForUser(client, "u1")).toBe(3);
+    expect(await cancelQueuedTasksForUser(client, "u1")).toBe(3);
     expect(rpc).toHaveBeenCalledWith("cancel_tasks_for_user", { p_user_id: "u1" });
   });
 

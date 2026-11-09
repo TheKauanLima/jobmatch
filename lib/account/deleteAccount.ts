@@ -1,9 +1,9 @@
 import { isAuthApiError } from "@supabase/supabase-js";
 
-import { cancelQueuedTasksForUser } from "@/lib/account/cancelUserTasks";
 import { purgeUserResumeObjects } from "@/lib/account/purgeUserStorage";
 import { verifyPassword } from "@/lib/account/reauthenticate";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { cancelQueuedTasksForUser } from "@/lib/supabase/queries/tasks";
 
 /**
  * Self-serve account deletion, per docs/ARCHITECTURE.md §13.13.7 and the
@@ -13,8 +13,10 @@ import { createAdminClient } from "@/lib/supabase/admin";
  *
  *   1. Re-authenticate with the password on a throwaway, non-cookie client.
  *      Wrong password → `reauth_failed` (403). Nothing else has happened.
- *   2. `cancel_tasks_for_user` (feature-gated no-op until M1.2; see
- *      `cancelUserTasks.ts`). Failure → stop, nothing deleted.
+ *   2. `cancel_tasks_for_user` via
+ *      `lib/supabase/queries/tasks.ts#cancelQueuedTasksForUser`: the user's
+ *      queued background tasks become `cancelled`. Failure → stop, nothing
+ *      deleted.
  *   3. Purge every object under `{user_id}/` in the `resumes` bucket
  *      (paginated). Failure → stop; no DB row and no auth user has been
  *      touched, so the request is safely retryable. Objects removed before

@@ -4031,8 +4031,10 @@ Specified in §13.13.6. It lets the report UI and future pages load fresh stats
 independently of a report's snapshot.
 
 #### 13.9.3 Per-user rate limits
-`lib/rateLimit.ts` replaces `lib/claude/rateLimit.ts`. v1 kinds `analyze`/`match` are
-retired with their routes in M3.9. Enforcement happens in the RPCs (§13.3.1), and
+`lib/rateLimit.ts` is the v2 rate-limit module (as built in M1.4c: it owns
+`nextUtcMidnight`, `consumeAccountReauthAttempt` and `getMyRateLimits`). `lib/claude/rateLimit.ts` stays
+v1-only (kinds `analyze`/`match`) and reuses `nextUtcMidnight` from `lib/rateLimit.ts`
+until M3.9, when it is deleted and the v1 kinds are retired with their routes. Enforcement happens in the RPCs (§13.3.1), and
 limits come from `private.rate_limits`. Routes map `rate_limited:<kind>` to `429 {
 error, code: 'rate_limited', kind, retry_after }`, where `retry_after` is the next UTC
 midnight, same convention as §5.
@@ -4484,10 +4486,23 @@ posting_count, required_count } ] } }`. `404` for an unknown slug.
   The user id and email always come from the verified session (`requireSession()`),
   never from the body. Validation errors never echo the password.
 - `export const maxDuration = 60`.
-- **Sequence.** Steps 0–4 live in `lib/account/deleteAccount.ts`; step 5 is done by
-  the route.
-  0. **Re-auth rate limit** (M1.4c, after M1.2 merges; see "Re-auth rate limiting"
-     below). Consume one `account_reauth` attempt before contacting GoTrue.
+- **Sequence.** Step 0 and step 5 are done by the route; steps 1–4 live in
+  `lib/account/deleteAccount.ts`.
+  0. **Re-auth rate limit** (built in M1.4c; see "Re-auth rate limiting" below). After
+     the session check and body validation, the route charges one `account_reauth`
+     attempt via `lib/rateLimit.ts#consumeAccountReauthAttempt` (RPC
+     `consume_account_reauth_attempt`, session client). This happens before
+     `deleteAccount` and before any GoTrue call. A `400` or `401` never consumes an
+     attempt.
+     - `true` → continue to step 1.
+     - `false` → `429 { error, code:'rate_limited', kind:'account_reauth',
+       retry_after }`, `retry_after` = next UTC midnight.
+     - RPC error with SQLSTATE **`23503`** (the user was already deleted by a
+       concurrent request, so the `rate_limit_events` FK insert fails) or **`42501`**
+       (`unauthenticated`) → `401 { error:'Unauthorized' }`, which M1.4b already
+       treats as "already deleted" (frontend rule below).
+     - Any other RPC error, a throw, a non-boolean result, or a client failure →
+       `500` (fails closed; no GoTrue call).
   1. **Re-authenticate** (`lib/account/reauthenticate.ts#verifyPassword`):
      - Runs `signInWithPassword` on a **throwaway client**: plain supabase-js with the
        anon key, `persistSession:false`, `autoRefreshToken:false`,
@@ -4512,19 +4527,13 @@ posting_count, required_count } ] } }`. `404` for an unknown slug.
        `403`. Adding another sign-in method requires designing a different re-auth
        path, for example GoTrue's `reauthenticate()` nonce flow or a fresh OAuth
        round-trip, **before** that method ships.
-  2. **Cancel queued tasks** (`lib/account/cancelUserTasks.ts` →
-     `cancel_tasks_for_user`):
-     - Gated by the code constant `CANCEL_TASKS_FOR_USER_ENABLED`, which stays `false`
-       until 0007 is applied in **every** environment the app runs against.
-     - It is a constant on purpose, not runtime "function missing" detection, because
-       detection would also hide a genuinely missing function after M1.2.
-     - Failure → `500`, and nothing has been deleted.
-     - **Decision:** the RPC call moves to `lib/supabase/queries/tasks.ts#cancelQueuedTasksForUser`.
-       Every Postgres call goes through `queries/*` (the §3 rule), and that file already
-       owns the other task functions. When the gate is flipped (M1.4c), types are
-       regenerated, the `UntypedRpcClient` cast is dropped, and
-       `lib/account/cancelUserTasks.ts` is deleted. `deleteAccount.ts` then imports from
-       `queries/tasks.ts`.
+  2. **Cancel queued tasks** (`lib/supabase/queries/tasks.ts#cancelQueuedTasksForUser`
+     → `cancel_tasks_for_user`; as built in M1.4c):
+     - Always runs; there is no gate. It is the first thing `deleteAccount` does after
+       step 1, before any Storage or auth-admin call.
+     - The call lives in `queries/tasks.ts` because every Postgres call goes through
+       `queries/*` (the §3 rule) and that file owns the other task functions.
+     - Failure → `500`, and nothing has been deleted, so the request is retry-safe.
   3. **Purge Storage** (`lib/account/purgeUserStorage.ts#purgeUserResumeObjects`,
      admin client):
      - **Guards** (this runs with RLS bypassed):
@@ -4574,13 +4583,14 @@ posting_count, required_count } ] } }`. `404` for an unknown slug.
   | Status | Body | When |
   |---|---|---|
   | `204` | none (cookies cleared) | deleted |
-  | `400` | `{code:'validation_failed'}` | bad or missing JSON body |
-  | `401` | `{error}` | no session |
-  | `403` | `{code:'reauth_failed'}` | wrong password, or no email on the session |
-  | `429` | `{code:'rate_limited', kind:'account_reauth', retry_after}` | from M1.4c |
-  | `500` | `{code:'internal_error'}` | any step failed before the user was deleted; GoTrue unavailable; rate-limit check failed (fails closed) |
+  | `400` | `{error, code:'validation_failed'}` | bad or missing JSON body |
+  | `401` | `{error:'Unauthorized'}` | no session; or the step-0 RPC failed with `23503` / `42501` (user already deleted) |
+  | `403` | `{error, code:'reauth_failed'}` | wrong password, or no email on the session |
+  | `429` | `{error, code:'rate_limited', kind:'account_reauth', retry_after}` | daily `account_reauth` limit reached (step 0) |
+  | `500` | `{error, code:'internal_error'}` | any step failed before the user was deleted; GoTrue unavailable; rate-limit check failed (fails closed) |
 
-  The `500` copy says "your account still exists — try again".
+  Every `500` from this route uses one shared copy constant: "We couldn't finish
+  deleting your account. Your account still exists — please try again."
 - **Frontend rule:** a **`401` from this endpoint means "already signed out or
   already deleted"**. This happens on a retry after a `204` that was lost in transit,
   because the session no longer resolves. M1.4b treats it like success: show the
@@ -4612,14 +4622,23 @@ S2.
 - **Responses:**
   - Limit reached → `429 { error, code:'rate_limited', kind:'account_reauth',
     retry_after }`, where `retry_after` is the next UTC midnight.
-  - RPC error → `500 internal_error`. It fails closed: no GoTrue call is made without
-    a successful consume.
+  - RPC error with SQLSTATE `23503` or `42501` → `401 { error:'Unauthorized' }`
+    (account already gone; see step 0).
+  - Any other RPC error, a throw, or a non-boolean result → `500 internal_error`. It
+    fails closed: no GoTrue call is made without a successful consume.
 - **Scope:** applies to every future password-re-auth endpoint (e.g. change email),
   which must reuse the same kind.
 
-**`GET /api/account/limits`** (new; M1.4c): `{ "limits": [ { kind, daily_limit,
-used_today, resets_at } ] }` from `get_my_rate_limits()`. The list includes
-`account_reauth`.
+**`GET /api/account/limits`** (new; built in M1.4c, `app/api/account/limits/route.ts`)
+- `200 { "limits": [ { kind, daily_limit, used_today, resets_at } ] }` from
+  `get_my_rate_limits()` (via `lib/rateLimit.ts#getMyRateLimits`), called on the
+  **session** client. The user is
+  `auth.uid()`; no user id is read from the request. The list includes
+  `account_reauth`.
+- `resets_at` is normalized to an ISO-8601 UTC string ending in `Z`.
+- `401 { error }` when signed out, or when the RPC fails with SQLSTATE `42501`.
+- `500 { error, code:'internal_error' }` on any other failure.
+- Every response, including errors, sets `Cache-Control: private, no-store`.
 
 **`GET|PUT /api/account/notifications`** (Phase 5): `{ "weekly_digest_enabled":
 boolean }`.
@@ -4707,11 +4726,12 @@ the same semantics for RFC 8058 one-click.
   /net/       safeFetch.ts, ipPolicy.ts, extractListingText.ts
   /account/   deleteAccount.ts (orchestrates §13.13.7 steps 1–4 + post-delete sweep),
               reauthenticate.ts (throwaway anon-key client; never admin), purgeUserStorage.ts (admin),
-              cancelUserTasks.ts (temporary — superseded by queries/tasks.ts in M1.4c, then deleted),
               clearAuthSession.ts (cookie-bound server client + cookie-expiry backstop)
   /email/     provider.ts, resend.ts, templates/weeklyDigest.ts          (Phase 5)
   /client/    usePolledResource.ts
-  rateLimit.ts                                                           (replaces lib/claude/rateLimit.ts)
+  rateLimit.ts      (v2 rate-limit module, §13.9.3: nextUtcMidnight, consumeAccountReauthAttempt,
+                     getMyRateLimits;
+                     lib/claude/rateLimit.ts stays v1-only until M3.9)
   /supabase/queries/ (+) reports.ts, profiles.ts, critiques.ts, recommendations.ts, jobRequirements.ts,
               embeddings.ts, taxonomy.ts, tasks.ts, usage.ts, imports.ts, market.ts, sources.ts, notifications.ts
 /data/taxonomy/skills.json, role-families.json
@@ -4730,10 +4750,12 @@ the same semantics for RFC 8058 one-click.
   `DELETE /api/resumes/:id` tests, and the worker tests, and a fake inside
   `lib/account/` would sit in production source.
 - Data fixtures stay in `/tests/fixtures/`.
-- Code under `lib/**` or `app/**` must never import from `/tests/**`. The reviewer
-  greps for this.
-- `lib/account/testing/fakeStorage.ts` moves to `/tests/fakes/supabaseStorage.ts` in
-  M1.4c.
+- Code under `lib/**` or `app/**` must never import from `/tests/**`, except from
+  `*.test.ts` files. Since M1.4c this is enforced by a `no-restricted-imports` block in
+  `eslint.config.mjs`. The lint rule only sees static imports; the reviewer still
+  checks for dynamic `import()` / `require()` of `/tests/**`.
+- The account-deletion Storage fake lives at `/tests/fakes/supabaseStorage.ts` (moved
+  from `lib/account/testing/` in M1.4c).
 **Service-role boundary (reviewer greps for `createAdminClient` imports):** allowed
 only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidates.ts`,
 `lib/supabase/queries/{tasks,usage,embeddings,sources}.ts`, `app/api/worker/**`,

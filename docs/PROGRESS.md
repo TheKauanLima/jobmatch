@@ -110,28 +110,53 @@ this file at the end of every work session.
 - §13 kept in sync with every review outcome; ROADMAP gained M1.1b, M1.4c, and quote
   display tasks in M3.2/M3.6 (show original text, not NFKC-normalized quotes).
 
-### Blocked — waiting on the user
-- **Apply 0007 + 0008 to the live database.** The Supabase connector disconnected
-  from the session. Either reconnect it (claude.ai connector settings) so the
-  orchestrator applies and verifies, or paste the SQL into the Supabase SQL Editor.
-  Until applied, the v1 routes log `[ALERT][usageSink] failed to record` (harmless;
-  AI spend just isn't recorded).
+- **0007 + 0008 APPLIED to the live database** (2026-11-09, via the Supabase
+  connector, files sent verbatim). Verified: 4 active `kalify-*` cron jobs owned by
+  postgres; all 19 functions owned by postgres with `search_path=""`;
+  anon/authenticated cannot execute any service function; `invoke_worker_tick` not
+  executable by service_role; no USAGE on `private` for anon/authenticated; RLS on
+  all 4 new tables, only `rate_limit_events` selectable by authenticated; rate-limit
+  seed rows present. Smoke test in a rolled-back transaction passed (dedupe, claim,
+  fencing, retry→dead, hook outbox, tick skips without Vault secrets). Advisors:
+  expected "RLS enabled, no policy" INFO on `background_tasks`, `ai_usage_events`,
+  `private.rate_limits`; WARN "authenticated can execute SECURITY DEFINER" on
+  `get_my_rate_limits` / `consume_account_reauth_attempt` — intended (both no-arg,
+  scoped to `auth.uid()`); leaked-password protection still off (user to-do).
+- **Generated types diffed against `types/database.ts`:** no drift; only deliberate
+  narrowings (recorded in the file header).
+- **M1.4c — Account hardening: APPROVED** (review → APPROVED WITH NITS → nits fixed,
+  checks re-run by the orchestrator: 953 tests, tsc and eslint clean).
+  `lib/rateLimit.ts` (v2 rate-limit module); `DELETE /api/account` charges an
+  `account_reauth` attempt before any GoTrue call (false → 429, RPC error → 500,
+  23503/42501 → 401 for the concurrent-delete race); one shared 500 copy;
+  `CANCEL_TASKS_FOR_USER_ENABLED` gate and `lib/account/cancelUserTasks.ts` deleted,
+  deletion always calls `queries/tasks.ts#cancelQueuedTasksForUser` first;
+  `GET /api/account/limits`; test fake moved to `tests/fakes/supabaseStorage.ts`,
+  `no-restricted-imports` lint rule keeps `lib/`/`app/` off `tests/**`.
+  Live check (rolled back): 10 attempts allowed, 11th refused. pgTAP criterion
+  handed off to M1.3 (recorded in ROADMAP). §13.9.3 / §13.13.7 / §13.14 synced.
+
+- **Production was pointed at the wrong database (fixed).** A Vercel Marketplace
+  Supabase resource, `supabase-bole-bell` (project `scvkmuiajdizsoxlepgo`, Free plan,
+  owned by the Vercel team, not in the user's Supabase org), was connected to the
+  `jobmatch` Vercel project and had replaced the Supabase env vars in Production and
+  Preview. Disconnected it; set `NEXT_PUBLIC_SUPABASE_URL` / `_ANON_KEY` (JobMatch,
+  verified by key `ref`) and `SUPABASE_SERVICE_ROLE_KEY` (sensitive) on Production +
+  Preview; redeployed. The resource still exists. Delete it only after the user
+  confirms nothing needs it. Any sign-ups made while it was connected live there,
+  not in JobMatch.
+- **Worker secrets:** `WORKER_SECRET`, `APP_BASE_URL` (Vercel Production) and Vault
+  `kalify_worker_url` / `kalify_worker_secret` are set; ticks return 202.
 
 ### Next steps (in order)
-1. Apply 0007 → 0008; verify: 4 `kalify-*` cron jobs; functions owned by postgres
-   with `search_path=""`; anon/authenticated can't execute service functions;
-   authenticated has no USAGE on `private`; advisors show only the expected
-   "RLS enabled, no policy" notices on `background_tasks` / `ai_usage_events`.
-2. Regenerate `types/database.ts` from the live schema and diff it against the
-   hand-written one.
+1. ~~Apply 0007 → 0008 and verify~~ — done.
+2. ~~Regenerate/diff types~~ — done.
 3. User: generate `WORKER_SECRET`; set `WORKER_SECRET` + `APP_BASE_URL` on Vercel
    **Production only**; deploy; then create Vault secrets `kalify_worker_url` and
    `kalify_worker_secret`; check Deployment Protection doesn't block
    `/api/worker/tick`. Then run the M1.2 acceptance check (`maintenance.noop`).
-4. M1.4c (flip `CANCEL_TASKS_FOR_USER_ENABLED`, move the RPC to
-   `lib/supabase/queries/tasks.ts`, `account_reauth` route wiring,
-   `GET /api/account/limits`, move test fake to `/tests/fakes/`).
-5. M1.3 QA (pgTAP + two-connection concurrency script — reviewer listed exactly
+4. ~~M1.4c~~ — done.
+5. M1.3 QA (now also: `consume_account_reauth_attempt` pgTAP, handed off from M1.4c) (pgTAP + two-connection concurrency script — reviewer listed exactly
    what it must cover), M1.1b, M1.4b settings UI, then M1.5 ingestion.
 6. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
    `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.

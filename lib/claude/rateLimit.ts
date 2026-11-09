@@ -15,10 +15,14 @@
  * is an accurate proxy for "Claude calls made today" — every successful
  * call inserts exactly one row, and failed calls (which don't insert a row)
  * don't count against the cap.
+ *
+ * v1 only: superseded by `lib/rateLimit.ts` (docs/ARCHITECTURE.md §13.9.3)
+ * and removed with the v1 analyze/match routes in M3.9.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { nextUtcMidnight } from "@/lib/rateLimit";
 import type { Database } from "@/types/database";
 
 type Client = SupabaseClient<Database>;
@@ -64,13 +68,6 @@ function startOfTodayUtc(now: Date): string {
   ).toISOString();
 }
 
-/** Start of the next UTC calendar day (i.e. when the cap resets), as an ISO timestamp. */
-function startOfNextDayUtc(now: Date): string {
-  return new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1),
-  ).toISOString();
-}
-
 /**
  * Checks whether `userId` is at or over their daily cap for `config.kind`.
  * Counts today's (UTC) rows they own in the relevant table via a `head`
@@ -106,7 +103,7 @@ export async function checkRateLimit(
       allowed: false,
       count: used,
       limit: config.limit,
-      retryAfter: startOfNextDayUtc(now),
+      retryAfter: nextUtcMidnight(now),
     };
   }
 

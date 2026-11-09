@@ -29,8 +29,17 @@
  * unexposed `private` schema). docs/ARCHITECTURE.md §13.3.0 says this file
  * must be regenerated with `supabase gen types typescript --project-id
  * xpubgotqrsosvpiwlpyh` after each migration; these two were hand-authored
- * only because they were written before being applied (M1.2). Regenerate
- * and diff once 0007/0008 are applied to the live project.
+ * only because they were written before being applied (M1.2).
+ *
+ * Verified 2026-11-09 after applying 0007/0008 to the live project: the
+ * generated types were compared against this file entry by entry (same
+ * tables, columns, functions and argument optionality; every hand type is
+ * assignable to the generated one). The only differences are deliberate
+ * narrowings kept here: string-literal unions for status/kind/provider
+ * columns, `search_vector` omitted from job_descriptions Insert/Update (a
+ * generated column), `fail_task` returning `... | null` (NULL when fenced
+ * out, which the generator cannot express), and `Record<string, never>` for
+ * no-argument RPCs. Keep narrowing on regeneration.
  */
 
 export type Json =

@@ -115,6 +115,8 @@ Depends on: M1.1, M1.2. Implements §13.16 (DB and idempotency subsets).
    - the dedupe partial unique index
    - `snooze_task` not counting an attempt
    - atomic `consume_rate_limit`
+   - `consume_account_reauth_attempt` charges only `auth.uid()`; 11th call in a UTC
+     day returns false (handed off from M1.4c)
    - execute privileges revoked on service functions
    - RLS on the three new tables
 3. [QA] vitest: worker loop budget logic (doesn't start tasks that won't fit), the
@@ -191,7 +193,9 @@ doubles).
 - The 11th re-auth attempt in a UTC day returns 429 without calling GoTrue (route
   test asserts no `signInWithPassword` call).
 - An RPC failure returns 500 and makes no GoTrue call.
-- pgTAP confirms the RPC only ever charges `auth.uid()`.
+- pgTAP confirms the RPC only ever charges `auth.uid()`: **handed off to M1.3**
+  (no pgTAP harness yet). Verified on the live DB in a rolled-back transaction: 10
+  calls returned true, the 11th false.
 - Deletion cancels queued tasks.
 - Nothing under `lib/` or `app/` imports `/tests/**`.
 

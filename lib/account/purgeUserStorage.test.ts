@@ -12,7 +12,7 @@ import {
   resumePaths,
   USER_A,
   USER_B,
-} from "@/lib/account/testing/fakeStorage";
+} from "@/tests/fakes/supabaseStorage";
 import { RESUME_STORAGE_BUCKET } from "@/lib/storage/resumeFiles";
 
 function adminWith(storage: ReturnType<typeof createFakeStorage>["storage"]) {

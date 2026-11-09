@@ -14,7 +14,7 @@ import type {
  * table is server-only and every task function's EXECUTE is revoked from
  * anon/authenticated. This file is inside the §13.14 service-role boundary
  * (`lib/supabase/queries/tasks.ts`); callers are `lib/tasks/**`,
- * `app/api/worker/**`, and account deletion (`cancelTasksForUser`).
+ * `app/api/worker/**`, and account deletion (`cancelQueuedTasksForUser`).
  *
  * Error messages carry the operation name plus PostgREST's code/message
  * only — never payload contents or row data.
@@ -239,11 +239,14 @@ export async function extendTaskLease(
 }
 
 /**
- * Account deletion (§13.13.7): cancels the user's queued tasks. `userId`
- * must come from the verified session, never from request input.
+ * Account deletion (§13.13.7 step 2): sets the user's `queued` tasks to
+ * `cancelled` via `cancel_tasks_for_user`. `userId` must come from the
+ * verified session, never from request input. Idempotent, so a retried
+ * deletion can call it again. Throws `TaskQueryError` on an RPC error; the
+ * caller treats that as fatal before anything is deleted.
  * Returns the number of tasks cancelled.
  */
-export async function cancelTasksForUser(
+export async function cancelQueuedTasksForUser(
   admin: AdminClient,
   userId: string,
 ): Promise<number> {

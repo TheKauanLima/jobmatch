@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * deleteAccount is exercised with the REAL Storage purge and task-cancel
- * modules against an in-memory fake admin client (Storage + auth.admin), so
+ * modules against an in-memory fake admin client (Storage + auth.admin +
+ * the `cancel_tasks_for_user` RPC), so
  * ordering, failure, and retry behavior are tested end to end at the module
  * level. Only the password check and the admin-client factory are mocked.
  */
@@ -22,7 +23,7 @@ vi.mock("@/lib/supabase/admin", () => ({
 const { AuthApiError } = await import("@supabase/supabase-js");
 const { deleteAccount } = await import("@/lib/account/deleteAccount");
 const { createFakeStorage, resumePaths, USER_A, USER_B } = await import(
-  "@/lib/account/testing/fakeStorage"
+  "@/tests/fakes/supabaseStorage"
 );
 
 const EMAIL = "student@example.test";
@@ -34,6 +35,8 @@ function setupWorld(params: {
   paths: string[];
   storageOpts?: FakeStorageOpts;
   deleteUserImpl?: (id: string) => Promise<{ error: unknown }>;
+  /** Result of the `cancel_tasks_for_user` RPC (default: 2 cancelled). */
+  rpcImpl?: () => Promise<{ data: unknown; error: unknown }>;
 }) {
   const fake = createFakeStorage(params.paths, params.storageOpts);
   const users = new Set([USER_A, USER_B]);
@@ -64,7 +67,12 @@ function setupWorld(params: {
   const admin = {
     storage: { from: () => bucket },
     auth: { admin: { deleteUser } },
-    rpc: vi.fn(),
+    rpc: vi.fn(async (fn: string, ...rest: unknown[]) => {
+      void rest;
+      events.push(`rpc.${fn}`);
+      if (params.rpcImpl) return params.rpcImpl();
+      return { data: 2, error: null };
+    }),
   };
   mockCreateAdminClient.mockReturnValue(admin);
 
@@ -136,12 +144,16 @@ describe("deleteAccount — happy path", () => {
     expect(world.fake.objects.size).toBe(0);
   });
 
-  it("does not call cancel_tasks_for_user while the M1.2 feature gate is off", async () => {
-    const world = setupWorld({ paths: [] });
+  it("cancels the session user's queued tasks, before any Storage or auth deletion", async () => {
+    const world = setupWorld({ paths: resumePaths(USER_A, 2) });
 
-    await deleteAccount(input);
+    await expect(deleteAccount(input)).resolves.toEqual({ ok: true });
 
-    expect(world.admin.rpc).not.toHaveBeenCalled();
+    expect(world.admin.rpc).toHaveBeenCalledTimes(1);
+    expect(world.admin.rpc).toHaveBeenCalledWith("cancel_tasks_for_user", {
+      p_user_id: USER_A,
+    });
+    expect(world.events[0]).toBe("rpc.cancel_tasks_for_user");
   });
 
   it("succeeds for a user with no Storage objects at all", async () => {
@@ -184,6 +196,49 @@ describe("deleteAccount — re-authentication", () => {
 
     expect(result).toEqual({ ok: false, reason: "failed", step: "reauth" });
     expect(world.events).toEqual([]);
+  });
+});
+
+describe("deleteAccount — task-cancel failure deletes nothing and is retryable", () => {
+  it("an RPC error → failed at cancel_tasks; no Storage call, no deleteUser", async () => {
+    const world = setupWorld({
+      paths: resumePaths(USER_A, 2),
+      rpcImpl: async () => ({
+        data: null,
+        error: { code: "PGRST202", message: "function not found" },
+      }),
+    });
+
+    const result = await deleteAccount(input);
+
+    expect(result).toEqual({ ok: false, reason: "failed", step: "cancel_tasks" });
+    expect(world.events).toEqual(["rpc.cancel_tasks_for_user"]);
+    expect(world.deleteUser).not.toHaveBeenCalled();
+    expect(world.fake.objects.size).toBe(2);
+    expect(world.users.has(USER_A)).toBe(true);
+  });
+
+  it("a thrown RPC → failed at cancel_tasks, and a retry completes", async () => {
+    let calls = 0;
+    const world = setupWorld({
+      paths: resumePaths(USER_A, 2),
+      rpcImpl: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("network down");
+        return { data: 0, error: null };
+      },
+    });
+
+    expect(await deleteAccount(input)).toEqual({
+      ok: false,
+      reason: "failed",
+      step: "cancel_tasks",
+    });
+    expect(world.users.has(USER_A)).toBe(true);
+
+    expect(await deleteAccount(input)).toEqual({ ok: true });
+    expect(world.users.has(USER_A)).toBe(false);
+    expect(world.fake.objects.size).toBe(0);
   });
 });
 
