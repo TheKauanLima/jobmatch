@@ -6,6 +6,7 @@ import { taskRegistry, type TaskRegistry } from "@/lib/tasks/registry";
 import type { BackgroundTaskRow, TaskDefinition, TaskHandlerResult } from "@/lib/tasks/types";
 import {
   runWorkerTick,
+  WORKER_CLAIM_MARGIN_MS,
   WORKER_HARD_BUDGET_MS,
   WORKER_MAX_RUNNING_BACKGROUND,
   WORKER_MAX_RUNNING_USER,
@@ -251,12 +252,16 @@ class FakeStore implements WorkerStore {
   }
 }
 
-/** A clock that tracks real time but can be jumped forward. */
-function makeClock(start = Date.parse("2026-11-04T12:00:00.000Z")) {
+/**
+ * A clock that tracks real time but can be jumped forward. `frozen` stops
+ * the real-time drift, so time only moves via `advance` (exact-boundary
+ * tests need that).
+ */
+function makeClock(start = Date.parse("2026-11-04T12:00:00.000Z"), frozen = false) {
   const realStart = Date.now();
   let offset = 0;
   return {
-    now: () => start + (Date.now() - realStart) + offset,
+    now: () => start + (frozen ? 0 : Date.now() - realStart) + offset,
     advance: (ms: number) => {
       offset += ms;
     },
@@ -277,8 +282,8 @@ function def(overrides: Partial<TaskDefinition> = {}): TaskDefinition {
   };
 }
 
-function setup(registry: TaskRegistry, opts: { budgetUsd?: number } = {}) {
-  const clock = makeClock();
+function setup(registry: TaskRegistry, opts: { budgetUsd?: number; frozen?: boolean } = {}) {
+  const clock = makeClock(undefined, opts.frozen ?? false);
   const store = new FakeStore(clock.now);
   const kick = vi.fn().mockResolvedValue(true);
   const logs: { level: string; message: string; fields: Record<string, unknown> }[] = [];
@@ -648,7 +653,7 @@ describe("runWorkerTick — snooze and fencing", () => {
 });
 
 describe("runWorkerTick — time budget", () => {
-  it("only claims kinds that still fit: elapsed + maxDurationMs < hard budget", async () => {
+  it("only claims kinds that still fit: elapsed + maxDurationMs + claim margin < hard budget", async () => {
     const { store, clock, tick } = setup({
       "long.user": def({ maxDurationMs: 200_000, leaseSeconds: 270 }),
       "short.user": def({ maxDurationMs: 10_000 }),
@@ -662,7 +667,8 @@ describe("runWorkerTick — time budget", () => {
     expect(store.claimCalls[0].kinds).toEqual(["short.user"]);
     expect(store.get(short.id).status).toBe("succeeded");
     expect(store.rows.find((r) => r.kind === "long.user")?.status).toBe("queued");
-    expect(100_000 + 200_000).toBeGreaterThanOrEqual(WORKER_HARD_BUDGET_MS);
+    expect(100_000 + 200_000 + WORKER_CLAIM_MARGIN_MS).toBeGreaterThanOrEqual(WORKER_HARD_BUDGET_MS);
+    expect(100_000 + 10_000 + WORKER_CLAIM_MARGIN_MS).toBeLessThan(WORKER_HARD_BUDGET_MS);
   });
 
   it("stops claiming at the soft stop", async () => {
@@ -1229,5 +1235,423 @@ describe("createWorkerStore — per-call DB timeouts", () => {
     for (const [signal] of abortSignal.mock.calls) expect(signal).toBeInstanceOf(AbortSignal);
     expect(timeoutSpy).toHaveBeenCalledTimes(10);
     expect(timeoutSpy).toHaveBeenCalledWith(WORKER_DB_TIMEOUT_MS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M1.3 (QA): gaps in the time-budget, self-kick and fit logic not covered above.
+// ---------------------------------------------------------------------------
+
+describe("runWorkerTick — M1.3 time budget: never starts a task that won't fit", () => {
+  it("exact boundary: elapsed + maxDurationMs + claim margin === hard budget is NOT claimed; 1 ms less is", async () => {
+    const elapsed = 200_000;
+    expect(WORKER_CLAIM_MARGIN_MS).toBe(15_000);
+    // 200 000 + 70 000 + 15 000 === 285 000 (edge); 69 999 fits.
+    const { store, clock, tick } = setup(
+      {
+        "edge.user": def({ maxDurationMs: WORKER_HARD_BUDGET_MS - WORKER_CLAIM_MARGIN_MS - elapsed, leaseSeconds: 120 }),
+        "fits.user": def({ maxDurationMs: WORKER_HARD_BUDGET_MS - WORKER_CLAIM_MARGIN_MS - elapsed - 1, leaseSeconds: 120 }),
+      },
+      { frozen: true },
+    );
+    const edge = store.add({ kind: "edge.user", task_class: "user" });
+    const fits = store.add({ kind: "fits.user", task_class: "user" });
+
+    await tick(clock.now() - elapsed);
+
+    for (const call of store.claimCalls) expect(call.kinds).not.toContain("edge.user");
+    expect(store.claimCalls[0].kinds).toEqual(["fits.user"]);
+    expect(store.get(edge.id)).toMatchObject({ status: "queued", attempts: 0 });
+    expect(store.get(fits.id).status).toBe("succeeded");
+  });
+
+  it("applies the fit filter to the background class too", async () => {
+    const { store, clock, tick } = setup(
+      {
+        "long.bg": def({ class: "background", maxDurationMs: 220_000, leaseSeconds: 270 }),
+        "short.bg": def({ class: "background", maxDurationMs: 10_000 }),
+      },
+      { frozen: true },
+    );
+    const long = store.add({ kind: "long.bg", task_class: "background" });
+    const short = store.add({ kind: "short.bg", task_class: "background" });
+
+    await tick(clock.now() - 70_000); // 70 + 220 + 15 = 305 s >= 285 s; 70 + 10 + 15 = 95 s fits
+
+    const bgCalls = store.claimCalls.filter((c) => c.taskClass === "background");
+    expect(bgCalls.length).toBeGreaterThan(0);
+    for (const call of bgCalls) expect(call.kinds).toEqual(["short.bg"]);
+    expect(store.get(long.id).status).toBe("queued");
+    expect(store.get(short.id).status).toBe("succeeded");
+  });
+
+  it("re-evaluates the fit on every iteration: a kind that fit at the start is not claimed once time has passed", async () => {
+    const { store, clock, kick, tick } = setup(
+      {
+        // Higher priority, so the first claim takes these and fills the cap.
+        "short.user": def({
+          priority: 10,
+          maxDurationMs: 30_000,
+          handler: async () => {
+            clock.advance(25_000);
+            return { outcome: "succeeded" };
+          },
+        }),
+        "long.user": def({ priority: 0, maxDurationMs: 200_000, leaseSeconds: 270 }),
+      },
+      { frozen: true },
+    );
+    for (let i = 0; i < WORKER_MAX_RUNNING_USER; i++) store.add({ kind: "short.user", task_class: "user", priority: 10 });
+    const long = store.add({ kind: "long.user", task_class: "user", priority: 0 });
+
+    const summary = await tick();
+
+    const userCalls = store.claimCalls.filter((c) => c.taskClass === "user");
+    // First iteration (elapsed 0): both kinds fit (0 + 200 + 15 < 285).
+    expect([...userCalls[0].kinds].sort()).toEqual(["long.user", "short.user"]);
+    // Later iterations (elapsed 100 s): 100 + 200 + 15 >= 285, so long.user is excluded.
+    expect(userCalls.length).toBeGreaterThan(1);
+    for (const call of userCalls.slice(1)) expect(call.kinds).toEqual(["short.user"]);
+    expect(store.get(long.id)).toMatchObject({ status: "queued", attempts: 0, started_at: null });
+    // The long task is still claimable by a fresh tick, so the worker self-kicks.
+    expect(summary.succeeded).toBe(WORKER_MAX_RUNNING_USER);
+    expect(kick).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes no claim call for a class when none of its kinds fit, and exits idle", async () => {
+    const { store, clock, kick, tick } = setup(
+      {
+        "long.user": def({ maxDurationMs: 200_000, leaseSeconds: 270 }),
+        "long.bg": def({ class: "background", maxDurationMs: 200_000, leaseSeconds: 270 }),
+      },
+      { frozen: true },
+    );
+    store.add({ kind: "long.user", task_class: "user" });
+    store.add({ kind: "long.bg", task_class: "background" });
+
+    const summary = await tick(clock.now() - 100_000);
+
+    expect(store.claimCalls).toHaveLength(0);
+    expect(summary).toMatchObject({ claimed: 0, stopReason: "idle", kicked: false });
+    expect(kick).not.toHaveBeenCalled();
+  });
+
+  it("over budget late in a tick: only non-AI kinds that still fit are claimed", async () => {
+    const { store, clock, tick } = setup(
+      {
+        "ai.user": def({ usesAi: true, maxDurationMs: 10_000 }),
+        "plain.user": def({ maxDurationMs: 10_000 }),
+        "long.user": def({ maxDurationMs: 200_000, leaseSeconds: 270 }),
+      },
+      { frozen: true },
+    );
+    store.spendUsd = 100;
+    store.add({ kind: "ai.user", task_class: "user" });
+    store.add({ kind: "plain.user", task_class: "user" });
+    store.add({ kind: "long.user", task_class: "user" });
+
+    await tick(clock.now() - 100_000);
+
+    expect(store.claimCalls.length).toBeGreaterThan(0);
+    for (const call of store.claimCalls) expect(call.kinds).toEqual(["plain.user"]);
+  });
+
+  // M1.3-B2 (fixed): `elapsed` is taken at the top of each loop iteration,
+  // but awaited DB calls in the same iteration (global AI budget check,
+  // over-budget deferral, and for the background class the user-class claim)
+  // can each take up to WORKER_DB_TIMEOUT_MS (15 s), while the slack between
+  // the hard budget (285 s) and the platform kill (300 s) is only 15 s. The
+  // worker now re-checks the fit with a fresh clock right before each claim.
+  // Spec §13.4.2: only claims a kind if elapsed + maxDurationMs +
+  // WORKER_CLAIM_MARGIN_MS < WORKER_HARD_BUDGET_MS, elapsed re-read right
+  // before each claim.
+  it("M1.3-B2 regression: a slow AI budget check must not let a no-longer-fitting kind be claimed", async () => {
+    const { store, clock, tick } = setup(
+      {
+        "ai.user": def({ usesAi: true, maxDurationMs: 10_000 }),
+        "long.user": def({ maxDurationMs: 220_000, leaseSeconds: 270 }),
+      },
+      { frozen: true },
+    );
+    vi.spyOn(store, "getAiSpendSince").mockImplementation(async () => {
+      clock.advance(14_000); // a slow (but not timed-out) spend query
+      return 0; // under budget
+    });
+    const long = store.add({ kind: "long.user", task_class: "user" });
+
+    // At the top of the iteration: 40 + 220 + 15 = 275 s < 285 s (fits).
+    // When the claim is actually made: 54 + 220 + 15 = 289 s >= 285 s (doesn't).
+    await tick(clock.now() - 40_000);
+
+    for (const call of store.claimCalls) expect(call.kinds).not.toContain("long.user");
+    expect(store.get(long.id)).toMatchObject({ status: "queued", attempts: 0 });
+  });
+
+  it("M1.3-B2 regression: a slow user-class claim must not let a no-longer-fitting background kind be claimed", async () => {
+    const { store, clock, tick } = setup(
+      {
+        "quick.user": def({ maxDurationMs: 10_000 }),
+        "long.bg": def({ class: "background", maxDurationMs: 220_000, leaseSeconds: 270 }),
+        "short.bg": def({ class: "background", maxDurationMs: 10_000 }),
+      },
+      { frozen: true },
+    );
+    const originalClaim = store.claim.bind(store);
+    let slowed = false;
+    vi.spyOn(store, "claim").mockImplementation(async (args) => {
+      if (args.taskClass === "user" && !slowed) {
+        slowed = true;
+        clock.advance(14_000); // a slow (but not timed-out) user-class claim_tasks call
+      }
+      return originalClaim(args);
+    });
+    store.add({ kind: "quick.user", task_class: "user" });
+    const long = store.add({ kind: "long.bg", task_class: "background" });
+    const short = store.add({ kind: "short.bg", task_class: "background" });
+
+    // Top of the first iteration: 40 + 220 + 15 = 275 s < 285 s, so long.bg fits.
+    // After the user claim, when the background claim is made:
+    // 54 + 220 + 15 = 289 s >= 285 s, so it no longer fits.
+    await tick(clock.now() - 40_000);
+
+    const firstUser = store.claimCalls.findIndex((c) => c.taskClass === "user");
+    const firstBg = store.claimCalls.findIndex((c) => c.taskClass === "background");
+    expect(firstUser).toBeGreaterThanOrEqual(0);
+    expect(firstBg).toBeGreaterThan(firstUser);
+    expect(store.claimCalls[firstBg].kinds).toEqual(["short.bg"]);
+    for (const call of store.claimCalls) expect(call.kinds).not.toContain("long.bg");
+    expect(store.get(long.id)).toMatchObject({ status: "queued", attempts: 0 });
+    expect(store.get(short.id).status).toBe("succeeded");
+  });
+
+  it("claim margin: a slow budget check that leaves elapsed + maxDurationMs under the hard budget but not the margin excludes the kind", async () => {
+    const { store, clock, tick } = setup(
+      {
+        "ai.user": def({ usesAi: true, maxDurationMs: 10_000 }),
+        "long.user": def({ maxDurationMs: 220_000, leaseSeconds: 270 }),
+      },
+      { frozen: true },
+    );
+    vi.spyOn(store, "getAiSpendSince").mockImplementation(async () => {
+      clock.advance(12_000);
+      return 0; // under budget
+    });
+    const ai = store.add({ kind: "ai.user", task_class: "user" });
+    const long = store.add({ kind: "long.user", task_class: "user" });
+
+    // Top: 40 + 220 + 15 = 275 s < 285 s (fits). At claim time: 52 + 220 = 272 s
+    // would pass without the margin, but 52 + 220 + 15 = 287 s >= 285 s.
+    await tick(clock.now() - 40_000);
+
+    expect(store.claimCalls[0].kinds).toEqual(["ai.user"]);
+    for (const call of store.claimCalls) expect(call.kinds).not.toContain("long.user");
+    expect(store.get(long.id)).toMatchObject({ status: "queued", attempts: 0 });
+    expect(store.get(ai.id).status).toBe("succeeded");
+  });
+});
+
+describe("runWorkerTick — onBudgetDelayed hard-budget guard (§13.4.2)", () => {
+  it("skips onBudgetDelayed after a running task's budget snooze when the tick is near the hard budget", async () => {
+    const onBudgetDelayed = vi.fn().mockResolvedValue(undefined);
+    const { store, clock, logs, tick } = setup(
+      {
+        "ing.bg": def({
+          class: "background",
+          maxDurationMs: 10_000,
+          handler: async () => {
+            clock.advance(WORKER_HARD_BUDGET_MS - 10_000); // finishes 10 s before the hard budget
+            throw new TaskError("budget_exhausted");
+          },
+          onBudgetDelayed,
+        }),
+      },
+      { frozen: true },
+    );
+    const row = store.add({ kind: "ing.bg", task_class: "background" });
+
+    const summary = await tick();
+
+    // The snooze itself still happens (attempt refunded); only the hook is skipped.
+    expect(store.get(row.id)).toMatchObject({ status: "queued", attempts: 0, last_error_code: "budget_exhausted" });
+    expect(summary).toMatchObject({ budgetSnoozed: 1, budgetHooksSkipped: 1 });
+    expect(onBudgetDelayed).not.toHaveBeenCalled();
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        message: "onBudgetDelayed skipped near the hard budget",
+        fields: expect.objectContaining({ task_id: row.id, kind: "ing.bg" }),
+      }),
+    );
+  });
+
+  it("runs onBudgetDelayed after a running task's budget snooze when there is room", async () => {
+    const onBudgetDelayed = vi.fn().mockResolvedValue(undefined);
+    const { store, tick } = setup({
+      "ing.bg": def({
+        class: "background",
+        handler: async () => {
+          throw new TaskError("budget_exhausted");
+        },
+        onBudgetDelayed,
+      }),
+    });
+    const row = store.add({ kind: "ing.bg", task_class: "background" });
+
+    const summary = await tick();
+
+    expect(summary).toMatchObject({ budgetSnoozed: 1, budgetHooksSkipped: 0 });
+    expect(onBudgetDelayed).toHaveBeenCalledTimes(1);
+    expect(onBudgetDelayed.mock.calls[0][0]).toMatchObject({ task: { id: row.id } });
+  });
+});
+
+describe("runWorkerTick — M1.3 self-kick conditions", () => {
+  it("does not kick when the remaining user tasks are not due yet (run_after in the future)", async () => {
+    const { store, clock, kick, tick } = setup({ "k.user": def() });
+    store.add({ kind: "k.user", task_class: "user" });
+    store.add({ kind: "k.user", task_class: "user", run_after: new Date(clock.now() + 3_600_000).toISOString() });
+
+    const summary = await tick();
+
+    expect(summary.claimed).toBe(1);
+    expect(kick).not.toHaveBeenCalled();
+  });
+
+  it("does not kick for remaining user tasks of kinds this deployment doesn't know", async () => {
+    const { store, kick, tick } = setup({ "k.user": def() });
+    store.add({ kind: "k.user", task_class: "user" });
+    store.add({ kind: "future.kind_from_preview", task_class: "user" });
+    const spy = vi.spyOn(store, "hasClaimableTasks");
+
+    await tick();
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toMatchObject({ taskClass: "user", kinds: ["k.user"] });
+    expect(kick).not.toHaveBeenCalled();
+  });
+
+  it("does not kick after a claim error, even when tasks already ran this tick", async () => {
+    const { store, kick, tick } = setup({
+      "k.user": def({
+        handler: async () => {
+          store.claimError = new Error("db went away");
+          return { outcome: "succeeded" };
+        },
+      }),
+    });
+    store.add({ kind: "k.user", task_class: "user" });
+    const spy = vi.spyOn(store, "hasClaimableTasks");
+
+    const summary = await tick();
+
+    expect(summary).toMatchObject({ claimed: 1, succeeded: 1, stopReason: "claim_error", kicked: false });
+    expect(spy).not.toHaveBeenCalled();
+    expect(kick).not.toHaveBeenCalled();
+  });
+
+  it("a task that failed and was re-queued still counts as progress (kicks when claimable user work remains)", async () => {
+    const { store, clock, kick, tick } = setup({
+      "f.user": def({
+        handler: async () => {
+          clock.advance(WORKER_SOFT_STOP_MS);
+          throw new TaskError("ai_unavailable");
+        },
+      }),
+    });
+    for (let i = 0; i < WORKER_MAX_RUNNING_USER + 1; i++) store.add({ kind: "f.user", task_class: "user" });
+
+    const summary = await tick();
+
+    expect(summary).toMatchObject({ claimed: WORKER_MAX_RUNNING_USER, succeeded: 0, retried: WORKER_MAX_RUNNING_USER });
+    expect(kick).toHaveBeenCalledTimes(1);
+    expect(summary.kicked).toBe(true);
+  });
+
+  it("reports kicked=false when the kick itself reports failure", async () => {
+    const { store, clock, kick, tick } = setup({
+      "k.user": def({
+        handler: async () => {
+          clock.advance(WORKER_SOFT_STOP_MS);
+          return { outcome: "succeeded" };
+        },
+      }),
+    });
+    kick.mockResolvedValue(false);
+    for (let i = 0; i < WORKER_MAX_RUNNING_USER + 1; i++) store.add({ kind: "k.user", task_class: "user" });
+
+    const summary = await tick();
+
+    expect(kick).toHaveBeenCalledTimes(1);
+    expect(summary.kicked).toBe(false);
+  });
+
+  it("a kick that throws is contained (logged, tick still resolves)", async () => {
+    const { store, clock, kick, logs, tick } = setup({
+      "k.user": def({
+        handler: async () => {
+          clock.advance(WORKER_SOFT_STOP_MS);
+          return { outcome: "succeeded" };
+        },
+      }),
+    });
+    kick.mockRejectedValue(new Error("network"));
+    for (let i = 0; i < WORKER_MAX_RUNNING_USER + 1; i++) store.add({ kind: "k.user", task_class: "user" });
+
+    await expect(tick()).resolves.toMatchObject({ kicked: false });
+    expect(kick).toHaveBeenCalledTimes(1);
+    expect(logs.some((l) => l.level === "warn" && l.message.includes("self-kick"))).toBe(true);
+  });
+
+  it("over budget: deferred AI user tasks do not trigger a kick (they are no longer claimable)", async () => {
+    const { store, kick, tick } = setup({ "ai.user": def({ usesAi: true }), "plain.user": def() });
+    store.spendUsd = 100;
+    for (let i = 0; i < 3; i++) store.add({ kind: "ai.user", task_class: "user" });
+    store.add({ kind: "plain.user", task_class: "user" });
+
+    const summary = await tick();
+
+    expect(summary).toMatchObject({ claimed: 1, succeeded: 1, budgetDeferred: 3 });
+    expect(kick).not.toHaveBeenCalled();
+  });
+
+  it("budget check failing: the kick chain is bounded (no progress, no further kick)", async () => {
+    const { store, kick, tick } = setup({ "ai.user": def({ usesAi: true }), "plain.user": def() });
+    store.spendError = new Error("rpc failed");
+    const ai = store.add({ kind: "ai.user", task_class: "user" });
+    store.add({ kind: "plain.user", task_class: "user" });
+
+    // Progress was made and a queued, due AI user task remains: one kick.
+    const first = await tick();
+    expect(first).toMatchObject({ claimed: 1, kicked: true });
+
+    // The kicked tick still can't check the budget, claims nothing, and
+    // therefore does not kick again.
+    const second = await tick();
+    expect(second).toMatchObject({ claimed: 0, kicked: false });
+    expect(kick).toHaveBeenCalledTimes(1);
+    expect(store.get(ai.id)).toMatchObject({ status: "queued", attempts: 0 });
+  });
+
+  it("checks for remaining work only after in-flight tasks have settled", async () => {
+    const order: string[] = [];
+    const { store, clock, tick } = setup({
+      "slow.user": def({
+        handler: async () => {
+          clock.advance(WORKER_SOFT_STOP_MS);
+          await tickMs(5);
+          order.push("handler-done");
+          return { outcome: "succeeded" };
+        },
+      }),
+    });
+    store.add({ kind: "slow.user", task_class: "user" });
+    vi.spyOn(store, "hasClaimableTasks").mockImplementation(async () => {
+      order.push("kick-check");
+      return false;
+    });
+
+    await tick();
+
+    expect(order).toEqual(["handler-done", "kick-check"]);
   });
 });

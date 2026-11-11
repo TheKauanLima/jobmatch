@@ -48,8 +48,14 @@ import type { Json } from "@/types/database";
  * The worker loop (docs/ARCHITECTURE.md §13.4.2). Runs inside `after()` in
  * `POST /api/worker/tick`.
  *
- * - Hard budget 285 s: a task is only claimed if `elapsed + maxDurationMs <
- *   WORKER_HARD_BUDGET_MS`; `claim_tasks` gets only the kinds that still fit.
+ * - Hard budget 285 s: a kind is only claimed if `fitsInTick(elapsed,
+ *   maxDurationMs)`, i.e. `elapsed + maxDurationMs + WORKER_CLAIM_MARGIN_MS <
+ *   WORKER_HARD_BUDGET_MS`, with `elapsed` re-read right before each
+ *   `claim_tasks` call; `claim_tasks` gets only the kinds that still fit. The
+ *   margin covers the claim round trip (the handler's clock starts only after
+ *   it returns); the 285 → 300 s gap covers one finalize call. Anything else
+ *   that runs after a handler (dead-hook fast path, onBudgetDelayed) carries
+ *   its own guard against the hard budget.
  * - In-process pool: up to 4 `user` + 2 `background` tasks at once. The same
  *   numbers go to `claim_tasks` as `p_max_running`, which counts live leases
  *   under an advisory lock, so the caps are global across concurrent ticks.
@@ -94,6 +100,22 @@ export const MAX_RESULT_BYTES = 4096;
 /** Per-call timeout for the loop's own PostgREST calls (claim/complete/...). */
 export const WORKER_DB_TIMEOUT_MS = 15_000;
 
+/**
+ * Reserve for the `claim_tasks` round trip in the claim-time fit check
+ * (§13.4.2): a task's own clock starts only after the claim returns, and the
+ * claim may take up to WORKER_DB_TIMEOUT_MS.
+ */
+export const WORKER_CLAIM_MARGIN_MS = WORKER_DB_TIMEOUT_MS;
+
+/**
+ * The §13.4.2 time-budget predicate: a kind may be claimed only if a claim,
+ * a full-length run and the hard budget's finalize reserve all fit before
+ * the platform kill. The single implementation; every fit check uses it.
+ */
+export function fitsInTick(elapsedMs: number, maxDurationMs: number): boolean {
+  return elapsedMs + maxDurationMs + WORKER_CLAIM_MARGIN_MS < WORKER_HARD_BUDGET_MS;
+}
+
 /** Max tasks deferred per class per tick when over the AI budget. */
 export const BUDGET_DEFER_BATCH = 200;
 
@@ -110,6 +132,13 @@ export const DEAD_HOOK_CLAIM_BATCH = 5;
  * bounded by its own timeout. Skipped unless this much hard budget remains.
  */
 export const DEAD_HOOK_FAST_PATH_RESERVE_MS = DEAD_HOOK_TIMEOUT_MS + 2 * WORKER_DB_TIMEOUT_MS;
+/**
+ * Hard-budget room required before running `onBudgetDelayed` after a running
+ * task's budget snooze (§13.4.2: anything after a handler needs its own
+ * guard). The hook is a few idempotent DB writes, budgeted like one bounded
+ * DB call.
+ */
+export const BUDGET_DELAYED_HOOK_RESERVE_MS = WORKER_DB_TIMEOUT_MS;
 
 const REASON_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
@@ -251,6 +280,8 @@ export interface WorkerTickSummary {
   deadHooksReleased: number;
   /** Fast-path deliveries skipped near the hard budget (sweep delivers). */
   deadHooksDeferredToSweep: number;
+  /** onBudgetDelayed hooks skipped after a running task's budget snooze (near the hard budget). */
+  budgetHooksSkipped: number;
   kicked: boolean;
   stopReason: WorkerStopReason;
   durationMs: number;
@@ -299,6 +330,7 @@ export async function runWorkerTick(
     deadHooksGaveUp: 0,
     deadHooksReleased: 0,
     deadHooksDeferredToSweep: 0,
+    budgetHooksSkipped: 0,
     kicked: false,
     stopReason: "idle",
     durationMs: 0,
@@ -560,11 +592,24 @@ export async function runWorkerTick(
     }
   };
 
-  /** A running handler threw `budget_exhausted` (e.g. ingest budget). */
+  /**
+   * A running handler threw `budget_exhausted` (e.g. ingest budget). This
+   * runs after the handler, so the hook carries its own hard-budget guard
+   * (§13.4.2), like the dead-hook fast path: when there isn't room for it,
+   * it is skipped. The snooze already succeeded, so nothing is lost; the hook
+   * is idempotent and runs again if the task is budget-delayed again
+   * (deferral or another snooze).
+   */
   const budgetSnoozeRunning = async (row: BackgroundTaskRow, def: TaskDefinition) => {
     const seconds = secondsUntilBudgetReset(new Date(deps.now()), deps.random);
     if (!(await safeSnooze(row, seconds, "budget_exhausted"))) return;
     summary.budgetSnoozed++;
+    if (!def.onBudgetDelayed) return;
+    if (deps.now() - startedAt + BUDGET_DELAYED_HOOK_RESERVE_MS >= WORKER_HARD_BUDGET_MS) {
+      summary.budgetHooksSkipped++;
+      taskLogger(row).warn("onBudgetDelayed skipped near the hard budget");
+      return;
+    }
     await runOnBudgetDelayed(row, def);
   };
 
@@ -744,8 +789,10 @@ export async function runWorkerTick(
       const free = cap - inFlightCount(taskClass);
       if (free <= 0) continue;
 
-      const fitting = kindsByClass[taskClass].filter(
-        (kind) => elapsed + registry[kind].maxDurationMs < WORKER_HARD_BUDGET_MS,
+      // Pre-filter (same predicate as the claim-time check below), so the
+      // budget check is skipped when nothing in the class can fit anyway.
+      const fitting = kindsByClass[taskClass].filter((kind) =>
+        fitsInTick(elapsed, registry[kind].maxDurationMs),
       );
       if (fitting.length === 0) continue;
 
@@ -759,6 +806,17 @@ export async function runWorkerTick(
           if (budget !== "error") await deferAiTasks(taskClass, aiKinds);
         }
       }
+      if (claimKinds.length === 0) continue;
+
+      // Re-check the §13.4.2 fit with a fresh clock right before claiming.
+      // `elapsed` above was taken at the top of the iteration, and the awaited
+      // budget check, the over-budget deferral and (for the background class)
+      // the user-class claim can each take up to WORKER_DB_TIMEOUT_MS, so a
+      // kind that fit then may no longer fit now (M1.3 QA bug B2).
+      const claimElapsed = deps.now() - startedAt;
+      claimKinds = claimKinds.filter((kind) =>
+        fitsInTick(claimElapsed, registry[kind].maxDurationMs),
+      );
       if (claimKinds.length === 0) continue;
 
       let rows: BackgroundTaskRow[];

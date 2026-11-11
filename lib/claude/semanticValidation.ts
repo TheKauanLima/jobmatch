@@ -27,8 +27,21 @@ const SINGLE_QUOTES = /[‘’‚‛′‵]/g;
 const DOUBLE_QUOTES = /[“”„‟″‶]/g;
 // en dash, em dash, figure dash, horizontal bar, minus sign, small/fullwidth hyphen-minus
 const DASHES = /[‐‑‒–—―−﹘﹣－]/g;
+// Whitespace in this module means the Unicode White_Space property (`u` flag),
+// not JS `\s`, which misses U+0085 NEXT LINE (same bug class as M1.3 QA bug
+// B1; see TAG_WS in promptEscaping.ts). U+FEFF, which `\s` matches but
+// White_Space doesn't, is Default_Ignorable and is removed by
+// stripInvisibleChars before the quote-matching patterns run.
+// fabricatedNumbers doesn't strip invisibles, so its patterns use NUM_WS,
+// which adds U+FEFF back to keep the old `\s` coverage.
+// Built with the RegExp constructor because TypeScript rejects
+// property-escape literals at the ES2017 target.
+const WS = "\\p{White_Space}";
+const NUM_WS = "[\\p{White_Space}\\uFEFF]";
+const WHITESPACE_RUN = new RegExp(`${WS}+`, "gu");
+
 // Bullet glyphs at line start: • ▪ ◦ · * - (after dash normalization, so – — count too)
-const LINE_START_BULLETS = /^[\s•▪◦·*-]+/;
+const LINE_START_BULLETS = new RegExp(`^[${WS}•▪◦·*-]+`, "u");
 
 /**
  * Normalization applied to both sides of a quote match (§13.5.6): NFKC;
@@ -46,7 +59,7 @@ export function normalizeForQuoteMatch(s: string): string {
     .split(/\r\n|\r|\n/)
     .map((line) => line.replace(LINE_START_BULLETS, ""))
     .join(" ")
-    .replace(/\s+/g, " ")
+    .replace(WHITESPACE_RUN, " ")
     .trim();
 }
 
@@ -136,10 +149,10 @@ export function slugsInVocabulary(
  * comments that state numbers Claude was told not to state.
  */
 const FABRICATED_NUMBER_PATTERNS: readonly RegExp[] = [
-  /\d[\d,.]*\s*(?:%|％|percent\b|per\s+cent\b)/gi,
-  /\d[\d,.]*\s+out\s+of\b/gi,
-  /\bout\s+of\s+\d[\d,.]*/gi,
-  /\bof\s+\d[\d,.]*/gi,
+  new RegExp(`\\d[\\d,.]*${NUM_WS}*(?:%|％|percent\\b|per${NUM_WS}+cent\\b)`, "giu"),
+  new RegExp(`\\d[\\d,.]*${NUM_WS}+out${NUM_WS}+of\\b`, "giu"),
+  new RegExp(`\\bout${NUM_WS}+of${NUM_WS}+\\d[\\d,.]*`, "giu"),
+  new RegExp(`\\bof${NUM_WS}+\\d[\\d,.]*`, "giu"),
 ];
 
 export function fabricatedNumbers(text: string): string[] {

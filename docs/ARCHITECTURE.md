@@ -2892,10 +2892,53 @@ a second.
      caller (pg_net with a 5s timeout, or a kick) never holds the connection, so a
      client disconnect cannot cut the work short.
 - **`runWorkerTick({ invocationId, startedAt })`** in `lib/tasks/worker.ts`:
-  - Hard budget `WORKER_HARD_BUDGET_MS = 285_000`. The loop **only starts a task if
-    `elapsed + registry[kind].maxDurationMs < WORKER_HARD_BUDGET_MS`**. `claim_tasks`
-    is called with `p_kinds` = kinds that still fit, so long tasks are never claimed
-    late in a tick.
+  - Hard budget `WORKER_HARD_BUDGET_MS = 285_000`. The loop **only claims a kind if
+    `elapsed + registry[kind].maxDurationMs + WORKER_CLAIM_MARGIN_MS <
+    WORKER_HARD_BUDGET_MS`**, where `WORKER_CLAIM_MARGIN_MS = WORKER_DB_TIMEOUT_MS`
+    (15 000). `claim_tasks` is called with `p_kinds` = kinds that still fit, so long
+    tasks are never claimed late in a tick.
+  - **Time-budget rule (binding; decided after M1.3 QA bug B2 and its review):**
+    - `elapsed` is `deps.now() − startedAt`, **re-read immediately before each
+      `store.claim` call**. The worker may also pre-filter at the top of a loop
+      iteration (to skip the budget check when nothing fits), but it must use the same
+      predicate. The pre-filter never replaces the fresh check before the claim.
+    - One helper in `lib/tasks/worker.ts` implements the predicate, and both call
+      sites use it. No second copy of the inequality.
+    - Why the margin: the handler's clock (`deadline = now + maxDurationMs`) starts
+      only after `claim_tasks` returns, and that call may take up to
+      `WORKER_DB_TIMEOUT_MS`. The budget is split like this:
+
+      | segment | bound |
+      |---|---|
+      | `claim_tasks` round trip | `WORKER_CLAIM_MARGIN_MS` = 15 s |
+      | handler | `maxDurationMs` (enforced by the abort timer) |
+      | one finalize call (`complete_task` / `fail_task` / `snooze_task`) | `WORKER_DB_TIMEOUT_MS` = 15 s, i.e. the 300 − 285 s gap |
+      | platform kill | 300 s |
+
+      Worst case: `claimStart + 15 + maxDurationMs + 15 < 300`. Without the margin,
+      a slow claim plus a full-length handler plus a slow finalize could reach about
+      315 s.
+    - Anything else that runs after a handler must carry its own guard against
+      `WORKER_HARD_BUDGET_MS`, the way the dead-hook fast path does (§13.4.5). The
+      finalize reserve covers exactly one bounded DB call.
+    - **Registry invariant (same rule, static form):** every kind must satisfy
+      `maxDurationMs + WORKER_CLAIM_MARGIN_MS < WORKER_HARD_BUDGET_MS` (< 270 000),
+      otherwise it could never be claimed. The largest planned kind
+      (`ingest.sync_source`, 220 000) passes.
+    - Impact (accepted): with every planned kind, the latest claim point moves 15 s
+      earlier. The 220 s kind can be claimed only while `elapsed < 50 s` (was 65 s),
+      200 s kinds below 70 s (was 85 s), 170 s kinds below 100 s (was 115 s). Kinds of
+      30 s or less are unaffected because `WORKER_SOFT_STOP_MS` (240 s) already
+      binds. A long task that misses the cut waits for the self-chained kick or the
+      next cron tick, at most about a minute.
+    - Rejected alternatives:
+      - *Re-check after the claim and snooze rows that no longer fit:* adds a DB
+        round trip that itself eats the reserve, adds queue churn, and only helps in
+        the pathological slow-claim case the static margin already covers.
+      - *Accept and document:* a kill at 300 s takes down **every** in-flight task of
+        the invocation (up to 6), not just the late one. Each loses its claimed
+        attempt to lease expiry, and repeated slow-DB episodes could dead-letter user
+        reports with `lease_expired`. That is worse than 15 s of claim window.
   - Concurrency: an in-process pool. The `user` class claims with `p_max_running =
     WORKER_MAX_RUNNING_USER (4)`, the `background` class with
     `WORKER_MAX_RUNNING_BACKGROUND (2)`. User tasks are claimed first on every loop
@@ -2936,7 +2979,8 @@ a second.
 Each kind declares a `TaskDefinition` (`lib/tasks/types.ts`):
 `{ class, priority, maxAttempts, leaseSeconds, maxDurationMs, usesAi, payloadSchema
 (zod), handler, onDead?, onBudgetDelayed? }`. `leaseSeconds × 1000` must exceed
-`maxDurationMs` by at least 30s. A unit test asserts this for every kind.
+`maxDurationMs` by at least 30s, and `maxDurationMs + WORKER_CLAIM_MARGIN_MS` must
+be `< WORKER_HARD_BUDGET_MS` (§13.4.2). A unit test asserts both for every kind.
 - **`usesAi: boolean`**: true when the handler calls a paid AI API (Claude or Voyage).
   These kinds are gated by the global budget (§13.9.4). From the table below, these
   are the kinds whose external calls include Claude or Voyage.
@@ -2948,7 +2992,15 @@ Each kind declares a `TaskDefinition` (`lib/tasks/types.ts`):
 - **`onBudgetDelayed?(ctx: BudgetDelayedContext)`**: `ctx` is `{ task, payload | null,
   admin, log }`. It runs after a successful budget snooze (§13.9.4), e.g. to set
   `resume_reports.notice = 'delayed_budget'`. It must be idempotent. Errors are logged
-  and don't affect the snooze.
+  and don't affect the snooze. After a running task's budget snooze, the worker skips
+  the hook when `elapsed + BUDGET_DELAYED_HOOK_RESERVE_MS` (15 s) ≥ the hard budget,
+  logs it and counts it in the tick summary's `budgetHooksSkipped`. A skipped hook is
+  **not** redelivered: the snoozed row waits until the budget resets, and it is only
+  re-run if the task is budget-delayed again. So the hook is best-effort UI
+  signalling, never required for correctness. **Open (must close before M3.1):** the
+  hook has no timeout or `signal`, and the deferral path runs it for up to 200 rows
+  with no time bound. Add a per-hook timeout plus a `signal` in `BudgetDelayedContext`,
+  and bound the deferral loop by the hard budget.
 
 | kind | class | prio | max att. | lease s | max ms | external calls | dedupe_key |
 |---|---|---|---|---|---|---|---|
@@ -4063,7 +4115,8 @@ midnight, same convention as §5.
   - **A running handler that throws `TaskError('budget_exhausted')`** (e.g. the
     ingest budget, M2.2) is different: its task was claimed, so it goes through
     `snooze_task` (attempt refunded, prior `last_error_code` kept, `safeSnooze`
-    retried once). Then `onBudgetDelayed` runs, and the summary counts
+    retried once). Then `onBudgetDelayed` runs (unless skipped near the hard budget;
+    see §13.4.3, counted in `budgetHooksSkipped`), and the summary counts
     `budgetSnoozed`.
 - **Budget check fails** (spend query errors): **fail closed.** The worker does not
   claim AI kinds that round; non-AI kinds still run.
@@ -4737,7 +4790,12 @@ the same semantics for RFC 8058 one-click.
 /data/taxonomy/skills.json, role-families.json
 /scripts/     taxonomy/build-seed.ts, taxonomy/review-provisional.ts,
               evals/{extraction,critique,retrieval,injection}.ts   (manual, need real keys; never in CI)
+              db-concurrency-check.mjs   (manual; multi-connection DB checks, §13.16; LOCAL Supabase
+                                          stack only: refuses any host but localhost/127.0.0.1 and any port but config.toml's DB port;
+                                          commits throwaway fixture rows and deletes them; never in CI)
 /supabase/tests/database/*.test.sql                                (pgTAP, run via `supabase test db`)
+/supabase/tests/README.md                                          (how to run the local stack, pgTAP and the
+                                                                    concurrency script; pgTAP authoring rules)
 /tests/fixtures/{resumes,listings,sources,adversarial,pages}/       (synthetic only — no real PII)
 /tests/fakes/                                                      (in-memory test doubles shared across modules,
                                                                     e.g. supabaseStorage.ts; imported only by *.test.ts)
@@ -4814,7 +4872,26 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
 - **Route integration (vitest, mocked Supabase/RPC):** every §13.13 route covering
   auth `401`, validation `400`, `404`-vs-`403` rules, `429` mapping, `202` + kick
   scheduled, and response shapes against `types/domain.ts`.
-- **Database (pgTAP, `supabase test db` on a local stack):** two users A/B.
+- **Database (local Supabase stack only, never the live project; run instructions in
+  `supabase/tests/README.md`).** Two tools, split by how many connections a property
+  needs:
+  - **pgTAP** (`npx supabase test db`, `supabase/tests/database/*.test.sql`): runs in a
+    single session, each file in one rolled-back transaction. It covers every
+    single-connection semantic below.
+  - **`scripts/db-concurrency-check.mjs`** (`node scripts/db-concurrency-check.mjs`):
+    covers properties that need two or more real concurrent connections, which pgTAP
+    can't express. Today that is the `claim_tasks` class cap under concurrent
+    claimers, `claim_tasks` `FOR UPDATE SKIP LOCKED`, and atomic consumes in
+    `private.consume_rate_limit` and `public.consume_account_reauth_attempt`. It
+    refuses non-local hosts. Exit 0 means pass, 1 a failed check, 2 a setup error.
+    Any new lock or race property goes here, not into pgTAP.
+  - **Dev tooling (devDependencies):** `supabase` CLI pinned at exactly `3.1.0` (use
+    `npx supabase`, never `npx supabase@latest`), `pg` (exact `8.23.1`) for the
+    concurrency script (plain `.mjs`, so no `@types/pg`), and `pg-connection-string`
+    (exact `2.14.1`, used by the script's host and port guard). Neither is imported by app code, so they
+    never ship in the bundle. Neither runs in CI yet, since both need Docker.
+
+  Properties (two users A/B; the tool for each is noted where it isn't pgTAP):
   - B cannot select A's resume-derived rows (every owner-only table).
   - B cannot see A's private listing, its requirements, or its skills.
   - Authenticated users cannot insert/update/delete `job_descriptions` directly or
@@ -4822,8 +4899,13 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
   - `execute` is denied to authenticated on every service-only function.
   - `match_candidates` called with `p_user_id = B` never returns A's private listing.
   - `shared → private` raises, via the RPC and the trigger.
-  - The rate-limit RPC is atomic (two concurrent consumes at limit−1 → one succeeds).
-  - `claim_tasks` respects caps, `skip locked`, and lease expiry.
+  - The rate-limit RPCs are atomic (N concurrent consumes at limit−1 → exactly one
+    succeeds): **concurrency script**. pgTAP covers the single-connection semantics:
+    counting, the per-UTC-day limit, the caller-only charge, and `get_my_rate_limits`.
+  - `claim_tasks`: pgTAP covers validation, caps counting live leases, ordering,
+    `run_after`, lease-expiry reclaim, and dead-lettering at `max_attempts`. The
+    **concurrency script** covers cap enforcement under concurrent claimers and
+    `skip locked` (a row locked by another transaction is skipped without blocking).
   - Fencing: `complete_task` with the wrong worker id is a no-op.
   - Dedupe: the partial unique index on the live task key holds.
   - The MV excludes private and user-submitted listings.

@@ -374,6 +374,10 @@ M2.3, M2.4.
 3. [BE] Change `POST /api/resumes` (pre-check, RPC, kick). Add
    `GET /api/resumes/:id/report`, `GET /api/reports/:id` (ETag/304),
    `POST /api/reports/:id/retry`, and `POST /api/resumes/:id/reports`.
+4. [BE] **Prerequisite carried over from M1.3**, before the first real
+   `onBudgetDelayed` handler lands: add a per-hook timeout and a `signal` in
+   `BudgetDelayedContext`, and bound `deferAiTasks`' hook loop by the worker's hard
+   budget (§13.4.3, the `onBudgetDelayed` entry).
 
 **Acceptance:**
 - An upload produces a report that reaches `completed` with profile + matching stages

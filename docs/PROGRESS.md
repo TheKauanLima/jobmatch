@@ -147,6 +147,33 @@ this file at the end of every work session.
   not in JobMatch.
 - **Worker secrets:** `WORKER_SECRET`, `APP_BASE_URL` (Vercel Production) and Vault
   `kalify_worker_url` / `kalify_worker_secret` are set; ticks return 202.
+- **M1.2 production acceptance: PASSED** (2026-11-09 23:45 UTC, after the env fix).
+  A plain `maintenance.noop` succeeded on attempt 1; a `force_fail` noop
+  (max_attempts 2) retried with backoff, went `dead` after 2 attempts, and its onDead
+  hook was handled within the same tick. The two `acceptance:*` rows are left for the
+  daily purge to remove.
+
+- **M1.3 — QA: unit half APPROVED; DB half written, NOT run.** Added worker
+  time-budget, self-kick and registry tests, adversarial `escapeUntrusted` tests and
+  U+0085 tests (1,050 vitest tests). Review → APPROVED WITH NITS twice; every nit fixed.
+  Two real bugs found and **fixed**: **B1**: prompt escaping (and
+  `semanticValidation.ts`) used JS `\s`, which misses U+0085 NEXT LINE; now
+  `\p{White_Space}`. **B2**: the worker's time-budget fit went stale across awaited DB
+  calls. The fix is the architect's decision (§13.4.2): one `fitsInTick` predicate with a
+  15 s `WORKER_CLAIM_MARGIN_MS`, re-checked with a fresh clock before every claim.
+  Registry invariant is now `maxDurationMs < 270 000`. Also added a hard-budget guard for
+  `onBudgetDelayed` (`budgetHooksSkipped`). Its remaining gaps (no timeout or signal,
+  unbounded deferral loop) are recorded as ROADMAP M3.1 task 4.
+  DB half: 6 pgTAP files in `supabase/tests/database/`,
+  `scripts/db-concurrency-check.mjs` (local-only host and port guard),
+  `supabase/tests/README.md`; devDeps `supabase` 3.1.0, `pg` 8.23.1,
+  `pg-connection-string` 2.14.1. Reviewer checked plan counts and expectations
+  statically. Accept only after they run green. Blocker: Docker Desktop now works (after enabling Virtual
+  Machine Platform + `hypervisorlaunchtype auto`), but `supabase start` (CLI 3.1.0)
+  hangs at "Starting database..." without ever creating the db container, also with
+  `-x` for non-essential services. Not diagnosed further (time-boxed). Next try: the
+  CLI's `--debug` output with an unbuffered run of `node_modules/.bin/supabase` (the
+  npx wrapper may buffer), or an older CLI version.
 
 ### Next steps (in order)
 1. ~~Apply 0007 → 0008 and verify~~ — done.

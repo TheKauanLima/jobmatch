@@ -13,7 +13,9 @@ import type { TaskClass, TaskDefinition } from "@/lib/tasks/types";
  * knows it instead of being dead-lettered.
  *
  * Invariant (unit-tested for every kind): `leaseSeconds × 1000 ≥
- * maxDurationMs + 30 000`, and `maxDurationMs` fits inside one worker tick.
+ * maxDurationMs + 30 000`, and `maxDurationMs + WORKER_CLAIM_MARGIN_MS <
+ * WORKER_HARD_BUDGET_MS` (< 270 000), so the kind can be claimed at all
+ * (§13.4.2).
  *
  * Later milestones add the kinds in the §13.4.3 table here, with the
  * table's class / priority / max attempts / lease / max ms values.
@@ -72,7 +74,9 @@ export const LEASE_MARGIN_MS = 30_000;
 
 /**
  * Returns a list of invariant violations for one definition (empty = ok).
- * `workerHardBudgetMs` is passed in to avoid a registry → worker import.
+ * `workerHardBudgetMs` is the budget `maxDurationMs` must stay under:
+ * callers pass `WORKER_HARD_BUDGET_MS - WORKER_CLAIM_MARGIN_MS` (§13.4.2).
+ * It is passed in to avoid a registry → worker import.
  */
 export function validateTaskDefinition(
   kind: string,
@@ -104,7 +108,7 @@ export function validateTaskDefinition(
     );
   }
   if (def.maxDurationMs >= workerHardBudgetMs) {
-    problems.push(`${kind}: maxDurationMs must be < the worker hard budget (${workerHardBudgetMs})`);
+    problems.push(`${kind}: maxDurationMs must be < the worker hard budget minus the claim margin (${workerHardBudgetMs})`);
   }
   if (typeof def.handler !== "function") {
     problems.push(`${kind}: handler must be a function`);

@@ -45,6 +45,12 @@ describe("normalizeForQuoteMatch (§13.5.6)", () => {
   it("removes invisible characters (same set as escapeUntrusted)", () => {
     expect(normalizeForQuoteMatch(`Py${String.fromCodePoint(0x200b)}thon`)).toBe("python");
   });
+
+  it("treats U+0085 NEXT LINE as whitespace (collapse, trim, line-start bullets; JS \\s misses it)", () => {
+    expect(normalizeForQuoteMatch("\u0085• Built\u0085\u0085a REST\u2028API\u0085")).toBe("built a rest api");
+    expect(quoteAppearsIn("built a rest api", "Built\u0085a REST API")).toBe(true);
+    expect(quoteAppearsIn("\u0085", "Built a REST API")).toBe(false);
+  });
 });
 
 describe("quoteAppearsIn / createQuoteMatcher", () => {
@@ -142,6 +148,9 @@ describe("fabricatedNumbers", () => {
     ["out of 340 postings", "out of 340"],
     ["most of 1,200 jobs", "of 1,200"],
     ["half ＷＡＮＴ ５０％", "50%"],
+    ["about 40\u0085percent of roles", "40\u0085percent"],
+    ["3\u0085out\u0085of 4 listings", "3\u0085out\u0085of"],
+    ["most of\u0085 1,200 jobs", "of\u0085 1,200"],
   ])("flags %j", (text, fragment) => {
     expect(fabricatedNumbers(text)).toContain(fragment);
   });

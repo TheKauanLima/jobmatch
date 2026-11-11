@@ -81,23 +81,38 @@ export function stripInvisibleChars(raw: string): string {
 }
 
 /**
+ * Regex-source fragment for "any run of whitespace" wherever tag matching
+ * tolerates whitespace. Uses the Unicode `White_Space` property (requires the
+ * `u` flag), not JS `\s`: `\s` is ECMAScript WhiteSpace + LineTerminator and
+ * misses U+0085 NEXT LINE, which survives both NFKC and Default_Ignorable
+ * stripping, so `</resu\u0085me_text>` would otherwise slip through (M1.3 QA
+ * bug B1). It is not a strict superset of `\s`: `\s` also matches U+FEFF
+ * (BOM / ZERO WIDTH NO-BREAK SPACE), which is not White_Space. That gap is
+ * harmless here because U+FEFF is Default_Ignorable_Code_Point, so
+ * `stripInvisibleChars` has already removed it before tag matching runs.
+ */
+const TAG_WS = "\\p{White_Space}*";
+
+/**
  * Regex fragment matching `word` with arbitrary whitespace between every
- * character (`res\nume_text`, `resume_te xt`).
+ * character (`res\nume_text`, `resume_te xt`, `resu\u0085me_text`).
  */
 function buildTolerantWordPattern(word: string): string {
   return word
     .split("")
     .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join("\\s*");
+    .join(TAG_WS);
 }
 
 /**
  * One pattern for every reserved word (longest first, so no word can shadow a
  * longer one sharing its prefix):
  *
- *   <  \s*  (/\s*)*  (word1|word2|...)  (?![letter/digit/_])  [^<>]*  >?
+ *   <  WS*  (/WS*)*  (word1|word2|...)  (?![letter/digit/_])  [^<>]*  >?
  *
- * - `(/\s*)*` accepts any number of slashes (`<//resume_text>`), not just one.
+ * - `WS*` is `TAG_WS` (`\p{White_Space}*`, not `\s*`; see above), used for
+ *   every whitespace-tolerant position, including inside each word.
+ * - `(/WS*)*` accepts any number of slashes (`<//resume_text>`), not just one.
  * - `(?![\p{L}\p{N}_])` keeps `<resume_textual>` and `<job_postings>` out.
  * - `[^<>]*` is the attribute / trailing-whitespace / self-closing-slash
  *   region (the §13.5.5 pattern's `(\s[^>]*)?\s*`). It also stops at the next
@@ -106,7 +121,7 @@ function buildTolerantWordPattern(word: string): string {
  * - `>?` makes the closing bracket optional (unterminated heads).
  */
 const RESERVED_TAG_PATTERN = new RegExp(
-  `<\\s*(?:\\/\\s*)*(?:${[...RESERVED_TAG_WORDS]
+  `<${TAG_WS}(?:\\/${TAG_WS})*(?:${[...RESERVED_TAG_WORDS]
     .sort((a, b) => b.length - a.length)
     .map(buildTolerantWordPattern)
     .join("|")})(?![\\p{L}\\p{N}_])[^<>]*>?`,
