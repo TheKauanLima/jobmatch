@@ -1,7 +1,10 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import Anthropic from "@anthropic-ai/sdk";
+// The SDK's own transitive dependency, used only to prove a traced client WOULD
+// send trace headers (control case). Not an added package.
+import * as otel from "@opentelemetry/api";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
@@ -11,6 +14,9 @@ import {
   buildStructuredParams,
   callStructured,
   classifySdkError,
+  CLAUDE_SDK_LOG_LEVEL,
+  getClaudeClient,
+  OTEL_CONTENT_MODE_ENV,
   retryOnceOnInvalidOutput,
   SERVER_SIDE_FALLBACK_BETA,
 } from "@/lib/claude/client";
@@ -18,11 +24,23 @@ import { CLAUDE_TASKS } from "@/lib/claude/config";
 import {
   ClaudeApiError,
   ClaudeBadRequestError,
+  ClaudeConfigurationError,
   ClaudeInvalidOutputError,
   ClaudeRefusalError,
   ClaudeTruncatedError,
 } from "@/lib/claude/errors";
 import { setUsageSink, type UsageEvent } from "@/lib/claude/usage";
+import { createEvalClient } from "@/scripts/evals/evalClient";
+import {
+  clientConstructorNames,
+  constructorCalls,
+  importsOf,
+  isTestFile,
+  REPO_ROOT,
+  repoSourceFiles,
+  sdkValueImports,
+  stripComments,
+} from "@/tests/helpers/sdkImports";
 
 /**
  * Unit coverage for `callStructured` (docs/ARCHITECTURE.md §13.5.2): request
@@ -607,5 +625,307 @@ describe("retryOnceOnInvalidOutput", () => {
     const fn = vi.fn().mockRejectedValue(err);
     await expect(retryOnceOnInvalidOutput(fn)).rejects.toBe(err);
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDK telemetry off (§13.5.2 "Client construction and SDK telemetry", M1.1c)
+// ---------------------------------------------------------------------------
+
+describe("getClaudeClient: SDK telemetry off", () => {
+  const TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
+  const SPAN_ID = "b7ad6b7169203331";
+
+  /** Minimal tracer + W3C-style propagator, so a TRACED client would send traceparent. */
+  function installTracing(): void {
+    const tracer = {
+      startSpan: () =>
+        otel.trace.wrapSpanContext({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: otel.TraceFlags.SAMPLED }),
+      startActiveSpan: () => {
+        throw new Error("not used");
+      },
+    } as unknown as otel.Tracer;
+    otel.trace.setGlobalTracerProvider({ getTracer: () => tracer });
+    otel.propagation.setGlobalPropagator({
+      inject(context, carrier, setter) {
+        const sc = otel.trace.getSpanContext(context);
+        if (sc) {
+          setter.set(carrier, "traceparent", `00-${sc.traceId}-${sc.spanId}-01`);
+          setter.set(carrier, "tracestate", "vendor=x");
+          setter.set(carrier, "baggage", "k=v");
+        }
+      },
+      extract: (context) => context,
+      fields: () => ["traceparent", "tracestate", "baggage"],
+    });
+  }
+
+  function okFetch(): ReturnType<typeof vi.fn> {
+    return vi.fn(async () =>
+      new Response(JSON.stringify(message()), {
+        status: 200,
+        headers: { "content-type": "application/json", "request-id": "req_fake" },
+      }),
+    );
+  }
+
+  function headersOf(fetchMock: ReturnType<typeof vi.fn>): Headers {
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    return new Headers(init.headers);
+  }
+
+  beforeEach(() => {
+    __resetClaudeClientForTests();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-fake");
+    vi.stubEnv("ANTHROPIC_OPEN_TELEMETRY", "true");
+    vi.stubEnv(OTEL_CONTENT_MODE_ENV, "metadata_only");
+  });
+
+  afterEach(() => {
+    otel.trace.disable();
+    otel.propagation.disable();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    __resetClaudeClientForTests();
+  });
+
+  it("disables traces even with ANTHROPIC_OPEN_TELEMETRY=true and a metadata_only content mode", () => {
+    const resolved = getClaudeClient().openTelemetry;
+    expect(resolved.traces.enabled).toBe(false);
+    expect(Object.isFrozen(resolved)).toBe(true);
+  });
+
+  it("control: an option-less client WOULD read those env vars and trace", () => {
+    expect(new Anthropic({ apiKey: "sk-ant-test-fake" }).openTelemetry.traces.enabled).toBe(true);
+  });
+
+  it("sends no traceparent/tracestate/baggage, while a traced control client does", async () => {
+    installTracing();
+
+    const controlFetch = okFetch();
+    const control = new Anthropic({ apiKey: "sk-ant-test-fake", maxRetries: 0, fetch: controlFetch as unknown as typeof fetch });
+    await control.beta.messages.create(buildStructuredParams(baseArgs()), { timeout: 5_000 });
+    expect(headersOf(controlFetch).get("traceparent")).toBe(`00-${TRACE_ID}-${SPAN_ID}-01`);
+
+    const appFetch = okFetch();
+    vi.stubGlobal("fetch", appFetch);
+    __resetClaudeClientForTests();
+    const result = await callStructured(baseArgs());
+    expect(result.value).toEqual({ score: 70, note: "fine" });
+    expect(appFetch).toHaveBeenCalledTimes(1);
+    const sent = headersOf(appFetch);
+    for (const name of ["traceparent", "tracestate", "baggage"]) {
+      expect(sent.has(name), name).toBe(false);
+    }
+  });
+
+  it.each(["content", "CONTENT", " content ", "Content\n"])(
+    "content mode %j: getClaudeClient throws ClaudeConfigurationError naming only the variable",
+    (value) => {
+      vi.stubEnv(OTEL_CONTENT_MODE_ENV, value);
+      let thrown: unknown;
+      try {
+        getClaudeClient();
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ClaudeConfigurationError);
+      const msg = (thrown as Error).message;
+      expect(msg).toContain(OTEL_CONTENT_MODE_ENV);
+      expect(msg.replace(OTEL_CONTENT_MODE_ENV, "")).not.toMatch(/content/i);
+    },
+  );
+
+  it("content mode: callStructured surfaces ai_unavailable (non-retryable) and sends no request", async () => {
+    vi.stubEnv(OTEL_CONTENT_MODE_ENV, "content");
+    const appFetch = okFetch();
+    vi.stubGlobal("fetch", appFetch);
+    await expect(callStructured(baseArgs())).rejects.toMatchObject({
+      name: "ClaudeApiError",
+      code: "ai_unavailable",
+      retryable: false,
+    });
+    expect(appFetch).not.toHaveBeenCalled();
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  it("content mode is checked before the API key (fails closed even without a key)", () => {
+    vi.stubEnv(OTEL_CONTENT_MODE_ENV, "content");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(() => getClaudeClient()).toThrow(OTEL_CONTENT_MODE_ENV);
+  });
+
+  it("logLevel is 'warn' even with ANTHROPIC_LOG=debug (control: an option-less client would be 'debug')", () => {
+    vi.stubEnv("ANTHROPIC_LOG", "debug");
+    expect(getClaudeClient().logLevel).toBe(CLAUDE_SDK_LOG_LEVEL);
+    expect(CLAUDE_SDK_LOG_LEVEL).toBe("warn");
+    expect(new Anthropic({ apiKey: "sk-ant-test-fake" }).logLevel).toBe("debug");
+  });
+
+  it("with ANTHROPIC_LOG=debug, no console.debug/console.info call carries request content (control client does)", async () => {
+    vi.stubEnv("ANTHROPIC_LOG", "debug");
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const infoSpy = vi.mocked(console.info);
+    const carriesContent = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.some((args) => JSON.stringify(args).includes("SECRET-RESUME"));
+
+    // Control: an option-less client logs the request body, resume text included.
+    const control = new Anthropic({ apiKey: "sk-ant-test-fake", maxRetries: 0, fetch: okFetch() as unknown as typeof fetch });
+    await control.beta.messages.create(buildStructuredParams(baseArgs()), { timeout: 5_000 });
+    expect(carriesContent(debugSpy)).toBe(true);
+    debugSpy.mockClear();
+    infoSpy.mockClear();
+
+    const appFetch = okFetch();
+    vi.stubGlobal("fetch", appFetch);
+    __resetClaudeClientForTests();
+    await callStructured(baseArgs());
+    expect(appFetch).toHaveBeenCalledTimes(1);
+    expect(carriesContent(debugSpy)).toBe(false);
+    expect(carriesContent(infoSpy)).toBe(false);
+    expect(debugSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(["metadata_only", "", "contents", "no-content"])("non-content mode %j is allowed", (value) => {
+    vi.stubEnv(OTEL_CONTENT_MODE_ENV, value);
+    expect(getClaudeClient().openTelemetry.traces.enabled).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SDK import guards (§13.5.2 "Client construction and SDK telemetry" item 4).
+// They check IMPORTS and the constructed clients' resolved options, not how a
+// call is spelled, so an alias, re-export or spread can't bypass them.
+// ---------------------------------------------------------------------------
+
+/**
+ * The exact allowlist of files that may import `@anthropic-ai/sdk[/*]` by
+ * VALUE (`import type` is allowed anywhere; test files and tests/** are
+ * exempt). Adding an entry is a reviewed change. `lib/claude/batches.ts`
+ * (M2.2) must use `getClaudeClient()`, not import the SDK by value.
+ */
+const SDK_VALUE_IMPORT_ALLOWLIST: Array<{ file: RegExp; specifiers: RegExp }> = [
+  { file: /^lib\/claude\/client\.ts$/, specifiers: /^@anthropic-ai\/sdk$/ },
+  { file: /^lib\/claude\/outputFormat\.ts$/, specifiers: /^@anthropic-ai\/sdk\/helpers\/zod$/ },
+  { file: /^scripts\/evals\/[^/]+\.ts$/, specifiers: /^@anthropic-ai\/sdk(\/.*)?$/ },
+];
+
+/** The only files allowed to construct an Anthropic client. */
+const CLIENT_CONSTRUCTION_SITES = ["lib/claude/client.ts", "scripts/evals/evalClient.ts"];
+
+describe("SDK import guards", () => {
+  const imports = sdkValueImports();
+
+  it("the scanner sees the repo (sanity) and parses import kinds correctly", () => {
+    expect(repoSourceFiles().length).toBeGreaterThan(50);
+    const parsed = importsOf(
+      [
+        'import type A from "@anthropic-ai/sdk";',
+        'import { type B, type C } from "@anthropic-ai/sdk/x";',
+        'import D, { E as F } from "@anthropic-ai/sdk";',
+        'import * as G from "@anthropic-ai/sdk";',
+        'export { H } from "@anthropic-ai/sdk/h";',
+        'import "@anthropic-ai/sdk/shims";',
+        'const I = await import("@anthropic-ai/sdk");',
+        'const J = require("@anthropic-ai/sdk");',
+        '// import K from "@anthropic-ai/sdk";',
+      ].join("\n"),
+    );
+    expect(parsed.map((s) => [s.specifier, s.typeOnly, s.kind])).toEqual([
+      ["@anthropic-ai/sdk", true, "static"],
+      ["@anthropic-ai/sdk/x", true, "static"],
+      ["@anthropic-ai/sdk", false, "static"],
+      ["@anthropic-ai/sdk", false, "static"],
+      ["@anthropic-ai/sdk/h", false, "static"],
+      ["@anthropic-ai/sdk/shims", false, "side-effect"],
+      ["@anthropic-ai/sdk", false, "dynamic"],
+      ["@anthropic-ai/sdk", false, "dynamic"],
+    ]);
+    expect(parsed[2].bindings).toEqual(["F", "D"]);
+  });
+
+  it("no value import of @anthropic-ai/sdk[/*] outside the allowlist (test files exempt, import type allowed)", () => {
+    const offenders = imports
+      .filter(({ file, site }) => !SDK_VALUE_IMPORT_ALLOWLIST.some((a) => a.file.test(file) && a.specifiers.test(site.specifier)))
+      .map(({ file, site }) => `${file} -> ${site.specifier} (${site.kind})`);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the allowlisted lib files really are the SDK's only lib importers (list isn't stale)", () => {
+    const libImporters = [...new Set(imports.filter(({ file }) => file.startsWith("lib/")).map(({ file }) => file))].sort();
+    expect(libImporters).toEqual(["lib/claude/client.ts", "lib/claude/outputFormat.ts"]);
+  });
+
+  it("clients are constructed only at the allowed sites, with no custom logger and no debug/info logLevel", () => {
+    const sites: string[] = [];
+    for (const { file, site } of imports) {
+      const source = readFileSync(join(REPO_ROOT, file), "utf8");
+      for (const call of constructorCalls(source, clientConstructorNames(site, source))) {
+        sites.push(file);
+        expect(call, file).not.toMatch(/\blogger\s*:/);
+        expect(call, file).not.toMatch(/\.\.\./); // no spread can smuggle in options
+      }
+    }
+    expect([...new Set(sites)].sort()).toEqual(CLIENT_CONSTRUCTION_SITES);
+  });
+
+  it("no non-test source sets an SDK logLevel of debug/info (constructor or withOptions)", () => {
+    for (const file of repoSourceFiles().filter((f) => !isTestFile(f))) {
+      const text = stripComments(readFileSync(join(REPO_ROOT, file), "utf8"));
+      expect(text, file).not.toMatch(/\blogLevel\s*:\s*["'`](debug|info)["'`]/);
+      expect(text, file).not.toMatch(/withOptions\s*\([^)]*logLevel/);
+    }
+  });
+
+  it("lib/ and app/ never call withOptions, and spell openTelemetry only as `openTelemetry: false`", () => {
+    for (const file of repoSourceFiles().filter((f) => /^(lib|app)\//.test(f) && !isTestFile(f))) {
+      const text = stripComments(readFileSync(join(REPO_ROOT, file), "utf8"));
+      expect(text, file).not.toMatch(/withOptions\s*\(/);
+      const all = text.match(/openTelemetry/g)?.length ?? 0;
+      const allowed = text.match(/openTelemetry:\s*false\b/g)?.length ?? 0;
+      expect(all, file).toBe(allowed);
+    }
+  });
+
+  it("no Next.js instrumentation hook exists (repo root or src/)", () => {
+    for (const dir of ["", "src/"]) {
+      for (const name of ["instrumentation", "instrumentation-client"]) {
+        for (const ext of ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"]) {
+          expect(existsSync(join(REPO_ROOT, `${dir}${name}.${ext}`)), `${dir}${name}.${ext}`).toBe(false);
+        }
+      }
+    }
+    const rootish = [...readdirSync(REPO_ROOT), ...(existsSync(join(REPO_ROOT, "src")) ? readdirSync(join(REPO_ROOT, "src")) : [])];
+    expect(rootish.filter((e) => /^instrumentation(-client)?\./.test(e))).toEqual([]);
+  });
+
+  describe("constructed clients' resolved options (env set to enable tracing and debug logs)", () => {
+    beforeEach(() => {
+      __resetClaudeClientForTests();
+      vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-fake");
+      vi.stubEnv("ANTHROPIC_LOG", "debug");
+      vi.stubEnv("ANTHROPIC_OPEN_TELEMETRY", "true");
+      vi.stubEnv(OTEL_CONTENT_MODE_ENV, "metadata_only");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      __resetClaudeClientForTests();
+    });
+
+    const clients: Array<[string, () => Anthropic]> = [
+      ["lib/claude/client.ts#getClaudeClient", () => getClaudeClient()],
+      ["scripts/evals/evalClient.ts#createEvalClient", () => createEvalClient({ apiKey: "sk-ant-test-fake", maxRetries: 2 })],
+      [
+        "scripts/evals/evalClient.ts#createEvalClient (with fetch)",
+        () => createEvalClient({ apiKey: "sk-ant-test-fake", maxRetries: 1, fetch: (async () => new Response("{}")) as typeof fetch }),
+      ],
+    ];
+
+    it.each(clients)("%s: openTelemetry traces off and logLevel warn/off", (_name, make) => {
+      const client = make();
+      expect(client.openTelemetry.traces.enabled).toBe(false);
+      expect(["warn", "off"]).toContain(client.logLevel);
+    });
   });
 });

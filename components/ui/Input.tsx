@@ -1,7 +1,9 @@
-import { InputHTMLAttributes } from "react";
+import { InputHTMLAttributes, Ref } from "react";
 
 interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   label: string;
+  /** Forwarded to the `<input>` (React 19 ref-as-prop), e.g. to move focus to it. */
+  ref?: Ref<HTMLInputElement>;
 }
 
 export function Input({ label, id, className = "", ...props }: InputProps) {

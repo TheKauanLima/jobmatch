@@ -49,25 +49,91 @@ Implements §13.5.1–13.5.3, 13.5.5, 13.5.6 (helpers). Depends on: nothing.
   classification, and escaping with attributes plus zero-width splitting.
 - `parse.ts` is reduced to (or replaced by) semantic validation.
 
-### M1.1b Structured-output `enum` restore [BE]
-Implements the §13.5.2 "Decision on `enum`" block. Depends on: M1.1 merged. **Must
-land before M2.2 and M2.3**, the first enum-heavy schemas. Small (one PR).
-1. [BE] `scripts/evals/structured-output-probe.ts` (manual, real key): 20 sync + 5
-   batch runs on `claude-opus-5-5` with an out-of-enum-pushing prompt. Record the
-   result in §13.5.2 next to the decision block, either "enforced" or "not enforced".
-2. [BE] `lib/claude/outputFormat.ts#buildOutputFormat` with `restoreEnums`,
-   `WIRE_ENUM_MAX_VALUES = 64`, and `WIRE_ENUM_RESTORE` (set from the probe result).
-   Use it in both `callStructured` and the batch request builder.
-3. [BE] Tests per §13.5.2 decision item 5: wire-schema snapshots, enum-path coverage,
-   nullable→`null`, no other keywords added, the oversized-enum guard, and
-   sync/batch parity.
+### M1.1b SDK 1.8.0 upgrade and structured-output `enum` [BE]
+Implements the §13.5.2 "Decision on `enum`" block (2026-11-12). Depends on: M1.1
+merged. **Must land before M2.2 and M2.3**, the first enum-heavy schemas. One PR.
+1. [BE] Pin `@anthropic-ai/sdk` to exactly `1.8.0` (no caret) and update the lockfile.
+   Fix any type or compile breaks inside `lib/claude` without changing behavior.
+   - If a fix would change behavior, or if any step-2 item fails, **stop**: leave the
+     pin at 0.122.0 and report back (decision item 2, fallback). Don't build
+     `restoreEnums`.
+2. [BE] `scripts/evals/sdk-contract-check.ts` (manual, real key). Covers decision item
+   5 (i)–(viii): the `anthropic-version` header, `.withResponse()` + `request_id` with
+   the fallback beta, the enum fixture accepted sync and batch, error classes, the
+   20k non-streaming guard, the `usage.iterations` / fallback-content shape, the
+   batches API shape, and abort/backoff.
+   - Record the results as a "Verified (M1.1b, SDK 1.8.0)" note in §13.5.2. Mark each
+     item live or from source.
+   - Update the abort note.
+3. [BE] `scripts/evals/structured-output-probe.ts` (manual, real key, raw schema): 20
+   sync + 5 batch runs on `claude-opus-5-5`. Record "enforced" / "not enforced" under
+   "Probe result" in §13.5.2. Informational only: the outcome doesn't change the code.
+4. [BE] `lib/claude/outputFormat.ts#buildOutputFormat(schema)`, a pass-through over
+   `zodOutputFormat(schema).schema`, and the only importer of `zodOutputFormat`.
+   `buildStructuredParams` uses it. No `restoreEnums`, no `WIRE_ENUM_RESTORE`, and no
+   enum logic in runtime code.
+5. [BE] Tests per decision item 6:
+   - the `OUTPUT_SCHEMAS` registry (keyed by `ClaudeTaskName`, with a runtime key
+     check);
+   - per-task wire snapshots;
+   - enum-path coverage on the registry plus the fixture (plain, nullable `anyOf`,
+     array item, reused/`$defs`);
+   - the ≤ 64 string-only enum guard (`OUTPUT_ENUM_MAX_VALUES`);
+   - no `const`;
+   - stripped constraints stay absent;
+   - the single-seam tests (`buildStructuredParams` ↔ `buildOutputFormat`, and the
+     `zodOutputFormat` import grep).
+   - Existing tests, including the `raceAbort` tests, stay green unchanged, except
+     `parse.test.ts` switching to `buildOutputFormat`.
+6. [BE] Re-run the v1 analyze and match routes end-to-end with a real key on 1.8.0.
 
 **Acceptance:**
-- The probe result is recorded.
-- With `WIRE_ENUM_RESTORE = true`, every closed enum in the M1.1-migrated schemas
-  appears on the wire, and a live call still returns `end_turn`.
-- With it set to `false`, the wire schema is byte-identical to the helper output.
+- `package.json` has `"@anthropic-ai/sdk": "1.8.0"`, and the lockfile resolves 1.8.0.
+- Every contract-check item passes and is recorded in §13.5.2. The probe result is
+  recorded.
+- `zodOutputFormat` appears only in `lib/claude/outputFormat.ts`. Runtime code
+  contains no enum post-processing.
+- The enum fixture's wire schema keeps every enum, with nullable as `anyOf` + null
+  branch. A live sync call and a batch call with it both return `end_turn`.
+- The v1 analyze and match routes work end-to-end on 1.8.0 (manual, noted in the PR).
+- No `tool_choice`, `temperature`, `top_p`, or `top_k` in `lib/claude` (unchanged from
+  M1.1).
 - No data-driven vocabulary (skill/role slugs) is a `z.enum`.
+
+### M1.1c Disable SDK telemetry on the Claude client [BE]
+Implements §13.5.2 "Client construction and SDK telemetry" (2026-11-12), §13.2.1
+rule 5, §13.15 item 11. Depends on: M1.1b. **Must land before any v2 task that sends
+resume data (M2.3).** Small; one PR.
+1. [BE] Confirm from the 1.8.0 runtime source that `openTelemetry: false` disables
+   spans and stops the client reading the `ANTHROPIC_OPEN_TELEMETRY*` env vars. Note
+   the file and function in the PR. If the runtime doesn't match the types, stop and
+   report.
+2. [BE] `getClaudeClient()`: pass `openTelemetry: false`. Before constructing, throw
+   `ClaudeConfigurationError` (message names the variable only) when
+   `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` is `content` (trimmed,
+   case-insensitive).
+3. [BE] Add `openTelemetry: false` to the clients built in
+   `scripts/evals/structured-output-probe.ts` and `scripts/evals/sdk-contract-check.ts`,
+   and add contract-check item (x).
+4. [BE] Tests per the decision's item 4: tracing disabled despite env vars; the guard
+   throws and maps to `ai_unavailable` with no request sent; no `traceparent`/
+   `tracestate`/`baggage` header on a fake-fetch call; the import guards (no value
+   import of `@anthropic-ai/sdk*` outside the allowlist, no `instrumentation.*`).
+5. [BE] *(Added 2026-11-12, M1.1b+c review; blocking privacy fix.)* Pass
+   `logLevel: "warn"` in `getClaudeClient()` and in both eval scripts' clients, so
+   `ANTHROPIC_LOG=debug` can't make the SDK log request bodies (decision item 1b).
+   Test it, and extend contract-check item (x) to cover it. Make `--only-x` run
+   without `ANTHROPIC_API_KEY`, and exclude stubbed captures from item (i)'s request
+   count.
+
+**Acceptance:**
+- `getClaudeClient().openTelemetry.traces.enabled === false` with
+  `ANTHROPIC_OPEN_TELEMETRY=true` set.
+- With `ANTHROPIC_LOG=debug` set, the client's log level resolves to `warn` and no
+  request content is logged.
+- The guard test and import-guard tests pass, and the existing `lib/claude` tests
+  stay green.
+- Contract-check item (x) passes on 1.8.0 and is recorded in §13.5.2.
 
 ### M1.2 🟢 Background task infrastructure [BE]
 Implements §13.3.1, 13.3.2, 13.4. Depends on: nothing (in parallel with M1.1).
@@ -263,6 +329,20 @@ Depends on: M1.4a/b, M1.5, M1.6, M1.7.
 2. [QA] Adapter fixture tests; dedupe and normalization property tests; a
    sync-continuation idempotency test.
 3. [QA] Account deletion end-to-end against the local stack.
+4. [QA] (Carried over from the M1.4b review.) Add a DOM test environment (jsdom +
+   `@testing-library/react`, scoped to `*.dom.test.tsx` so the node suite is
+   unchanged) and cover what M1.4b's pure-function tests can't:
+   - a double click on delete sends one request;
+   - a 403 clears the password and focuses the field;
+   - a 500 focuses the alert;
+   - 204 and 401 call `location.replace` with `/?account=deleted` and
+     `/?account=signed_out` after the sign-out finishes or hits its 2 s cap;
+   - `AccountStatusNotice` removes the `?account=` param after the first read.
+5. [BE] (Carried over from the M1.4b review.) Next 16 deprecates `middleware.ts` in
+   favour of `proxy.ts` (`node_modules/next/dist/docs/01-app/01-getting-started/16-proxy.md`).
+   Rename it to `proxy.ts` / `export function proxy`, keeping `PROTECTED_PATHS` and
+   the matcher behaviour identical, and update the relevant §13/§3 text. It's a
+   separate small PR; don't fold it into feature work.
 
 **Acceptance:** all green; a list of findings is resolved or explicitly deferred by
 the orchestrator.
@@ -288,16 +368,44 @@ including during Phase 1.
 - [RV] spot-checks coverage for business, healthcare, and design roles.
 
 ### M2.2 Job requirement extraction (batch + sync) [BE]
-Implements §13.3.6, 13.5.4(2), 13.6.6 (batch/poll/sync), 13.7.3. Depends on: M2.1,
-M1.5, M1.1.
+Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.5.4(2),
+13.6.6 (batch/poll/sync), 13.7.3. Depends on: M2.1, M1.5, M1.1, M1.1b.
 1. [BE] Migration `0013_job_requirements.sql`, including the user-listing extraction
    trigger.
 2. [BE] `lib/claude/tasks/extractJobRequirements.ts` (schema, prompt with
    vocabulary, validate) and `lib/claude/batches.ts`.
+   - `batches.ts` takes `output_config.format` from `buildOutputFormat`.
+   - Add the sync/batch parity test (§13.5.2 enum decision, item 6).
+   - Replace `extractJobRequirements`'s `null` in `OUTPUT_SCHEMAS` with its schema
+     and add its wire snapshot (§13.5.2 enum decision, item 6: `null` means "not
+     implemented yet" and must not survive the implementing PR).
+   - Get the client from `getClaudeClient()`; `batches.ts` must not value-import
+     the SDK (import guard).
 3. [BE] Handlers `jobs.submit_requirement_batch`, `jobs.poll_requirement_batch`, and
    `jobs.extract_requirements_sync`. Skill mapping with provisional-skill rules.
    Ingest caps and budget.
-4. [BE] Add `scripts/taxonomy/review-provisional.ts`.
+4. [BE] Batch item outcomes and refusals (§13.5.3 "Per-item outcome" and "Batch
+   refusals", 2026-11-12):
+   - Batch requests send no `betas` and no `fallbacks`.
+   - The `claude_batch_items.error_code` check constraint in 0013, and the poll
+     handler's outcome → `error_code` mapping.
+   - The `jobs.retry_refused_requirement` kind (§13.4.3 registry row): its no-op
+     guards, the ingest-budget snooze, a sync `runExtractJobRequirements`, and
+     enqueuing `jobs.embed_pending`.
+   - `BATCH_REFUSAL_RETRY_MAX = 10` per batch, with `ai_refused_capped` past it.
+   - The submitter's exclusions (revised 2026-11-12): `ai_refused` (re-run given)
+     is final per hash; the 3-strike rule counts
+     `ai_invalid_output`/`ai_truncated`/`batch_errored`/`ai_refused_capped`. Capped
+     refusals are **not** final; they return to the stale pool as one strike.
+   - Tests (fake batch results): refusal → item `ai_refused` and exactly one
+     re-run enqueued (deduped); the 11th refusal in a batch → `ai_refused_capped`
+     with no re-run, and that listing **is** selected by the next submitter run;
+     a listing with 3 capped (or mixed capped/invalid/truncated/errored) items for
+     its hash is not selected; a re-run for a changed hash, a private listing, or a
+     `source = 'user'` listing makes no Claude call; a re-run over the ingest budget
+     snoozes; an `ai_refused` listing is never selected by the submitter again for
+     the same hash; expired items don't count toward the 3 strikes.
+5. [BE] Add `scripts/taxonomy/review-provisional.ts`.
 
 **Acceptance:**
 - The existing corpus is fully extracted through Batches within one day, respecting
@@ -305,11 +413,18 @@ M1.5, M1.1.
 - A user-submitted listing gets requirements within ~1–2 min.
 - A private listing's unmapped skills create no shared `skills` rows.
 - A re-run with an unchanged hash makes zero Claude calls.
+- A batch refusal within the per-batch cap gets exactly one sync re-run with the
+  fallback, and is never resubmitted to a batch for the same hash. A capped refusal
+  gets no re-run and is resubmitted until it reaches 3 strikes.
+- `OUTPUT_SCHEMAS.extractJobRequirements` is non-null and snapshotted.
 
 ### M2.3 Resume profile extraction [BE]
 Implements §13.3.5, 13.5.4(1), 13.10.3. Depends on: M2.1, M1.2, M1.1.
 1. [BE] Migration `0012_resume_profiles.sql`.
 2. [BE] `lib/claude/tasks/extractResumeProfile.ts` with evidence-quote validation.
+   Replace `extractResumeProfile`'s `null` in `OUTPUT_SCHEMAS` with its schema and
+   add its wire snapshot (§13.5.2 enum decision, item 6: `null` means "not
+   implemented yet" and must not survive the implementing PR).
 3. [BE] Handlers `resume.extract_text` and `resume.extract_profile`, callable
    standalone (correlation by resume id) until M3.1 adds reports.
 
@@ -390,6 +505,8 @@ M2.3, M2.4.
 Implements §13.5.4(3), 13.5.6 (critique rules). Depends on: M3.1.
 1. [BE] `lib/claude/tasks/critiqueResume.ts` (rubric, student guidance,
    fabrication guard) and the `resume.critique` handler, replacing the stub.
+   Replace `critiqueResume`'s `null` in `OUTPUT_SCHEMAS` with its schema and add its
+   wire snapshot (§13.5.2 enum decision, item 6).
 2. [BE] Map quotes back to the original text, per §13.13.2 "Displaying quoted text".
    - `semanticValidation.ts#locateQuoteInSource`: NFKC plus invisible-character
      normalization, keeping an offset map back to the original.
@@ -425,6 +542,9 @@ Implements §13.5.4(4)(5), 13.8.5. Depends on: M3.3.
 2. [BE] `narrateRoleFit.ts` and the `resume.narrate_roles` handler. Until M4.1, pass
    an empty market and `sufficient_sample=false`. Number-stripping validation applies
    from the start.
+3. [BE] Replace the `null`s for `rerankJobsForRole` and `narrateRoleFit` in
+   `OUTPUT_SCHEMAS` with their schemas and add their wire snapshots (§13.5.2 enum
+   decision, item 6).
 
 **Acceptance:**
 - Rerank handles always match the input set exactly.
@@ -435,7 +555,10 @@ Implements §13.5.4(4)(5), 13.8.5. Depends on: M3.3.
 Implements §13.5.4(6), 13.13.3. Depends on: M3.1 (`request_fit_check`), M2.2 (sync
 extraction).
 1. [BE] `assessJobFit.ts` and the `match.fit_check` handler (inline extraction when
-   stale).
+   stale). Replace `assessJobFit`'s `null` in `OUTPUT_SCHEMAS` with its schema and add
+   its wire snapshot (§13.5.2 enum decision, item 6). Whichever of M3.2/M3.4/M3.5
+   lands last leaves no `null` entry and drops `| null` from the registry type in
+   the same PR.
 2. [BE] `POST /api/matches` returns 202. `GET /api/matches/:id` and the list routes
    carry status and `details`. Remove the v1 sync path.
 
@@ -624,7 +747,8 @@ deletion completeness including the new tables.
 | ID | Title | Owner | Depends on | Start now |
 |---|---|---|---|---|
 | M1.1 | Claude layer v2 foundation (structured outputs, Opus 5.5, delete repair/retry) | BE | — | 🟢 |
-| M1.1b | Structured-output `enum` restore (probe + `buildOutputFormat`) | BE | M1.1; before M2.2/M2.3 | |
+| M1.1b | SDK 1.8.0 upgrade + contract check + enum probe + `buildOutputFormat` seam | BE | M1.1; before M2.2/M2.3 | |
+| M1.1c | Disable SDK OpenTelemetry on the Claude client + content-mode guard | BE | M1.1b; before M2.3 | |
 | M1.2 | Background task infrastructure (0007/0008, worker, kicks) | BE | — | 🟢 |
 | M1.3 | QA: task infra and Claude layer (pgTAP harness) | QA | M1.1, M1.2 | |
 | M1.4a | Account deletion backend | BE | — | 🟢 |
@@ -636,7 +760,7 @@ deletion completeness including the new tables.
 | M1.8 | QA: Phase 1 gate | QA | M1.4–M1.7 | |
 | M2.1 | Skills and role-family taxonomy | BE | M1.5 (migration order; data authoring can start now) | |
 | M2.2 | Job requirement extraction (batch + sync) | BE | M2.1, M1.5, M1.1, M1.1b | |
-| M2.3 | Resume profile extraction | BE | M2.1, M1.2, M1.1, M1.1b | |
+| M2.3 | Resume profile extraction | BE | M2.1, M1.2, M1.1, M1.1b, M1.1c | |
 | M2.4 | Embeddings and `match_candidates` | BE | M2.2, M2.3, Q1 | |
 | M2.5 | Extraction model eval harness | QA+BE | M2.2 | |
 | M2.6 | QA: Phase 2 gate | QA | M2.1–M2.4 | |

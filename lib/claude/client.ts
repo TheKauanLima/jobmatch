@@ -30,8 +30,8 @@
  *     request_id only. Never prompt or response content.
  *
  * ---- Why `beta.messages.create` + our own parse, not `beta.messages.parse` ----
- * Verified against @anthropic-ai/sdk 0.122 (details in the §13.5.2
- * "Verified" note). `parse` works with `output_config.format` + `fallbacks`,
+ * Verified against @anthropic-ai/sdk 0.122 and re-checked on the pinned
+ * 1.8.0 (details in the §13.5.2 "Verified" notes). `parse` works with `output_config.format` + `fallbacks`,
  * but (a) it throws a plain `AnthropicError` when the output fails JSON or
  * zod parsing, which discards the response (no usage, no stop_reason, so a
  * `max_tokens` truncation becomes indistinguishable from invalid output),
@@ -39,15 +39,16 @@
  * plain Promise, so `.withResponse()` (the only way to read the request id)
  * isn't available. §13.5.2 names `create` + `schema.parse(JSON.parse(text))`
  * as the sanctioned alternative. Structured output is still enforced
- * server-side, because `zodOutputFormat(schema).schema` is sent as
+ * server-side, because `buildOutputFormat(schema)` (lib/claude/outputFormat.ts,
+ * a pass-through over the SDK's zod helper) is sent as
  * `output_config.format`.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { z } from "zod";
 
 import { getTaskConfig, type ClaudeTaskName } from "@/lib/claude/config";
+import { buildOutputFormat } from "@/lib/claude/outputFormat";
 import {
   ClaudeApiError,
   ClaudeBadRequestError,
@@ -75,23 +76,73 @@ export const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
 /** SDK-level automatic retries for transient errors (§13.5.2 step 6). */
 export const CLAUDE_SDK_MAX_RETRIES = 1;
 
+/**
+ * The SDK env var that, on a client built without a telemetry option, puts
+ * prompt and response text into trace spans. Our client ignores it
+ * (`openTelemetry: false`), but its presence means someone intends content
+ * capture, so `getClaudeClient()` fails closed (§13.5.2 "Client construction
+ * and SDK telemetry" item 2).
+ */
+export const OTEL_CONTENT_MODE_ENV = "ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE";
+
+/**
+ * The SDK log level, set explicitly so `ANTHROPIC_LOG=debug` can't make the
+ * SDK log request bodies (see `getClaudeClient`). Never `info` or `debug`.
+ */
+export const CLAUDE_SDK_LOG_LEVEL = "warn" as const;
+
 let cachedClient: Anthropic | null = null;
 
 /**
- * Lazily constructed, module-cached Anthropic client. Reads
- * `ANTHROPIC_API_KEY` on first use (not at import), so importing this module
- * never breaks a build or a route that doesn't call Claude. Throws
- * `ClaudeConfigurationError` if the key is missing.
+ * Lazily constructed, module-cached Anthropic client, and the ONLY place app
+ * code constructs one (a grep test in client.test.ts enforces this). Reads
+ * env on first use (not at import), so importing this module never breaks a
+ * build or a route that doesn't call Claude.
+ *
+ * Throws `ClaudeConfigurationError` (which `callStructured` maps to a
+ * non-retryable `ai_unavailable`) if:
+ *  - `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` is `content` (trimmed,
+ *    any case). The message names the variable only, never its value;
+ *  - `ANTHROPIC_API_KEY` is missing.
+ *
+ * `openTelemetry: false` turns off the SDK's built-in OpenTelemetry tracing
+ * (on by default since 1.x). Verified in the 1.8.0 runtime
+ * (`internal/tracing.js`):
+ *  - `resolveOpenTelemetryOptions(false)` becomes `{ traces: false }`, and the
+ *    `ANTHROPIC_OPEN_TELEMETRY*` env vars are read only when no option is given;
+ *  - `getTracer` then returns `undefined`, so every request takes the
+ *    untraced `makeRequest` path;
+ *  - with no span, no `traceparent` / `tracestate` / `baggage` header is
+ *    injected.
+ * Resume text must never reach a tracing backend (§13.2.1 rule 5).
+ *
+ * `logLevel: CLAUDE_SDK_LOG_LEVEL` ("warn") is explicit so the SDK never reads
+ * `ANTHROPIC_LOG`. At `debug`, 1.8.0's `debugLogRequestDetails` writes every
+ * request body (prompts, i.e. resume text) to `console.debug`, which ends up in
+ * the platform's logs. Verified in the 1.8.0 runtime (`client.js` constructor):
+ * `parseLogLevel(options.logLevel) ?? parseLogLevel(env ANTHROPIC_LOG) ?? default`,
+ * so a valid explicit option always wins. At `warn`, the SDK's messages on our
+ * code paths are fixed strings with no request or response content.
  */
 export function getClaudeClient(): Anthropic {
   if (cachedClient) {
     return cachedClient;
   }
+  if (process.env[OTEL_CONTENT_MODE_ENV]?.trim().toLowerCase() === "content") {
+    throw new ClaudeConfigurationError(
+      `${OTEL_CONTENT_MODE_ENV} is set to a mode that is not allowed for Claude calls. Unset it.`,
+    );
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new ClaudeConfigurationError();
   }
-  cachedClient = new Anthropic({ apiKey, maxRetries: CLAUDE_SDK_MAX_RETRIES });
+  cachedClient = new Anthropic({
+    apiKey,
+    maxRetries: CLAUDE_SDK_MAX_RETRIES,
+    openTelemetry: false,
+    logLevel: CLAUDE_SDK_LOG_LEVEL,
+  });
   return cachedClient;
 }
 
@@ -157,18 +208,14 @@ export function buildStructuredParams<T>(
       : rest;
   });
 
-  // `zodOutputFormat` converts the zod schema to the JSON Schema subset that
-  // structured outputs accept. Only its `schema` goes on the wire; the
-  // helper's `parse` function is not used (see the module docstring).
-  const format = zodOutputFormat(args.schema);
-
   return {
     model: config.model,
     max_tokens: config.maxTokens,
     system,
     messages: [{ role: "user", content: args.userContent }],
     output_config: {
-      format: { type: "json_schema", schema: format.schema },
+      // The single wire-schema seam, shared with the batch builder (§13.5.2).
+      format: buildOutputFormat(args.schema),
       effort: config.effort,
     },
     betas: [SERVER_SIDE_FALLBACK_BETA],
@@ -335,11 +382,17 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
  *
  * The SDK forwards `signal` to fetch, but it only checks `signal.aborted`
  * at certain points: before each attempt, and when the request fails with a
- * connection-level error. Its retry backoff is a plain `sleep()` that honors
- * `Retry-After` with no cap and ignores the signal (verified in 0.122's
- * `retryRequest`). Racing here makes the caller's deadline hard. The
- * abandoned SDK promise is still observed, so it can't become an unhandled
- * rejection, and it throws `APIUserAbortError` itself once its sleep ends.
+ * connection-level error. Between attempts:
+ *  - SDK 0.122's retry backoff was a plain `sleep()` that ignored the signal,
+ *    so an abort waited out the whole backoff;
+ *  - SDK 1.8.0 honors it: `retryRequest` (client.js) calls
+ *    `sleep(ms, options.signal)` (internal/utils/sleep.js), which resolves early
+ *    on abort, and the next attempt's `signal.aborted` check throws
+ *    `APIUserAbortError` (contract-check item (viii)).
+ * The race stays anyway. Our hard deadline must not depend on SDK internals
+ * that have already changed once, and the SDK still honors `Retry-After` with
+ * no cap of its own (anything up to 2^31-1 ms). The abandoned SDK promise is
+ * still observed, so it can't become an unhandled rejection.
  */
 function raceAbort<R>(promise: Promise<R>, signal: AbortSignal | undefined): Promise<R> {
   if (!signal) {

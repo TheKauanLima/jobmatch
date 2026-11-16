@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 
 import { ClaudeInvalidOutputError } from "@/lib/claude/errors";
+import { buildOutputFormat } from "@/lib/claude/outputFormat";
 import {
   matchResultSchema,
   resumeAnalysisResultSchema,
@@ -34,14 +34,14 @@ describe("v1 schemas (structure only)", () => {
     ]);
   });
 
-  it("convert to a strict structured-output JSON schema via zodOutputFormat", () => {
-    const analysis = zodOutputFormat(resumeAnalysisResultSchema).schema;
+  it("convert to a strict structured-output JSON schema via buildOutputFormat", () => {
+    const analysis = buildOutputFormat(resumeAnalysisResultSchema).schema;
     expect(analysis).toMatchObject({
       type: "object",
       additionalProperties: false,
       required: ["strengths", "weaknesses", "summary", "suggested_roles"],
     });
-    const match = zodOutputFormat(matchResultSchema).schema as {
+    const match = buildOutputFormat(matchResultSchema).schema as {
       properties: { score: { type: string } };
     };
     expect(match.properties.score.type).toBe("integer");

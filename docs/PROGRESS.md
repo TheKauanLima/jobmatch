@@ -178,16 +178,57 @@ this file at the end of every work session.
 ### Next steps (in order)
 1. ~~Apply 0007 → 0008 and verify~~ — done.
 2. ~~Regenerate/diff types~~ — done.
-3. User: generate `WORKER_SECRET`; set `WORKER_SECRET` + `APP_BASE_URL` on Vercel
-   **Production only**; deploy; then create Vault secrets `kalify_worker_url` and
-   `kalify_worker_secret`; check Deployment Protection doesn't block
-   `/api/worker/tick`. Then run the M1.2 acceptance check (`maintenance.noop`).
+3. ~~Worker secrets + M1.2 production acceptance~~ — done (passed 2026-11-09).
 4. ~~M1.4c~~ — done.
-5. M1.3 QA (now also: `consume_account_reauth_attempt` pgTAP, handed off from M1.4c) (pgTAP + two-connection concurrency script — reviewer listed exactly
-   what it must cover), M1.1b, M1.4b settings UI, then M1.5 ingestion.
-6. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
+5. ~~M1.3 unit half~~ — committed (`1b39c87`). Still open: run the pgTAP files and
+   the concurrency script once local Supabase starts.
+6. ~~M1.1b + M1.1c~~ — **APPROVED 2026-11-12** (review → CHANGES REQUIRED → fixed →
+   re-review APPROVED). Step 0 found `@anthropic-ai/sdk` 1.7.0 fixed `enum`
+   stripping, so the architect chose to pin 1.8.0 exactly (crosses the breaking 1.0.0;
+   `anthropic-version: 2026-10-21`; licence is now Apache-2.0) instead of our own enum
+   helper. `buildOutputFormat` is a pass-through seam and the only `zodOutputFormat`
+   importer.
+   - **Probe:** enum enforced, 25/25 (20 sync + 5 batch).
+   - **Contract check:** `scripts/evals/sdk-contract-check.ts` items (i)–(x) all
+     passed. Re-run it on every SDK bump.
+   - **Live checks:** v1 analyze and match run end-to-end at the lib level.
+   - **Live spend:** about $0.14 in total.
+   - **Telemetry and logging (M1.1c):** the client is built with
+     `openTelemetry: false` and `logLevel: "warn"`, so `ANTHROPIC_LOG=debug` can no
+     longer log resume text into Vercel logs (a pre-existing gap the review found).
+     A guard rejects the OTel content-capture env var. Import-level guards allow SDK
+     value imports only in `lib/claude/client.ts`, `lib/claude/outputFormat.ts` and
+     `scripts/evals/*`, and no `instrumentation.*` file.
+   - **Tests:** 1,113.
+   - **Design decisions recorded for M2.2:** batches can't use server-side refusal
+     fallbacks, so a refused item gets one sync re-run (capped at 10 per batch).
+     Capped items return to the stale pool as one strike; only `ai_refused` is final
+     per content hash.
+7. ~~M1.4b settings + delete-account UI~~ — **APPROVED WITH NITS 2026-11-12, all nits
+   fixed.**
+   - **Page:** `/settings` (signed-in only; also added to `PROTECTED_PATHS`) with a
+     Nav link.
+   - **`DeleteAccountForm`:** responses mapped per §13.13.7.
+     - 204 → `/?account=deleted`.
+     - 401 → `/?account=signed_out`, a non-error notice. It doesn't claim
+       "deleted", because a 401 can also mean the session simply ended.
+     - 500 with `internal_error` → "still exists".
+     - Platform 500s, 5xx and network errors → "couldn't confirm"; retrying is
+       safe.
+   - **Navigation:** full navigation drops the cached private pages, after a
+     best-effort local sign-out.
+   - **Banner:** `AccountStatusNotice` strips `?account=` after the first read.
+   - **`UsageLimits` panel:** reads `/api/account/limits`.
+   - **Code layout:** pure helpers in `lib/client/`; 1,181 tests.
+   - **Carried to M1.8:** jsdom/Testing Library tests for click-driven behaviour,
+     and the Next 16 `middleware.ts` → `proxy.ts` rename.
+8. Next: M1.5 job ingestion v2 (needs M1.2, done).
+9. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
    `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
 
 ### User to-dos (not blocking current work)
-- Check `CRON_SECRET` is set in Vercel (needed for the daily job sync).
 - Enable leaked-password protection in Supabase Auth settings.
+- Decide whether to delete the disconnected Vercel resource `supabase-bole-bell`.
+- Disk space: C: had ~5 GB free on 2026-11-12, and one write hit ENOSPC. Docker's
+  `docker_data.vhdx` is 13 GB on C:. Consider moving it to D: (Docker Desktop →
+  Settings → Resources → Advanced → Disk image location).

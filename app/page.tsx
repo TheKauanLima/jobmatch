@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { FadeInSection } from "@/components/FadeInSection";
 import { SampleAnalysisShowcase } from "@/components/SampleAnalysisShowcase";
+import { AccountStatusNotice } from "@/components/settings/AccountStatusNotice";
 
 /**
  * Landing page. Visual polish pass (2026-09-17): previously a single
@@ -42,6 +43,7 @@ const STEPS = [
 export default function Home() {
   return (
     <div className="flex flex-1 flex-col">
+      <AccountStatusNotice />
       <FadeInSection as="section" className="mx-auto w-full max-w-5xl px-6 pt-20 pb-16 sm:pt-28 sm:pb-24">
         <p className="text-sm font-semibold tracking-wide text-fg-muted uppercase">
           AI-powered job matching

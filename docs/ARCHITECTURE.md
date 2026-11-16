@@ -2050,6 +2050,20 @@ now; the five-phase plan (`docs/ROADMAP.md` breaks it into milestones).
    (Claude API) only. The embeddings provider receives a **synthesized profile text**
    with names, contact details, and street addresses excluded (§13.8.2), never the
    raw resume. Fetched URLs are fetched by our server, never by a third party.
+   **Telemetry and observability tooling are third-party processors too.** No
+   tracing, APM, or LLM-observability backend may receive Claude call spans, and
+   none may receive prompt or response content. The Anthropic client has SDK
+   tracing disabled at construction (§13.5.2 "Client construction and SDK
+   telemetry"). Adding any OpenTelemetry instrumentation (`instrumentation.ts`,
+   `@vercel/otel`, a tracer provider, an LLM-observability SDK) is an
+   architecture change that needs a §13 decision and user confirmation first.
+   **Log drains count too.** Anything written to the console on Vercel goes to
+   Vercel's logs and to every log drain attached to the project, so content logged
+   there reaches those processors. That is why the Anthropic client's SDK logging is
+   pinned to `logLevel: "warn"` at construction: at `debug`, SDK 1.8.0 logs full
+   request bodies (system prompt plus resume text), and `ANTHROPIC_LOG` alone would
+   turn that on (§13.5.2 "Client construction and SDK telemetry", item 1b). The PII
+   rule (§13.15 item 7) applies to library logging as much as to our own.
 
 #### 13.2.2 Proposed CLAUDE.md wording (orchestrator applies after user confirmation)
 Replace the **Privacy model** section with:
@@ -2610,8 +2624,10 @@ unique`, `operation text` (`job_requirements`), `prompt_version`, `model`,
 **`claude_batch_items`**: server-only. Columns: `id`, `batch_id → claude_batches cascade`,
 `custom_id text` (`<job_description_id>_<first 16 hex of content_hash>`, which fits
 the 64-char `^[a-zA-Z0-9_-]+$` limit), `job_description_id → job_descriptions cascade`,
-`content_hash text`, `status ('pending','succeeded','failed')`, `error_code`,
-`created_at`. Unique `(job_description_id, content_hash) where status='pending'`, which
+`content_hash text`, `status ('pending','succeeded','failed')`, `error_code text null`
+(check: null, or one of `'ai_invalid_output','ai_truncated','ai_refused',
+'ai_refused_capped','batch_errored','batch_expired','batch_canceled'`; meanings in
+§13.5.3 "Per-item outcome"), `created_at`. Unique `(job_description_id, content_hash) where status='pending'`, which
 stops a listing being submitted to two in-flight batches. Index `(job_description_id,
 content_hash, status)`.
 
@@ -3016,6 +3032,7 @@ be `< WORKER_HARD_BUDGET_MS` (§13.4.2). A unit test asserts both for every kind
 | `jobs.extract_requirements_sync` | user | 60 | 3 | 240 | 150 000 | Claude, Voyage | `jobreq:{job_id}:{content_hash}` |
 | `jobs.submit_requirement_batch` | background | 20 | 5 | 120 | 60 000 | Claude Batches | `jobreq-batch:{yyyy-mm-dd-hh}` |
 | `jobs.poll_requirement_batch` | background | 20 | 10 | 270 | 200 000 | Claude Batches | `jobreq-poll:{batch_id}` |
+| `jobs.retry_refused_requirement` | background | 20 | 3 | 240 | 150 000 | Claude | `jobreq-refusal:{job_id}:{content_hash}` |
 | `jobs.embed_pending` | background | 20 | 5 | 270 | 200 000 | Voyage | `jobembed:{yyyy-mm-dd-hh}` |
 | `ingest.sync_source` | background | 10 | 4 | 270 | 220 000 | source APIs | `ingest:{slug}:{board}:{date}[:{page_cursor}]` |
 | `market.refresh_stats` | background | 10 | 3 | 180 | 120 000 | SQL only | `market-refresh:{yyyy-mm-dd-hh}` |
@@ -3073,7 +3090,7 @@ or throws a `TaskError` (`code`, `retryable`).
 | `ai_unavailable` | yes | Anthropic 429/500/529, network, timeout |
 | `ai_invalid_output` | yes (once more, then dead) | `parsed_output` null, or semantic validation failed beyond tolerance |
 | `ai_truncated` | no | `stop_reason = 'max_tokens'`; config bug, logged for tuning |
-| `ai_refused` | no | `stop_reason = 'refusal'` after the server-side fallback |
+| `ai_refused` | no | `stop_reason = 'refusal'` after the server-side fallback (sync). Batch refusals have no fallback; see §13.5.3 "Batch refusals" |
 | `ai_bad_request` | no | Anthropic 400 (config/schema bug) |
 | `embed_unavailable` | yes | Voyage 429/5xx/network |
 | `text_extraction_failed` | no | unreadable PDF/DOCX |
@@ -3280,9 +3297,10 @@ callStructured<T>(args: {
 Behavior, in order:
 1. Build params (`buildStructuredParams`): `model`, `max_tokens`, `system`,
    `messages: [{role:'user', content}]`, and `output_config: { format: { type:
-   'json_schema', schema: <wire schema> }, effort }`. The wire schema is
-   `zodOutputFormat(schema).schema`, plus `enum` restoration per the "Decision on
-   `enum`" block below, once M1.1b lands.
+   'json_schema', schema: <wire schema> }, effort }`. `output_config.format` comes
+   from `lib/claude/outputFormat.ts#buildOutputFormat(schema)`, a pass-through over
+   `zodOutputFormat(schema).schema` on the pinned SDK. The batch builder uses the same
+   function. See the "Decision on `enum`" block below (M1.1b).
    **Never** send `tool_choice` (forced `tool_choice` returns 400 on Opus 5.5),
    `temperature`, `top_p`, `top_k`, or an assistant prefill.
 2. **As built (M1.1):** call the beta *create* endpoint with server-side refusal
@@ -3325,7 +3343,105 @@ recommended" error at these values, pass an explicit `timeout` (which bypasses t
 estimate) or switch that task to `client.beta.messages.stream(...).finalMessage()`.
 Verify in M1.1.
 
-**Verified (M1.1, 2026-11-04, `@anthropic-ai/sdk` 0.122.0, zod 4.6.5, live calls on `claude-opus-5-5`):**
+**Client construction and SDK telemetry (binding; architect 2026-11-12; implemented in
+M1.1c).** SDK 1.8.0 traces every API call through `@opentelemetry/api` by default
+(content mode `metadata_only`). Today that does nothing, because no tracer provider is
+registered. But it would become live the moment anyone adds OTel instrumentation, and
+one env var (`ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content`) would then put
+prompt and response text, i.e. resume text, into a third-party tracing backend. That
+breaks §13.2.1 rule 5. So tracing is off by construction, and the off state is
+asserted, not assumed:
+1. **`getClaudeClient()` passes `openTelemetry: false`** to `new Anthropic({...})`,
+   alongside `apiKey` and `maxRetries`. From the 1.8.0 types (`client.d.ts`,
+   `internal/tracing.d.ts`): `false` is short for `{ traces: false }`, and a client
+   given *any* `openTelemetry` option **does not read the `ANTHROPIC_OPEN_TELEMETRY*`
+   env vars at all**. So no env var can turn tracing or content capture back on for
+   this client. With spans disabled, `startApiCallSpan` returns `undefined`, so no
+   `traceparent` header is injected either. *backend-dev confirms this against the
+   1.8.0 runtime source (`internal/tracing.js#resolveOpenTelemetryOptions`,
+   `startApiCallSpan`) and records the result in the M1.1c PR. If the runtime differs
+   from the types, stop and report.*
+1b. **`getClaudeClient()` also passes `logLevel: "warn"`** *(added 2026-11-12 from
+   the M1.1b+c review; blocking privacy finding)*. SDK debug logging is the same
+   threat as telemetry, through a different channel. When no `logLevel` option is
+   given, SDK 1.8.0 reads `process.env.ANTHROPIC_LOG`. At `debug`,
+   `debugLogRequestDetails` (`client.js` ~l.828) logs the outgoing request
+   **including its body**, i.e. the system prompt plus resume text, via
+   `console.debug`; its redaction (`internal/utils/log.js` ~l.97–124) covers only
+   auth headers. On Vercel that output lands in the function logs and any log drain
+   (§13.2.1 rule 5). This exposure predates the 1.8.0 upgrade. An explicit
+   `logLevel` option overrides the env var, so with `"warn"` no value of
+   `ANTHROPIC_LOG` can enable request/response logging on this client. `"warn"`
+   (not `"off"`) keeps the SDK's own warnings (deprecations, misconfiguration),
+   which carry no request content.
+   - **Forbidden:** passing `logLevel: "debug"` or `logLevel: "info"` to any
+     Anthropic client (app code or `scripts/evals/`), calling
+     `client.withOptions({ logLevel: ... })` with either, or passing a custom
+     `logger` that writes request details. Scripts under `scripts/evals/` that build
+     their own client pass `logLevel: "warn"` alongside `openTelemetry: false`.
+   - To debug a request locally, log our own redacted metadata (task, model, token
+     counts, `request_id`), never turn SDK debug logging on.
+2. **Startup guard (fail closed).** Before constructing the client, `getClaudeClient()`
+   throws if `process.env.ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` is set to
+   `content` (case-insensitive, trimmed). It throws the same way as a missing API
+   key: a `ClaudeConfigurationError` (with its own message naming the variable
+   only), which `callStructured` wraps in a non-retryable `ClaudeApiError`, so the
+   task code is `ai_unavailable` (§13.5.1). The check runs before the cache is
+   filled, so it runs once per server instance. Item 1 already makes the var
+   harmless to *our* client, so this is defence in depth: the var's presence means
+   someone intends content capture, and another library could read it. The fail-
+   closed choice matches how §13.15 item 10 treats missing secrets.
+3. **Single construction point.** `new Anthropic(` appears in app code only in
+   `lib/claude/client.ts#getClaudeClient`. `lib/claude` never calls
+   `client.withOptions({ openTelemetry: ... })`, and no code passes an
+   `openTelemetry` client option other than `false`. (The per-request
+   `openTelemetry.conversationId` option is also unused.) Scripts under
+   `scripts/evals/` that build their own client must also pass
+   `openTelemetry: false` and `logLevel: "warn"`. Test files that build fake
+   clients are exempt.
+4. **Tests (unit, no network; `lib/claude/client.test.ts`):**
+   - With `ANTHROPIC_OPEN_TELEMETRY=true` and
+     `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=metadata_only` set before
+     construction, `getClaudeClient().openTelemetry.traces.enabled === false`. The
+     resolved option is a public, frozen getter on 1.8.0.
+   - With the content-mode var set to `content` (also `CONTENT` and ` content `),
+     `getClaudeClient()` throws `ClaudeConfigurationError`, and `callStructured`
+     surfaces it as a non-retryable `ClaudeApiError` (`ai_unavailable`). No request
+     is sent.
+   - With a fake `fetch`, a `callStructured` request carries no `traceparent`,
+     `tracestate` or `baggage` header.
+   - With `ANTHROPIC_LOG=debug` set before construction, `getClaudeClient()` reports
+     log level `warn`, and a `callStructured` request through a fake `fetch` makes
+     no `console.debug`/`console.info` call carrying request content.
+   - **Import guards (revised 2026-11-12, M1.1b+c review; replaces the earlier
+     source-spelling grep).** The guards check *imports*, not how a call is spelled,
+     because a spelling grep is defeated by an alias, a re-export or a spread:
+     - Any **value** import of `@anthropic-ai/sdk` or a subpath
+       (`@anthropic-ai/sdk/*`) outside the allowlist fails. The allowlist is
+       `lib/claude/client.ts`, `lib/claude/outputFormat.ts` (`zodOutputFormat`
+       only), and `scripts/evals/*.ts`; test files are exempt. `import type` is
+       allowed anywhere (the prompt modules use it). `lib/claude/batches.ts` (M2.2)
+       must get the client from `getClaudeClient()`, not import the SDK by value.
+       backend-dev keeps the exact list in the test file; adding to it is a reviewed
+       change.
+     - No file named `instrumentation.*` exists at the repo root or under `src/`
+       (Next.js's instrumentation hook, §13.2.1 rule 5).
+     - Within the allowlisted files, the client construction passes
+       `openTelemetry: false` and `logLevel: "warn"` (asserted on the constructed
+       client's resolved options, not on source text).
+   - The cached client is reset between cases with `__resetClaudeClientForTests()`,
+     so each case constructs fresh.
+5. **Re-check on every SDK version change.** The SDK contract check (enum decision
+   item 5) gains item **(x)**: the constructed client reports
+   `openTelemetry.traces.enabled === false` with the env vars set as above, and the
+   option name and semantics are unchanged in the new version's types. It also
+   checks that, with `ANTHROPIC_LOG=debug` set, the client's resolved log level is
+   `warn` and that an explicit `logLevel` option still takes precedence over the env
+   var in the new version's source.
+
+**Verified (M1.1, 2026-11-04, `@anthropic-ai/sdk` 0.122.0, zod 4.4.3, live calls on `claude-opus-5-5`):**
+*(Corrected 2026-11-12: this note originally said zod 4.6.5; the installed version is
+4.4.3.)*
 - **(a) `beta.messages.parse` + `output_config.format` + `fallbacks`:** it exists, and a live
   call with `betas: ['server-side-fallback-2026-07-01']`, `fallbacks: 'default'`,
   `output_config: { format: zodOutputFormat(S), effort }` returned `end_turn` with a
@@ -3349,7 +3465,8 @@ Verify in M1.1.
 - **(b) zod v4:** `zodOutputFormat` imports `zod/v4` and works with our `zod` 4.x
   schemas (it uses `z.toJSONSchema` plus the SDK's `transformJSONSchema`). Objects get
   `additionalProperties: false` and full `required`. Nullable fields become
-  `type: [T, 'null']`.
+  `type: [T, 'null']`. *(Nullable enums are the exception: zod 4 emits them as
+  `anyOf: [{$ref → enum}, {type: 'null'}]`. See the "Decision on `enum`" block.)*
 - **(c) Unsupported constraints:** the helper moves numeric `minimum`/`maximum`,
   string `minLength`/`maxLength`, array `maxItems`, and `minItems` > 1 out of the schema
   and into the field's `description` as a hint (e.g. `{minimum: 0, maximum: 100}`). Only
@@ -3360,7 +3477,8 @@ Verify in M1.1.
   enforced only by our client-side zod parse: a miss becomes `ai_invalid_output`, then
   a retry. *Open item for the architect before M2.x:* either accept that, or have
   `callStructured` restore `enum` on the wire schema (a small post-processing step on
-  `z.toJSONSchema` output).
+  `z.toJSONSchema` output). *(Resolved by the "Decision on `enum`" block below. SDK
+  1.7.0 fixed the stripping, and M1.1b upgrades to 1.8.0.)*
 - **(d) Non-streaming guard at 20k:** without an explicit timeout, the SDK throws above
   `max_tokens` ≈ 21 333 (`3_600_000 × max_tokens / 128_000 > 600_000` ms). 16k and 20k
   pass, and `claude-opus-5-5` isn't in `MODEL_NONSTREAMING_TOKENS`. `callStructured`
@@ -3388,26 +3506,176 @@ Verify in M1.1.
   - An **already-aborted signal makes no call at all.**
   - **Accepted edge case:** a response that lands at the exact instant the deadline
     fires may lose the race and be dropped. Its usage then goes unrecorded.
+  - **SDK 1.8.0 (M1.1b):** the retry backoff now honors the abort signal. `raceAbort`
+    **stays anyway.** Our hard-deadline guarantee must not depend on SDK internals
+    that have changed before. It is redundant but harmless, and its tests stay.
+    *Verified (contract check (viii)):* 1.8.0's `retryRequest` calls
+    `sleep(ms, options.signal)`. That sleep *resolves early* on abort, and the next
+    attempt's `signal.aborted` check then throws `APIUserAbortError`. A 429 with
+    `Retry-After: 30` aborted at 200 ms rejected after 207 ms with no `raceAbort`.
+    `Retry-After` is still honored up to 2^31−1 ms with no cap of its own, so without
+    a signal a long `Retry-After` still blocks; `raceAbort` + the per-call signal keep
+    covering that.
 
-**Decision on `enum` (architect, 2026-11-05; resolves the open item in (c) above).**
-Option B, limited to small closed enums, and conditional on a probe. Implemented in
-milestone M1.1b.
-1. **Wire schema = helper output + restored `enum`, nothing else.**
-   - `callStructured` and the batch request builder both get the wire schema from one
-     function, `lib/claude/outputFormat.ts#buildOutputFormat(schema)`.
-   - It takes `zodOutputFormat(schema).schema` (the helper output), then copies
-     **only the `enum` keyword** back from `z.toJSONSchema(schema)` at the same paths,
-     using a recursive `restoreEnums(raw, wire)`. The recursion walks `properties`,
-     `items`, `anyOf`/`oneOf`/`allOf`, and `$defs`/`definitions` with `$ref` targets.
-     The two trees have the same shape, since the helper only removes keywords and adds
-     `additionalProperties`/`required`/descriptions.
-   - Where the wire node's `type` includes `'null'` (a nullable enum) and the enum
-     lacks `null`, append `null`.
-   - The description hint the helper added stays as is.
-   - Numeric/length/array-size keywords are **not** restored. The helper strips them
-     because the API doesn't support them, so they stay client-side in `validateX`.
-2. **Only small, closed enums.** An enum is restored only if it has ≤
-   `WIRE_ENUM_MAX_VALUES = 64` values and every value is a string.
+**Verified (M1.1b, 2026-11-12, `@anthropic-ai/sdk` 1.8.0, zod 4.4.3, `claude-opus-5-5`;
+`scripts/evals/sdk-contract-check.ts`, all items pass, spend $0.054):** *live* = real API
+call; *local* = SDK code run in-process (fake fetch or pre-send); *source* = read from
+1.8.0 source/types.
+- **(i) API version (live):** all captured requests sent `anthropic-version:
+  2026-10-21`: 14 live requests. All 14 went over the network: item (x) and its local
+  stub didn't exist at the time of that run. *(2026-11-12, M1.1b+c review: the script
+  now tags requests answered by the local stub as `stubbed` and leaves them out of
+  this count, so a full run reports 14 live + 1 stubbed excluded.)*
+- **(ii) Request path (live):** `callStructured` → `beta.messages.create(...).withResponse()`
+  with `anthropic-beta: server-side-fallback-2026-07-01`, `fallbacks: 'default'`,
+  `output_config: { format: buildOutputFormat(S), effort }` returned `end_turn`, a
+  non-null `request_id`, and served `claude-opus-5-5`.
+- **(iii) Enum fixture (live):** a plain enum, nullable enum (`anyOf` + `$ref`), enum in
+  array items, and an enum reused at two paths (`$defs`), i.e. type-less `{enum}` nodes.
+  Accepted and answered `end_turn` with zod-valid output both sync (`callStructured`)
+  and through `messages.batches` (1 request, ended in ~81 s). *Enforcement* on these
+  shapes is **assumed equivalent, not verified**: the probe tested
+  `{type: 'string', enum}`, and decoding-time enforcement on the type-less `{enum}`,
+  `$ref`/`$defs` and `anyOf`+null shapes is unverified (this check proves only that
+  they are accepted and answered). Informational only, since zod stays authoritative
+  (decision item 7). *(Corrected 2026-11-12, M1.1b+c review; this previously said the
+  formats were equivalent so the probe was not re-run.)*
+- **(iv) Errors:** forced `tool_choice` → `BadRequestError` → `ClaudeBadRequestError`
+  (live). An in-flight abort (300 ms) → `APIUserAbortError` straight from the SDK,
+  classified retryable (live). An already-aborted signal sends no request (local).
+  `APIError.generate` for 400/401/403/404/409/422/429/500/529 yields the same classes,
+  and `classifySdkError` the same codes/retryability as on 0.122; the
+  `APIConnectionTimeoutError` ⊂ `APIConnectionError` ⊂ `APIError` ⊂ `AnthropicError`
+  and `APIUserAbortError` ⊂ `APIError` hierarchy is unchanged (local).
+- **(v) Non-streaming guard:** `max_tokens: 20_000` with an explicit `timeout` makes the
+  call and returns `end_turn` (live). Without a timeout, 21 334 throws a plain
+  `AnthropicError` before any request (local). Threshold from source is unchanged:
+  `3_600_000 × max_tokens / 128_000 > 600_000` ms (> 21 333), and
+  `MODEL_NONSTREAMING_TOKENS` still lists only three Opus 4 ids.
+- **(vi) Response shape:** a normal response has `content: [text]` and
+  `usage.iterations: [{ type: 'message', model: null }]` (live). The refusal fallback
+  could not be reproduced benignly, so from 1.8.0 types: `BetaFallbackBlock.type ===
+  'fallback'` (with `from`/`to`/`trigger`), iteration types `message` (`model` nullable)
+  and `fallback_message` (`model` required), and `BetaStopReason` still includes
+  `refusal`/`max_tokens`/`model_context_window_exceeded`. These match what
+  `finalAnswerText` and `costFromUsage` read.
+- **(vii) Batches (live + source; input for M2.2):** `messages.batches.create({ requests:
+  [{ custom_id, params }] })` / `retrieve` / `results()` (async-iterable JSONL decoder)
+  are unchanged. Result items are `{ custom_id, result }`, with `result = { type:
+  'succeeded', message }` or `errored`/`canceled`/`expired`. **The server-side refusal
+  fallback is not available in batches:** with the beta header, a request carrying
+  `fallbacks: 'default'` is rejected with 400 "The `fallbacks` parameter is not
+  supported for batch requests." (the header alone is accepted). So batch items must
+  treat `stop_reason: 'refusal'` as a per-item failure.
+- **(viii) Abort (local + source):** see the 1.8.0 bullet in the abort note above.
+- **(ix) v1 flows (live):** `analyzeResume` and `matchResumeToJob` (the Claude half of
+  `POST /api/resumes/:id/analyze` and `POST /api/matches`: real prompts,
+  `callStructured`, semantic validation, single retry) both returned `end_turn` and
+  validated on a synthetic resume/job: 5 strengths / 4 weaknesses / 5 roles, and score
+  85 with 5 matched / 3 gaps, 0 dropped. Cost $0.025 and $0.019. The routes' DB/auth
+  half was not run live (it would write to the live DB); it's SDK-independent and
+  covered by the route tests.
+- **(x) Telemetry off (M1.1c, local + source, no network, $0; `--only-x`):** with
+  `ANTHROPIC_OPEN_TELEMETRY=true` and the content-mode var at `metadata_only`,
+  `getClaudeClient().openTelemetry` is frozen with `traces.enabled === false`. A
+  request from that client (answered by a local stub, which is excluded from the live
+  count in (i)) carried no `traceparent`/`tracestate`/`baggage`. With the var at
+  ` CONTENT `, `getClaudeClient()` throws `ClaudeConfigurationError`.
+  - *Re-recorded 2026-11-12 after the M1.1b+c review, `--only-x` with
+    `ANTHROPIC_API_KEY` unset, $0.* All passed:
+    - (x-a) traces off and frozen despite `ANTHROPIC_OPEN_TELEMETRY=true` (local);
+    - (x-b) no trace headers on a stubbed request (local);
+    - (x-c) the content-mode guard throws (local);
+    - (x-d) the option names and env-var semantics are unchanged in the SDK
+      source, including that the explicit `logLevel` is read before `ANTHROPIC_LOG`
+      (source);
+    - (x-f) `logLevel` is `warn` with `ANTHROPIC_LOG=debug` (local);
+    - (x-g) with `ANTHROPIC_LOG=debug`, no `console.debug`/`console.info` call
+      carries request content (local; 0 calls).
+    (x-e), no trace headers on live requests, runs only on a full run.
+  - Runtime source (`internal/tracing.js`) matches the types:
+    - `resolveOpenTelemetryOptions` maps `false` to `{ traces: false }`, and calls
+      `optionFromEnv()` (the only reader of the `ANTHROPIC_OPEN_TELEMETRY*` vars)
+      only when the option is nullish.
+    - `getTracer` returns `undefined` when `!traces.enabled`, so `client._tracer` is
+      unset and `request()` takes the untraced `makeRequest(…, span = undefined)` path.
+    - `startApiCallSpan` also returns `undefined` without a tracer, and `makeRequest`
+      injects trace headers only `if (span && propagation)`. `propagation` still
+      resolves to `true` under `false`, but no span ever exists.
+  - The script greps those three facts in the installed SDK, so a changed SDK fails
+    (x).
+  - Unit tests (`client.test.ts`) register a real tracer + propagator through the
+    transitive `@opentelemetry/api`. An option-less control client then sends
+    `traceparent`, and `getClaudeClient()` doesn't.
+- **Other 1.8.0 changes noted:** the license changed from MIT to Apache-2.0. A new
+  dependency, `@opentelemetry/api`, adds tracing that defaults to on with
+  `metadata_only` content. It's a no-op here because no tracer provider is registered
+  (there's no `instrumentation.ts`). It can only record prompt/response content if
+  someone sets `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content` or passes
+  `openTelemetry` options. **Decided:** tracing is disabled at construction and
+  guarded; see "Client construction and SDK telemetry" above (M1.1c).
+
+**Decision on `enum` (architect, 2026-11-12; supersedes the 2026-11-05 decision; resolves
+the open item in (c) above).** Upgrade the SDK so its helper keeps `enum`, and do **no
+wire-schema post-processing of our own**. Implemented in milestone M1.1b.
+
+*Superseded decision (2026-11-05), kept for the record:* stay on SDK 0.122 and have a
+`buildOutputFormat` re-inject `enum` from `z.toJSONSchema` into the helper output
+(`restoreEnums`). It had a 64-value cap, appended `null` for nullable enums, and was
+gated on a probe flag `WIRE_ENUM_RESTORE`. **Why it was dropped:**
+- `@anthropic-ai/sdk` **1.7.0** (2026-11-09) fixed the stripping ("helpers: keep const
+  and enum in structured output schemas"). On 1.8.0, `restoreEnums` would be dead code.
+  It would be a second schema transformer that has to track both zod's and the SDK's
+  output shapes.
+- The old design was already wrong for zod 4. Zod 4 emits nullable enums as
+  `anyOf: [{$ref → {enum}}, {type: 'null'}]`, never as `type: [T, 'null']`, so the
+  "append `null`" step targeted a shape that never occurs.
+- Staying on a pre-1.0 line only postpones a breaking upgrade we will have to make
+  anyway. It is cheapest now: no output schema has an enum yet, and only the two
+  legacy tasks run on the SDK.
+
+1. **SDK pin.** `@anthropic-ai/sdk` is pinned **exactly** at `1.8.0` in
+   `package.json`, with no caret.
+   - The SDK transforms our output schemas and defines our error, retry, and abort
+     behavior. So every version change is a deliberate, reviewed PR that re-runs the
+     SDK contract check (item 5) and updates the wire-schema snapshots (item 6).
+   - The upgrade crosses 1.0.0 (2026-10-21), which sends `anthropic-version:
+     2026-10-21`. That version's Messages API changes don't affect `lib/claude`:
+     - a 400 for document blocks in assistant messages (we send none);
+     - a 400 for non-empty citations in user text (we send none);
+     - temperature/top_p/top_k removed (already banned, §13.5.2 step 1).
+2. **Wire schema = the helper's output, unmodified.**
+   `lib/claude/outputFormat.ts#buildOutputFormat(schema)` returns
+   `{ type: 'json_schema', schema: zodOutputFormat(schema).schema }`, and nothing else.
+   - It is the **only** place in the codebase that calls `zodOutputFormat`.
+   - `buildStructuredParams` (sync) uses it, and so does `lib/claude/batches.ts`
+     (M2.2). That makes sync/batch parity structural, not a convention.
+   - The function exists even though it is a pass-through. It is the single seam
+     where an SDK schema regression would be fixed, and the single thing the guard
+     tests and snapshots exercise.
+   - What the 1.8.0 helper produces (verified on real `z.toJSONSchema` output from
+     our zod 4; normative for the tests in item 6):
+     - `enum` is kept on every enum path, including `$defs`/`$ref` targets and
+       nullable enums.
+     - Enum nodes are emitted as `{ enum: [...] }` with no sibling `type`. That's
+       accepted, since enum values are strings only (item 3). Enum values are no
+       longer copied into `description`.
+     - A nullable enum is `anyOf: [{ $ref → { enum } }, { type: 'null' }]`, so `null`
+       is allowed by the null branch, not by the enum list.
+     - `const` is kept. It's irrelevant, because output schemas don't use
+       `z.literal` (item 3).
+     - Numeric `minimum`/`maximum`, string lengths, `maxItems`, and `minItems` > 1 are
+       still moved into `description` and re-checked client-side by `validateX`.
+       `additionalProperties: false` and full `required` are unchanged.
+   - **Fallback if the contract check fails** (item 5): if any check fails on 1.8.0
+     and can't be fixed inside `lib/claude` without changing behavior, backend-dev
+     **stops, leaves the pin at 0.122.0, and reports back**. Do not re-implement
+     `restoreEnums` on your own initiative; the architect re-decides.
+3. **Only small, closed enums in output schemas.** The SDK now sends an enum of any
+   size, so the cap is a **design rule enforced by a test**, not by code on the
+   request path. `OUTPUT_ENUM_MAX_VALUES = 64` lives in the guard test (item 6), not
+   in runtime code. Every output-schema `z.enum` must have ≤ 64 values, and all of
+   them must be strings.
    - Every closed enum in §13.5.4 qualifies: level, employment/remote type, education
      level, seniority, proficiency, section, issue types, dimension, fit label,
      importance, status. The largest has 9 values.
@@ -3423,42 +3691,128 @@ milestone M1.1b.
        pick the nearest wrong skill instead of honestly returning `null` + `raw_label`.
    - The vocabulary stays in the cached system prompt.
    - Output schemas don't use `z.literal`. Use a single-value `z.enum` if ever needed.
-3. **Probe first, then ship.** The API *accepting* `enum` (verified) is not the same
-   as the API *enforcing* it during decoding. Backend-dev runs
-   `scripts/evals/structured-output-probe.ts` (manual, real key):
+4. **Enforcement probe: informational, not a gate.** The API *accepting* `enum` is not
+   the same as the model *enforcing* it during decoding.
+   `scripts/evals/structured-output-probe.ts` (manual, real key, raw schema,
+   SDK-independent):
    - Schema: `{ color: enum ['red','green'], note: string }`.
    - User content: a benign prompt that strongly pushes an out-of-enum answer ("The
      user's favorite color is blue. Report it exactly.").
    - Runs: 20× sync on `claude-opus-5-5` at effort `low`, plus 5 requests through
      Message Batches.
-   - Decision rule:
-     - **Enforced** = 0/25 outputs outside the enum, and none failing JSON parse. Then
-       ship the restore in both paths.
-     - **Not enforced** (any out-of-enum value gets through) = don't send restored
-       enums. `buildOutputFormat` returns the helper output unchanged, behind the
-       constant `WIRE_ENUM_RESTORE = false`, which is Option A. Record the result here
-       either way.
-   - **Re-run the probe whenever the SDK major/minor version or a task's model
-     changes.** Its result is recorded next to this block.
-4. **Client-side zod stays authoritative regardless.** `schema.safeParse` runs on
+   - Result: **enforced** = 0/25 outputs outside the enum and none failing JSON parse;
+     otherwise **not enforced**. Record it below as "Probe result (date, model, n,
+     outcome)".
+   - **The outcome does not change what we send.** Enums go on the wire either way. An
+     unenforced enum is still a schema-level hint the model sees, and costs nothing.
+     The outcome only sets expectations for the `ai_invalid_output` retry rate on
+     enum-heavy tasks (item 7).
+   - **Escalate only if** an enum on the wire causes something other than either a
+     valid in-enum answer or a clean zod failure. Examples: a 400, `stop_reason` other
+     than `end_turn`, or unparseable JSON. Then stop and report to the architect.
+   - **Re-run the probe whenever a task's model changes.** SDK version changes are
+     covered by the contract check (item 5); the probe doesn't touch the SDK.
+5. **SDK contract check: re-runnable, required on every SDK version change.**
+   `scripts/evals/sdk-contract-check.ts` (manual, real key, uses `lib/claude`'s own
+   client construction). It re-verifies, on the pinned SDK, everything the M1.1
+   "Verified" note relied on, and prints pass/fail per item. The results go in a new
+   "Verified (M1.1b, SDK 1.8.0, date)" note directly under the M1.1 one. Record each
+   item as *live* or *from SDK source/types*.
+   - (i) Outgoing request headers include `anthropic-version: 2026-10-21` (capture with
+     a `fetch` wrapper in the script; log header names/values only, never bodies).
+   - (ii) `client.beta.messages.create({ ...params, betas:
+     ['server-side-fallback-2026-07-01'], fallbacks: 'default' }, { signal, timeout
+     }).withResponse()` returns `data` plus a non-null `request_id`, with
+     `output_config: { format: buildOutputFormat(S), effort }`.
+   - (iii) A fixture schema containing a plain enum, a nullable enum (the `anyOf` +
+     `$ref` shape), an enum inside an array item, and an enum reused at two paths is
+     **accepted and answered `end_turn`**: sync, and once through Message Batches.
+     This is the live check that type-less `{enum}` nodes and the `$defs` layout are
+     accepted.
+   - (iv) Error classes: the names and `instanceof` behavior that `errors.ts`
+     classification relies on still exist and are thrown as before. Covers
+     `BadRequestError` on a forced `tool_choice` (live), `APIUserAbortError` on an
+     aborted signal (live), and `RateLimitError`/`InternalServerError`/
+     `APIConnectionError`/`APIConnectionTimeoutError`/`AuthenticationError`/
+     `PermissionDeniedError` (exports and hierarchy, from source).
+   - (v) Non-streaming guard: `max_tokens: 20_000` with an explicit `timeout` makes
+     the call (live). Record the no-timeout threshold from source.
+   - (vi) Response shape: `usage.iterations[]` (including `model: null`), the
+     `fallback` boundary block's type name and position in `content`, and
+     `stop_reason` values. These must match what `finalAnswerText` and
+     `costFromUsage` read. Use a live refusal fallback if it can be reproduced as in
+     M1.1; otherwise use the 1.8.0 type definitions, and say which.
+   - (vii) Batches: the `messages.batches.create` / `results` signatures, the
+     result-item shape, and whether batch requests accept the fallback beta. This is
+     input for M2.2.
+   - (viii) Abort: whether the retry backoff honors the signal (from source). Update
+     the abort note above either way. `raceAbort` stays regardless.
+   - (x) *(Added 2026-11-12, M1.1c.)* Telemetry off: `getClaudeClient()` built with
+     `ANTHROPIC_OPEN_TELEMETRY=true` and a non-`content` content-mode var set reports
+     `openTelemetry.traces.enabled === false`, and the `openTelemetry` option's name
+     and env-var semantics are unchanged in the SDK's types (local + source). With
+     `ANTHROPIC_LOG=debug` set, the client's resolved log level is `warn`, and an
+     explicit `logLevel` still overrides the env var in source. Runs without an API
+     key. See "Client construction and SDK telemetry".
+   - Re-run the whole check on **every** SDK version change. A failing item blocks
+     the bump.
+6. **Tests (M1.1b; unit, no network).**
+   - **Output-schema registry (test-only).** `lib/claude/outputSchemas.test.ts`
+     declares `const OUTPUT_SCHEMAS: Record<ClaudeTaskName, z.ZodType | null>`, one
+     entry per task in `CLAUDE_TASKS`. *(Revised 2026-11-12, M1.1b+c review.)*
+     - `null` means **"task not implemented yet"**: the task is listed in
+       `CLAUDE_TASKS` (§13.5.3) but has no schema module. It is never a way to opt an
+       implemented task out of the guards.
+     - It also has a runtime assertion that its keys equal `Object.keys(CLAUDE_TASKS)`,
+       so a new task without a registry entry fails even if test files aren't
+       type-checked.
+     - **Each task milestone that implements a task (M2.2, M2.3, M3.2, M3.4, M3.5,
+       and any later one) must replace that task's `null` with its schema and add
+       the wire snapshot in the same PR.** The reviewer blocks a PR that adds a
+       `lib/claude/tasks/*.ts` module while its registry entry is still `null`. Once
+       all tasks are implemented, the `| null` should be dropped from the type.
+     - All the guards below iterate over the non-null entries of this registry, not
+       a file glob. Null entries get no snapshot.
+   - **Snapshots:** one snapshot per registry entry of `buildOutputFormat(schema)`.
+     This catches SDK or zod drift in the wire schema. Snapshot updates are reviewed
+     like code.
+   - **Enum coverage:** for every registry schema, and for a fixture schema with a
+     plain enum, a nullable enum, an enum in array items, and a reused enum, every
+     `z.enum` path resolves (following `$ref` into `$defs`) to a wire node whose `enum`
+     equals the zod values.
+   - **Nullable enums** allow `null` on the wire, either through an `anyOf` branch
+     `{type: 'null'}` next to the enum branch, or through `null` in the enum list. The
+     fixture asserts the `anyOf` form, which is what 1.8.0 emits.
+   - **Size/type guard:** every output-schema `z.enum` has ≤ `OUTPUT_ENUM_MAX_VALUES`
+     (64) values, all of them strings. This catches someone turning the skills
+     vocabulary into an enum.
+   - **No `const`** anywhere in a registry wire schema (enforces "no `z.literal`").
+   - **Constraints still client-side:** for the fixture, `minimum`/`maximum`/
+     `maxLength`/`maxItems` are absent from the wire schema. This guards the
+     assumption that `validateX` is the only enforcement.
+   - **Single seam:** a test asserts `buildStructuredParams(args).output_config.format`
+     deep-equals `buildOutputFormat(args.schema)`. A source grep test asserts
+     `zodOutputFormat` is imported only by `lib/claude/outputFormat.ts`. Test files
+     are exempt; `parse.test.ts` switches to `buildOutputFormat`.
+   - **Sync/batch parity:** lands with `lib/claude/batches.ts` in M2.2. It asserts
+     the batch request's `params.output_config.format` deep-equals
+     `buildOutputFormat(schema)` for the same schema.
+7. **Client-side zod stays authoritative regardless.** `schema.safeParse` runs on
    every response; a miss → `ai_invalid_output` → one task-level retry (sync). In
    Batches, the item is marked failed and returns to the stale pool (3-strike rule,
    §13.6.6).
    - Why enforcement still matters: a sync retry costs a whole extra call (~$0.10–0.21
      on Opus for the enum-heavy tasks). In batch, a miss costs a resubmission plus a
      delay of up to a day for that listing.
-   - Enforced decoding removes that whole class of failure at no cost.
-5. **Tests (M1.1b):**
-   - Snapshot each §13.5.4 task's wire schema.
-   - Assert that every `z.enum` path in the zod schema has `enum` on the wire, and
-     that nullable enums include `null`.
-   - Assert `restoreEnums` adds no keyword other than `enum`, and never touches a node
-     the helper didn't keep.
-   - Add a guard test that fails if any `lib/claude/tasks/*` schema contains a
-     `z.enum` with more than `WIRE_ENUM_MAX_VALUES` values. This catches someone
-     turning the skills vocabulary into an enum.
-   - Add a unit test that the batch builder and `callStructured` produce identical
-     `output_config.format` for the same schema.
+   - If the probe shows enforcement, that class of failure goes away at no cost. If it
+     doesn't, the retry path covers it.
+
+**Probe result (2026-11-12, `claude-opus-5-5`, effort `low`, n = 25): enforced.** Raw
+hand-built schema, sent on installed SDK 0.122.0 via non-beta `messages.create`, no
+fallback beta, `max_tokens` 1 500. Sync: 20/20 in-enum (15 `red`, 5 `green`). Batch
+(`msgbatch_01GJLWS66UjGoKDg2uUmHSkA`, ended in ~91 s): 5/5 in-enum (all `red`). 0 out
+of enum, 0 JSON-parse failures, 0 non-`end_turn`. The prompts pushed toward blue, purple
+and yellow. Spend: $0.088 total (~$0.0035–0.005 per sync call; batch at 50%).
 
 **Deleted by M1.1:** `repairListField`, `repairMatchResponseShape`,
 `TAG_COVERAGE_THRESHOLD`, `extractToolUseInput`, the forced-tool definitions, and the
@@ -3517,13 +3871,114 @@ not. That's fine, but don't pad prompts just to reach it. Batch requests use the
 same `system` and get best-effort cache hits.
 
 **Batch path** (`lib/claude/batches.ts`): `client.messages.batches.create({ requests:
-[{ custom_id, params }] })` with the same params as sync, minus the fallback beta.
-Verify whether batches accept the fallback beta; if not, a batch refusal marks the item
-`failed/ai_refused` and the listing is skipped. Results are fetched with
-`batches.results(id)`, keyed by `custom_id` (they arrive in any order), and parsed with
-`schema.parse(JSON.parse(text))`, then `validateX`. **Only shared, externally ingested
-listing text is ever sent through Batches.** Resume data, private listings, and user
-submissions always go sync.
+[{ custom_id, params }] })` (the non-beta endpoint) with the same params as sync
+(`output_config.format` from `buildOutputFormat`, §13.5.2 "Decision on `enum`" item 2),
+**minus `betas` and `fallbacks`**. Batches reject `fallbacks` with a 400 (verified
+M1.1b (vii)), and sending the beta header alone would do nothing, so neither is sent.
+Results are fetched with `batches.results(id)`, keyed by `custom_id` (they arrive in
+any order). Each succeeded message goes through the same steps as sync §13.5.2 steps
+4–5 (stop-reason check, `finalAnswerText`, `JSON.parse`, `schema.safeParse`), then
+`validateX`. **Only shared, externally ingested listing text is ever sent through
+Batches.** Resume data, private listings, and user submissions always go sync.
+
+**Per-item outcome → `claude_batch_items` (decided 2026-11-12; implemented in M2.2).**
+`jobs.poll_requirement_batch` sets each item's `status` and `error_code` as follows.
+These are the only `error_code` values a batch item can have.
+
+| result | item `status` / `error_code` | listing afterwards |
+|---|---|---|
+| `succeeded`, `end_turn`, valid | `succeeded` / null | requirements upserted (`extracted_via = 'batch'`) |
+| `succeeded`, `end_turn`, invalid (JSON, zod, or `validateX` beyond tolerance) | `failed` / `ai_invalid_output` | back in the stale pool; counts toward the 3-strike rule (§13.6.6) |
+| `succeeded`, `refusal`, within the per-batch cap | `failed` / `ai_refused` | one sync re-run (see "Batch refusals" below); never resubmitted to a batch for this hash |
+| `succeeded`, `refusal`, past the per-batch cap | `failed` / `ai_refused_capped` | no sync re-run; back in the stale pool; counts toward the 3-strike rule (see "Batch refusals" below) |
+| `succeeded`, `max_tokens` or `model_context_window_exceeded` | `failed` / `ai_truncated` | back in the stale pool; counts toward the 3-strike rule; logged for tuning |
+| `succeeded`, any other stop reason | `failed` / `ai_invalid_output` | as invalid |
+| `errored` | `failed` / `batch_errored` | back in the stale pool; counts toward the 3-strike rule |
+| `expired` or `canceled` | `failed` / `batch_expired` or `batch_canceled` | back in the stale pool; **does not** count toward the 3-strike rule (not the listing's fault) |
+
+**Batch refusals (decided 2026-11-12; implemented in M2.2).** A batch item that ends
+`stop_reason: 'refusal'` has had no server-side fallback. On sync, the fallback exists
+precisely so that a classifier refusal on benign text can be answered by another
+model. So a batch refusal within the per-batch cap gets **exactly one sync re-run with
+the fallback**, then is final for that content hash. A refusal past the cap goes back
+to the batch pool as a strike instead (item 1, revised 2026-11-12):
+1. The poll handler marks the item `failed` / `ai_refused` and enqueues
+   **`jobs.retry_refused_requirement`** (§13.4.3; class `background`, `user_id`
+   null) with payload `{ jobDescriptionId, contentHash }` and dedupe key
+   `jobreq-refusal:{job_id}:{content_hash}`.
+   - **Per-batch cap:** at most `BATCH_REFUSAL_RETRY_MAX = 10` re-runs are enqueued
+     per batch (code constant in `lib/claude/batches.ts`). Refused items past the cap
+     are marked `failed` / `ai_refused_capped` and get no sync re-run. The handler
+     logs one warning per batch with the refused and capped counts only (no text, no
+     ids beyond the batch id). Many refusals in one batch point to a prompt problem
+     (or a transient classifier issue), not to the listings, and spending sync money
+     on them would not fix it.
+   - **Capped items are not final** *(decided 2026-11-12, M1.1b+c review; supersedes
+     "capped items are final for the hash")*. An `ai_refused_capped` item returns
+     the listing to the stale pool and counts as **one strike** toward the 3-strike
+     rule (§13.6.6), exactly like `ai_invalid_output`. On a later batch the listing
+     is submitted again; if it refuses again it is treated afresh (a re-run if that
+     batch is under its cap, another strike if not). So a listing gets at most 3
+     batch attempts plus at most 1 sync re-run per hash.
+2. The handler `jobs.retry_refused_requirement`:
+   - **No-op (succeeds without a Claude call)** if the listing is gone, soft-deleted,
+     not active, not `visibility = 'shared'`, has `source = 'user'`, or its current
+     `content_hash` differs from the payload's, or if `job_requirements` is already
+     fresh for that hash. This keeps it idempotent (§13.4.4) and ensures it only
+     ever sends shared, externally ingested text.
+   - **Ingest budget first:** if today's `ai_usage_events where user_id is null`
+     spend has reached `INGEST_DAILY_BUDGET_USD`, throw
+     `TaskError('budget_exhausted')` (snooze path, §13.9.4). The global guard applies
+     as for any `usesAi` kind. The re-run does **not** count toward
+     `INGEST_DAILY_EXTRACTION_CAP`; the listing was already counted when its batch
+     item was created.
+   - Calls `runExtractJobRequirements` sync (`callStructured`, with the server-side
+     fallback), with the same `prompt_version` and the same external-listing skill
+     mapping as the batch path (provisional skills allowed, §13.7.3). Upserts
+     `job_requirements` with `extracted_via = 'sync'`, then enqueues
+     `jobs.embed_pending` (its hourly dedupe key). It does not embed inline.
+   - Usage is recorded per call by `callStructured`, with `user_id` null, so it
+     counts against the ingest and global budgets automatically.
+   - If the sync call refuses too (`ClaudeRefusalError`, after the fallback), the
+     task fails non-retryably with `ai_refused`. There is no `onDead` hook; there is
+     no user-facing root row.
+3. **Final state.** `jobs.submit_requirement_batch` excludes any listing that has a
+   batch item with `error_code = 'ai_refused'` for its current hash (alongside the
+   existing pending and 3-strike exclusions, §13.6.6; `ai_refused_capped` items
+   count toward the 3 strikes). A listing whose sync re-run also refused, or which
+   collected 3 strikes, therefore has no requirements for that hash. It drops out of
+   matching, embeddings and market stats, all of which require fresh requirements.
+   A content change (new hash) makes it eligible again. To retry those after a prompt
+   fix, an operator deletes the `ai_refused` (and, for 3-strike listings, the failed)
+   items for that hash. That is a manual step, and the PR that changes the prompt
+   says so. Listings that were only capped need no manual step: they retry on their
+   own while under 3 strikes.
+- **Why capped items count as a strike instead of being final (2026-11-12):** with
+  capped items final, one bad batch (a prompt regression, or a transient classifier
+  episode) could permanently drop up to ~190 listings (200 items minus 10 re-runs)
+  from the board for their current hash, recoverable only by hand-deleting rows. A
+  capped item has had no second opinion at all, so finality isn't earned. Returning
+  it to the pool as a strike keeps the cap's purpose (no sync money spent on a
+  likely-systemic failure) while letting a transient problem heal itself. Cost stays
+  bounded: at most 3 batch attempts per listing per hash at batch price (~$0.027
+  each on Opus 5.5, §13.17), and every resubmission still counts against
+  `INGEST_DAILY_EXTRACTION_CAP` and `INGEST_DAILY_BUDGET_USD`. Worst case for a
+  persistently broken prompt: the affected listings burn their 3 strikes over a few
+  days within those daily caps, the per-batch warning fires each time, and they then
+  stop, which is the same end state as before, reached without operator action
+  for the transient case. Tradeoff accepted: a systemic prompt problem now costs up
+  to ~3× the batch spend on affected listings before they settle, instead of ~1×.
+- **Why not just mark it failed:** a classifier refusal on a benign listing would then
+  silently drop a real job from the board for as long as its text is unchanged. The
+  re-run costs about twice the batch price for that one listing (~$0.054 on Opus 5.5,
+  §13.17), refusals are expected to be rare, and both budgets and the per-batch cap
+  bound it.
+- **Why not re-run inline in the poll handler:** a sync extraction can take up to
+  140 s, and the poll handler processes up to 200 items within a 200 s budget. A
+  separate task keeps retries, leases and budget snoozes on the normal path.
+- **Privacy:** unchanged. The re-run only sends shared, externally ingested listing
+  text (the no-op guard enforces that), and it uses the same sync path that user
+  listings already use.
 
 #### 13.5.4 Task specifications (schemas are normative; field names are final)
 
@@ -3888,8 +4343,13 @@ Board sources return every job a company has, so filter before upsert to bound c
 `jobs.submit_requirement_batch`:
 - Select up to `BATCH_MAX_ITEMS = 200` listings that are active, `visibility='shared'`,
   `source <> 'user'`, and have requirements missing or stale. Exclude any with a
-  pending batch item for the current hash, and any with ≥ 3 failed items for the
-  current hash. Order newest first.
+  pending batch item for the current hash; any with ≥ 3 failed items for the
+  current hash whose `error_code` is `ai_invalid_output`, `ai_truncated`,
+  `batch_errored` or `ai_refused_capped` (the 3-strike rule; expired/canceled items
+  don't count); and any with a failed item for the current hash whose `error_code`
+  is `ai_refused` (a refusal that got its sync re-run is final per hash, §13.5.3
+  "Batch refusals"). Capped refusals are not final: they return to the pool as a
+  strike (decided 2026-11-12). Order newest first.
 - Stop early when `INGEST_DAILY_EXTRACTION_CAP` (default **300** listings/day) or
   `INGEST_DAILY_BUDGET_USD` is reached (count today's batch items / sum today's
   `ai_usage_events where user_id is null`).
@@ -3899,8 +4359,12 @@ Board sources return every job a company has, so filter before upsert to bound c
 `jobs.poll_requirement_batch`:
 - If not ended, `snooze` 5 min (10 min after 1 hour). Anthropic expires batches at
   24h; expired items go back to the stale pool.
-- On end, iterate results. `succeeded` → validate → upsert `job_requirements` +
-  replace `job_requirement_skills` (§13.7.3 mapping). Otherwise mark the item failed.
+- On end, iterate results. `succeeded` with `end_turn` → validate → upsert
+  `job_requirements` + replace `job_requirement_skills` (§13.7.3 mapping). Every other
+  outcome marks the item failed with the `error_code` from §13.5.3 "Per-item outcome".
+  A refusal also enqueues `jobs.retry_refused_requirement`, up to
+  `BATCH_REFUSAL_RETRY_MAX` per batch; refusals past that are `ai_refused_capped`
+  and go back to the stale pool as a strike (§13.5.3 "Batch refusals").
 - Record usage as one aggregated `ai_usage_events` row per batch (`is_batch = true`).
 - Enqueue `jobs.embed_pending` and `market.refresh_stats`.
 
@@ -4644,10 +5108,28 @@ posting_count, required_count } ] } }`. `404` for an unknown slug.
 
   Every `500` from this route uses one shared copy constant: "We couldn't finish
   deleting your account. Your account still exists — please try again."
-- **Frontend rule:** a **`401` from this endpoint means "already signed out or
-  already deleted"**. This happens on a retry after a `204` that was lost in transit,
-  because the session no longer resolves. M1.4b treats it like success: show the
-  deleted confirmation and route to `/`. It does not show an error.
+- **Frontend rule (as built in M1.4b, `lib/client/accountDeletion.ts`):**
+  - **`204`** → full navigation (`window.location.replace`) to `/?account=deleted`,
+    which shows "Your account has been deleted".
+  - **`401`** means **"already signed out or already deleted"**. It happens on a retry
+    after a `204` that was lost in transit, and also when the session ended for
+    another reason (signed out in another tab, a failed refresh). It is never shown
+    as an error: route to `/?account=signed_out` with a non-error "You're signed
+    out" confirmation. That notice says the deletion most likely finished, and that
+    if the user can still log in, the account wasn't deleted. Saying "deleted" for
+    every 401 could be false, which a trust-first product must not claim.
+  - **`500` with `code:'internal_error'`** → the shared "still exists" copy above. A
+    500 without that body (e.g. a Vercel platform 500 such as
+    `FUNCTION_INVOCATION_FAILED`, possibly after step 4) is treated as uncertain,
+    like the next item.
+  - **Network failure, or any status not in the table** (502, 504, a non-route 500)
+    → "We couldn't confirm whether your account was deleted. Check your connection
+    and try again." Don't say "still exists": a `504` can arrive after step 4 ran
+    (`maxDuration = 60`), and a `204` can be lost. Retrying is safe, because a
+    completed deletion turns the retry into a `401`.
+  - On `204`/`401` the client also runs a best-effort local Supabase sign-out
+    (`scope:'local'`, 2 s cap, errors ignored) before navigating. The full
+    navigation drops the client router cache of private pages.
 
 **Re-auth rate limiting (`account_reauth`; M1.4c).** Resolves deferred review finding
 S2.
@@ -4760,7 +5242,8 @@ the same semantics for RFC 8058 one-click.
               RoleCard, RoleMarketFit, RecommendedJobList, RetryReportButton, NewMatchesBanner
   /fitcheck/  FitCheckStatus, RequirementTable, TailoringSuggestions
   /jobs/      (+) VisibilityChoice, ImportUrlForm, ListingImportStatus, ClosedBadge, SourceAttribution
-  /settings/  DeleteAccountForm, UsageLimits, NotificationPrefs
+  /settings/  DeleteAccountForm, UsageLimits, AccountStatusNotice (the `?account=` banner on /),
+              NotificationPrefs
 /lib
   /tasks/     types.ts, registry.ts, enqueue.ts, kick.ts, worker.ts, errors.ts, budget.ts,
               workerAuth.ts (Bearer WORKER_SECRET check, timing-safe over SHA-256 digests; tick + status routes),
@@ -4781,7 +5264,9 @@ the same semantics for RFC 8058 one-click.
               reauthenticate.ts (throwaway anon-key client; never admin), purgeUserStorage.ts (admin),
               clearAuthSession.ts (cookie-bound server client + cookie-expiry backstop)
   /email/     provider.ts, resend.ts, templates/weeklyDigest.ts          (Phase 5)
-  /client/    usePolledResource.ts
+  /client/    usePolledResource.ts; accountDeletion.ts (DELETE /api/account request + response
+              mapping + copy), usageLimits.ts (limits fetch → panel state, kind labels),
+              formatDateTime.ts (local time with zone). React-free so they're unit-testable.
   rateLimit.ts      (v2 rate-limit module, §13.9.3: nextUtcMidnight, consumeAccountReauthAttempt,
                      getMyRateLimits;
                      lib/claude/rateLimit.ts stays v1-only until M3.9)
@@ -4857,6 +5342,21 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
    §13.3.12 is updated in the same PR.
 10. **Secrets:** fail closed when `WORKER_SECRET`, `CRON_SECRET`, or Vault secrets are
     missing. Use timing-safe compares.
+11. **Telemetry (added 2026-11-12):** the Anthropic client is constructed only in
+    `getClaudeClient`, with `openTelemetry: false`, and the content-mode guard is
+    intact (§13.5.2 "Client construction and SDK telemetry"). A PR that adds
+    `instrumentation.ts`, `@vercel/otel`, any `@opentelemetry/*` package other than
+    the SDK's transitive `@opentelemetry/api`, a tracer provider, or an
+    LLM-observability SDK is **blocked** unless §13 records a decision for it
+    (§13.2.1 rule 5). The same goes for any `ANTHROPIC_OPEN_TELEMETRY*` variable added
+    to `.env.local.example` or Vercel.
+    **SDK logging (added 2026-11-12, M1.1b+c review):** the client is also constructed
+    with `logLevel: "warn"` (item 1b of the same block). **Blocked:** any
+    `logLevel: "debug"` or `"info"` on any Anthropic client (app or `scripts/evals/`),
+    a `withOptions` that sets either, a custom SDK `logger` that writes request
+    details, or `ANTHROPIC_LOG` added to `.env.local.example` or Vercel. The import
+    guards stay green: no value import of `@anthropic-ai/sdk*` outside the
+    allowlist, and no `instrumentation.*` file.
 
 ### 13.16 Testing strategy (qa-tester)
 - **Unit (vitest):** zod schemas and `validateX` per Claude task (each drop/invalid
@@ -5011,7 +5511,19 @@ Phase 1:** ~300–800 new or changed listings/day. On Opus that's **$6–$22/day
 | Vault `kalify_worker_url` | Supabase | pg_cron tick target |
 
 `.env.local.example` is updated in each milestone that adds a variable. Code constants
-(not env): rate limits (SQL), scoring weights, model per task, top-N/K sizes.
+(not env): rate limits (SQL), scoring weights, model per task, top-N/K sizes,
+`BATCH_REFUSAL_RETRY_MAX`.
+
+**Must not be set:** `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content` makes every
+Claude call fail with `ai_unavailable` (fail-closed guard, §13.5.2 "Client construction
+and SDK telemetry"). The other `ANTHROPIC_OPEN_TELEMETRY*` variables are ignored by our
+client, because it passes an explicit `openTelemetry: false`. Don't add them anyway
+(§13.15 item 11). `ANTHROPIC_LOG=debug` or `=info` is likewise **ignored by our
+client**, because it passes an explicit `logLevel: "warn"` (at `debug` the SDK would
+log full request bodies, including resume text, to Vercel logs and drains). Don't
+rely on it for debugging and don't add it to any environment. Passing a raw
+`logLevel: "debug"` or `"info"` to any Anthropic client is forbidden (§13.5.2
+"Client construction and SDK telemetry" item 1b).
 
 ### 13.19 Open questions for the user (decisions with cost, privacy, or account consequences)
 1. **Embeddings provider.** *Recommend Voyage `voyage-4-lite` (1024-dim).* User action:

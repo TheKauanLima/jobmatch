@@ -5,7 +5,13 @@ import { NextResponse, type NextRequest } from "next/server";
  * Route prefixes that require a signed-in user. Subpaths are protected too
  * (checked via a "/prefix" or "/prefix/..." match below).
  */
-const PROTECTED_PATHS = ["/dashboard", "/resumes", "/jobs", "/matches"];
+const PROTECTED_PATHS = [
+  "/dashboard",
+  "/resumes",
+  "/jobs",
+  "/matches",
+  "/settings",
+];
 
 /** Auth-only pages that a signed-in user shouldn't see again. */
 const AUTH_PATHS = ["/login", "/signup"];

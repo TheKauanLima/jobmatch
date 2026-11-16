@@ -11,7 +11,8 @@
  * `ClaudeResponseValidationError` are gone. What's left here is:
  *
  *   1. The zod schemas. They describe structure only (types and required
- *      keys), and are what `zodOutputFormat` turns into the wire JSON Schema.
+ *      keys), and are what `buildOutputFormat` (lib/claude/outputFormat.ts)
+ *      turns into the wire JSON Schema.
  *      Field order and names are the v1 contract the UI and the
  *      `resume_analyses` / `matches` columns depend on. Do not rename.
  *   2. `validateResumeAnalysis` / `validateMatchResult`: meaning checks the
