@@ -103,6 +103,25 @@ export const JOB_DESCRIPTION_LEVELS = [
   "Management",
 ] as const;
 
+/**
+ * Listing visibility (docs/ARCHITECTURE.md §13.2.1, §13.13.4). Optional on
+ * `POST` during M1.5–M4.2, defaulting to `shared` in the route; required
+ * from M4.3. On `PATCH` only `private → shared` succeeds: `private` for a
+ * shared row is rejected by `update_job_listing` with `visibility_downgrade`
+ * (400 with that code), so the schema accepts both values and lets the RPC
+ * decide.
+ */
+export const JOB_LISTING_VISIBILITIES = ["shared", "private"] as const;
+export const JOB_LISTING_DEFAULT_VISIBILITY = "shared" as const;
+const jobListingVisibilitySchema = z.enum(JOB_LISTING_VISIBILITIES);
+
+/**
+ * These limits are duplicated as SQL checks in `create_job_listing` /
+ * `update_job_listing` (supabase/migrations/0009_job_ingestion_v2.sql,
+ * `private.validate_job_listing_fields`); `schemas.test.ts` asserts the two
+ * agree.
+ */
+
 /** URL schemes accepted for `source_url`. */
 const JOB_DESCRIPTION_ALLOWED_URL_SCHEMES = new Set(["http:", "https:"]);
 
@@ -180,6 +199,7 @@ export const jobDescriptionCreateSchema = z.object({
   source_url: jobDescriptionSourceUrlSchema.optional(),
   location: jobDescriptionLocationSchema.optional(),
   level: jobDescriptionLevelSchema.optional(),
+  visibility: jobListingVisibilitySchema.optional(),
 });
 
 export type JobDescriptionCreateInput = z.infer<
@@ -236,6 +256,7 @@ export const jobDescriptionUpdateSchema = z
     source_url: clearableOptional(jobDescriptionSourceUrlSchema),
     location: clearableOptional(jobDescriptionLocationSchema),
     level: clearableOptional(jobDescriptionLevelSchema),
+    visibility: jobListingVisibilitySchema.optional(),
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "Request body must include at least one field to update.",

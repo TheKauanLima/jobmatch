@@ -222,7 +222,23 @@ this file at the end of every work session.
    - **Code layout:** pure helpers in `lib/client/`; 1,181 tests.
    - **Carried to M1.8:** jsdom/Testing Library tests for click-driven behaviour,
      and the Next 16 `middleware.ts` → `proxy.ts` rename.
-8. Next: M1.5 job ingestion v2 (needs M1.2, done).
+8. **M1.5 job ingestion v2: IN PROGRESS, stopped mid-way 2026-11-16 (user shutdown).**
+   - **Where it is:** partial, unreviewed work on branch `wip/m1.5-ingestion` (NOT
+     main): migration 0009, source adapters (`lib/jobs/sources/`, html, normalize,
+     studentFilter), generic `sync.ts`, ingest/backfill handlers, routes switched to
+     the RPCs, `vercel.json` cron removed, hand-edited `types/database.ts`.
+   - **Last step in progress:** the handler tests. Tests/tsc/eslint were NOT run at
+     the stop point.
+   - **Never merge or deploy this before 0009 is reviewed and applied:** the routes
+     depend on RPCs that don't exist on the live DB yet.
+   - **To resume:**
+     1. Check out the branch.
+     2. Have backend-dev finish (handler tests, pgTAP files marked UNRUN, full
+        checks, ops notes).
+     3. Reviewer pass.
+     4. Smoke-test 0009 on the live DB in a rolled-back transaction.
+     5. Apply with the user's OK.
+     6. Merge.
 9. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
    `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
 

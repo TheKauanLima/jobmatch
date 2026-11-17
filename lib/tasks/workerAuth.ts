@@ -35,9 +35,22 @@ export function checkWorkerAuth(
   request: Request,
   env: Record<string, string | undefined> = process.env,
 ): WorkerAuthResult {
-  const expected = env.WORKER_SECRET?.trim();
+  return checkBearerSecret(request, env.WORKER_SECRET, "Worker endpoint is not configured.");
+}
+
+/**
+ * The same check for any shared-secret machine route (also used by
+ * `GET /api/cron/sync-jobs` with `CRON_SECRET`): unset/blank secret → 500,
+ * missing/malformed/wrong bearer → 401, timing-safe compare.
+ */
+export function checkBearerSecret(
+  request: Request,
+  secret: string | undefined,
+  notConfiguredError: string,
+): WorkerAuthResult {
+  const expected = secret?.trim();
   if (!expected) {
-    return { ok: false, status: 500, error: "Worker endpoint is not configured." };
+    return { ok: false, status: 500, error: notConfiguredError };
   }
 
   const header = request.headers.get("authorization");

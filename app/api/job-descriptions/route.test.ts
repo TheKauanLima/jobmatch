@@ -4,13 +4,13 @@ const {
   mockRequireSession,
   mockCreateClient,
   mockListJobDescriptions,
-  mockCreateJobDescription,
+  mockCreateJobListing,
   mockSearchJobDescriptions,
 } = vi.hoisted(() => ({
   mockRequireSession: vi.fn(),
   mockCreateClient: vi.fn(),
   mockListJobDescriptions: vi.fn(),
-  mockCreateJobDescription: vi.fn(),
+  mockCreateJobListing: vi.fn(),
   mockSearchJobDescriptions: vi.fn(),
 }));
 
@@ -32,7 +32,7 @@ vi.mock("@/lib/supabase/queries/jobDescriptions", async () => {
   return {
     ...actual,
     listJobDescriptions: mockListJobDescriptions,
-    createJobDescription: mockCreateJobDescription,
+    createJobListing: mockCreateJobListing,
     searchJobDescriptions: mockSearchJobDescriptions,
   };
 });
@@ -56,6 +56,26 @@ const row = {
   level: null,
   location: null,
   posted_at: null,
+  deleted_at: null,
+  visibility: "shared",
+  owner_user_id: null,
+  source_board: null,
+  apply_url: null,
+  employment_type: null,
+  remote_type: null,
+  location_country: null,
+  salary_min: null,
+  salary_max: null,
+  salary_currency: null,
+  salary_period: null,
+  last_seen_at: null,
+  expires_at: "2026-03-02T00:00:00.000Z",
+  closed_at: null,
+  closed_reason: null,
+  content_hash: "hash",
+  dedupe_key: null,
+  duplicate_of: null,
+  source_metadata: {},
 };
 
 function makeRequest(url: string, init?: RequestInit) {
@@ -112,6 +132,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 5,
       cursor: "2026-01-01T00:00:00.000Z",
       level: null,
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -127,6 +149,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 20,
       cursor: null,
       level: "Internship",
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -140,6 +164,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 20,
       cursor: null,
       level: null,
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -195,6 +221,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 100,
       cursor: null,
       level: null,
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -223,6 +251,7 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       offset: 0,
       level: null,
+      scope: "shared",
     });
     expect(mockListJobDescriptions).not.toHaveBeenCalled();
     expect(body.job_descriptions).toHaveLength(1);
@@ -244,6 +273,7 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       offset: 0,
       level: "Internship",
+      scope: "shared",
     });
   });
 
@@ -287,6 +317,8 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       cursor: null,
       level: null,
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -387,6 +419,8 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       cursor: "offset_40",
       level: null,
+      scope: "shared",
+      callerId: "user-1",
     });
   });
 
@@ -437,7 +471,7 @@ describe("POST /api/job-descriptions", () => {
     );
 
     expect(res.status).toBe(401);
-    expect(mockCreateJobDescription).not.toHaveBeenCalled();
+    expect(mockCreateJobListing).not.toHaveBeenCalled();
   });
 
   it("returns 400 for a non-JSON body", async () => {
@@ -462,7 +496,7 @@ describe("POST /api/job-descriptions", () => {
       }),
     );
     expect(res.status).toBe(400);
-    expect(mockCreateJobDescription).not.toHaveBeenCalled();
+    expect(mockCreateJobListing).not.toHaveBeenCalled();
   });
 
   it("returns 400 for an empty description", async () => {
@@ -475,7 +509,7 @@ describe("POST /api/job-descriptions", () => {
       }),
     );
     expect(res.status).toBe(400);
-    expect(mockCreateJobDescription).not.toHaveBeenCalled();
+    expect(mockCreateJobListing).not.toHaveBeenCalled();
   });
 
   it("returns 400 for a missing title/description", async () => {
@@ -490,9 +524,9 @@ describe("POST /api/job-descriptions", () => {
     expect(res.status).toBe(400);
   });
 
-  it("creates a job description with submitted_by set to the caller, not a client-supplied value", async () => {
+  it("creates the listing through the RPC, never passing a client-supplied submitted_by (the RPC uses auth.uid())", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockCreateJobDescription.mockResolvedValue(row);
+    mockCreateJobListing.mockResolvedValue(row);
 
     const res = await POST(
       makeRequest("http://localhost/api/job-descriptions", {
@@ -509,15 +543,16 @@ describe("POST /api/job-descriptions", () => {
 
     expect(res.status).toBe(201);
     expect(body.job_description.id).toBe("jd-1");
-    expect(mockCreateJobDescription).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ submittedBy: "user-1" }),
-    );
+    expect(mockCreateJobListing).toHaveBeenCalledTimes(1);
+    const args = mockCreateJobListing.mock.calls[0][1];
+    expect(args).not.toHaveProperty("submittedBy");
+    expect(args).not.toHaveProperty("submitted_by");
+    expect(args).toMatchObject({ title: "Software Engineer", company: "Acme", visibility: "shared" });
   });
 
   it("returns 500 (not a crash) when the query layer throws", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockCreateJobDescription.mockRejectedValue(new Error("db down"));
+    mockCreateJobListing.mockRejectedValue(new Error("db down"));
 
     const res = await POST(
       makeRequest("http://localhost/api/job-descriptions", {
@@ -530,7 +565,7 @@ describe("POST /api/job-descriptions", () => {
 
   it("passes location and level through to the query layer when provided", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockCreateJobDescription.mockResolvedValue(row);
+    mockCreateJobListing.mockResolvedValue(row);
 
     await POST(
       makeRequest("http://localhost/api/job-descriptions", {
@@ -544,7 +579,7 @@ describe("POST /api/job-descriptions", () => {
       }),
     );
 
-    expect(mockCreateJobDescription).toHaveBeenCalledWith(
+    expect(mockCreateJobListing).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ location: "Remote", level: "Entry Level" }),
     );
@@ -564,6 +599,180 @@ describe("POST /api/job-descriptions", () => {
       }),
     );
     expect(res.status).toBe(400);
-    expect(mockCreateJobDescription).not.toHaveBeenCalled();
+    expect(mockCreateJobListing).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M1.5 (docs/ARCHITECTURE.md §13.13.4): scopes, visibility, RPC errors, v2 fields
+// ---------------------------------------------------------------------------
+
+const { JobListingRpcError } = await import("@/lib/supabase/queries/jobDescriptions");
+
+function rpcError(message: string, code = "P0001") {
+  return new JobListingRpcError("create_job_listing", { code, message });
+}
+
+function post(body: unknown) {
+  return POST(
+    makeRequest("http://localhost/api/job-descriptions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+describe("GET /api/job-descriptions ?scope=", () => {
+  beforeEach(() => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockListJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+    mockSearchJobDescriptions.mockResolvedValue({ items: [], hasMore: false });
+  });
+
+  it("defaults to scope 'shared'", async () => {
+    await GET(makeRequest("http://localhost/api/job-descriptions"));
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: "shared" }),
+    );
+  });
+
+  it("passes scope=mine with the session user's id (never a request param) to the keyset listing", async () => {
+    await GET(makeRequest("http://localhost/api/job-descriptions?scope=mine&callerId=attacker&level=Internship"));
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(expect.anything(), {
+      limit: 20,
+      cursor: null,
+      level: "Internship",
+      scope: "mine",
+      callerId: "user-1",
+    });
+  });
+
+  it("passes scope=mine to search when q is present", async () => {
+    await GET(makeRequest("http://localhost/api/job-descriptions?scope=mine&q=data"));
+    expect(mockSearchJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: "mine", query: "data" }),
+    );
+    expect(mockListJobDescriptions).not.toHaveBeenCalled();
+  });
+
+  it("treats an empty scope as the default", async () => {
+    await GET(makeRequest("http://localhost/api/job-descriptions?scope="));
+    expect(mockListJobDescriptions).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: "shared" }),
+    );
+  });
+
+  it.each(["all", "private", "SHARED", "mine "])("returns 400 validation_failed for scope=%j", async (scope) => {
+    const res = await GET(makeRequest(`http://localhost/api/job-descriptions?scope=${encodeURIComponent(scope)}`));
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe("validation_failed");
+    expect(mockListJobDescriptions).not.toHaveBeenCalled();
+    expect(mockSearchJobDescriptions).not.toHaveBeenCalled();
+  });
+
+  it("returns the v2 listing fields and never exposes submitted_by / owner_user_id / internal columns", async () => {
+    mockListJobDescriptions.mockResolvedValue({
+      items: [
+        {
+          ...row,
+          source: "themuse",
+          submitted_by: null,
+          apply_url: "https://apply.example.com/1",
+          employment_type: "Full-time",
+          remote_type: "remote",
+          closed_at: "2026-02-01T00:00:00.000Z",
+          closed_reason: "expired",
+        },
+      ],
+      hasMore: false,
+    });
+
+    const res = await GET(makeRequest("http://localhost/api/job-descriptions"));
+    const [item] = (await res.json()).job_descriptions;
+
+    expect(item).toMatchObject({
+      visibility: "shared",
+      is_closed: true,
+      closed_reason: "expired",
+      expires_at: "2026-03-02T00:00:00.000Z",
+      apply_url: "https://apply.example.com/1",
+      employment_type: "Full-time",
+      remote_type: "remote",
+      source_display_name: "The Muse",
+      attribution: { text: "Listing from The Muse", url: "https://www.themuse.com" },
+      is_own: false,
+    });
+    for (const key of ["submitted_by", "owner_user_id", "dedupe_key", "duplicate_of", "content_hash", "external_id", "search_vector", "source_metadata", "last_seen_at"]) {
+      expect(item).not.toHaveProperty(key);
+    }
+  });
+
+  it("user-submitted listings carry no attribution", async () => {
+    mockListJobDescriptions.mockResolvedValue({ items: [row], hasMore: false });
+    const res = await GET(makeRequest("http://localhost/api/job-descriptions"));
+    const [item] = (await res.json()).job_descriptions;
+    expect(item.attribution).toBeNull();
+    expect(item.is_closed).toBe(false);
+    expect(item.is_own).toBe(true);
+  });
+});
+
+describe("POST /api/job-descriptions (create_job_listing RPC)", () => {
+  beforeEach(() => {
+    mockRequireSession.mockResolvedValue({ user: fakeUser });
+    mockCreateJobListing.mockResolvedValue(row);
+  });
+
+  it("defaults visibility to 'shared' when omitted (M1.5–M4.2)", async () => {
+    const res = await post({ title: "t", description: "d" });
+    expect(res.status).toBe(201);
+    expect(mockCreateJobListing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ visibility: "shared" }));
+  });
+
+  it("passes an explicit 'private' visibility through", async () => {
+    mockCreateJobListing.mockResolvedValue({ ...row, visibility: "private", owner_user_id: "user-1", expires_at: null });
+    const res = await post({ title: "t", description: "d", visibility: "private" });
+    expect(res.status).toBe(201);
+    expect(mockCreateJobListing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ visibility: "private" }));
+    expect((await res.json()).job_description.visibility).toBe("private");
+  });
+
+  it("returns 400 for an unknown visibility without calling the RPC", async () => {
+    const res = await post({ title: "t", description: "d", visibility: "public" });
+    expect(res.status).toBe(400);
+    expect(mockCreateJobListing).not.toHaveBeenCalled();
+  });
+
+  it("maps rate_limited:job_listing_create to 429 with kind and retry_after (next UTC midnight)", async () => {
+    mockCreateJobListing.mockRejectedValue(rpcError("rate_limited:job_listing_create"));
+    const res = await post({ title: "t", description: "d" });
+    const body = await res.json();
+    expect(res.status).toBe(429);
+    expect(body).toMatchObject({ code: "rate_limited", kind: "job_listing_create" });
+    expect(body.retry_after).toMatch(/T00:00:00\.000Z$/);
+    expect(Date.parse(body.retry_after)).toBeGreaterThan(Date.now());
+  });
+
+  it("maps a validation_* RPC error to 400 validation_failed", async () => {
+    mockCreateJobListing.mockRejectedValue(rpcError("validation_source_url"));
+    const res = await post({ title: "t", description: "d" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe("validation_failed");
+  });
+
+  it("maps the RPC's unauthenticated (42501) to 401", async () => {
+    mockCreateJobListing.mockRejectedValue(rpcError("unauthenticated", "42501"));
+    const res = await post({ title: "t", description: "d" });
+    expect(res.status).toBe(401);
+  });
+
+  it("maps any other RPC error to 500 with the generic copy", async () => {
+    mockCreateJobListing.mockRejectedValue(rpcError("something unexpected", "XX000"));
+    const res = await post({ title: "t", description: "d" });
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("Failed to save job description.");
   });
 });
