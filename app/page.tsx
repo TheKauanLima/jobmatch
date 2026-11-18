@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { FadeInSection } from "@/components/FadeInSection";
-import { SampleAnalysisShowcase } from "@/components/SampleAnalysisShowcase";
+import { SampleCritiqueShowcase } from "@/components/SampleCritiqueShowcase";
 import { AccountStatusNotice } from "@/components/settings/AccountStatusNotice";
 
 /**
@@ -17,6 +17,12 @@ import { AccountStatusNotice } from "@/components/settings/AccountStatusNotice";
  * your resume" pitch is concrete rather than abstract, and wrapped each
  * section in `FadeInSection` so the page doesn't feel static while
  * scrolling.
+ *
+ * Critique showcase (2026-11-18): the mocked resume/analysis pair was
+ * replaced by `SampleCritiqueShowcase`, which renders the real critique
+ * components (§13.20.6) from a static, clearly labelled fictional critique
+ * (`lib/marketing/sampleCritique.ts`) — the app's most detailed feature,
+ * visible without signing up. No API, Claude or DB access.
  */
 
 const STEPS = [
@@ -28,9 +34,9 @@ const STEPS = [
   },
   {
     number: "2",
-    title: "Get an AI analysis",
+    title: "Get a detailed critique",
     description:
-      "Claude reads your resume and surfaces concrete strengths and weaknesses, plus roles it's well-suited for.",
+      "Claude scores your resume across five areas, names your top 3 fixes, and suggests rewrites for individual lines, plus roles it's well-suited for.",
   },
   {
     number: "3",
@@ -73,18 +79,13 @@ export default function Home() {
         </div>
       </FadeInSection>
 
-      <FadeInSection as="section" className="border-t border-border bg-surface">
+      <FadeInSection
+        as="section"
+        aria-labelledby="sample-critique-heading"
+        className="border-t border-border"
+      >
         <div className="mx-auto w-full max-w-5xl px-6 py-16 sm:py-20">
-          <h2 className="text-xl font-semibold tracking-tight text-fg">
-            See it in action
-          </h2>
-          <p className="mt-2 max-w-2xl text-sm text-fg-muted">
-            A sample resume excerpt and the kind of analysis Kalify
-            generates for it — not real data, just an example.
-          </p>
-          <div className="mt-8">
-            <SampleAnalysisShowcase />
-          </div>
+          <SampleCritiqueShowcase />
         </div>
       </FadeInSection>
 

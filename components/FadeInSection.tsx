@@ -7,6 +7,8 @@ interface FadeInSectionProps {
   className?: string;
   /** Element type to render as. Defaults to `div` so this can wrap any block-level content. */
   as?: "div" | "section";
+  /** Id of the element that labels this region (e.g. its `h2`). */
+  "aria-labelledby"?: string;
 }
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
@@ -43,6 +45,7 @@ export function FadeInSection({
   children,
   className = "",
   as = "div",
+  "aria-labelledby": labelledBy,
 }: FadeInSectionProps) {
   const divRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -66,7 +69,11 @@ export function FadeInSection({
           observer.disconnect();
         }
       },
-      { threshold: 0.15 },
+      // Trigger once the section's top edge is 10% above the viewport's
+      // bottom. A ratio threshold (previously 0.15) never fires for sections
+      // taller than ~6.7 viewports — e.g. the critique showcase on a phone —
+      // which would leave them invisible.
+      { threshold: 0, rootMargin: "0px 0px -10% 0px" },
     );
 
     observer.observe(node);
@@ -84,14 +91,14 @@ export function FadeInSection({
 
   if (as === "section") {
     return (
-      <section ref={sectionRef} className={motionClassName}>
+      <section ref={sectionRef} aria-labelledby={labelledBy} className={motionClassName}>
         {children}
       </section>
     );
   }
 
   return (
-    <div ref={divRef} className={motionClassName}>
+    <div ref={divRef} aria-labelledby={labelledBy} className={motionClassName}>
       {children}
     </div>
   );

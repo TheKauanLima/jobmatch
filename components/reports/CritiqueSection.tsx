@@ -21,6 +21,18 @@ interface CritiqueSectionProps {
    * re-run is offered (e.g. the M3.6 report page).
    */
   staleAction?: ReactNode;
+  /**
+   * Showcase mode (landing page): show only the first `limit` line-feedback
+   * items, followed by `note`, instead of the full list with its "Show all
+   * N" toggle. Omit it (the default) for the full list.
+   */
+  lineFeedbackPreview?: { limit: number; note: ReactNode };
+  /**
+   * Show the "Generated <date>" line in the footer. Defaults to `true`; the
+   * landing-page sample turns it off because its date is not meaningful.
+   * The AI disclaimer always shows.
+   */
+  showDate?: boolean;
 }
 
 /**
@@ -34,8 +46,16 @@ interface CritiqueSectionProps {
  * string renders as React text, never HTML. Headings start at `h3`; the
  * caller owns the `h2` card title.
  */
-export function CritiqueSection({ critique, staleAction }: CritiqueSectionProps) {
-  const date = formatCritiqueDate(critique.created_at);
+export function CritiqueSection({
+  critique,
+  staleAction,
+  lineFeedbackPreview,
+  showDate = true,
+}: CritiqueSectionProps) {
+  const date = showDate ? formatCritiqueDate(critique.created_at) : null;
+  const lineItems = lineFeedbackPreview
+    ? critique.line_feedback.slice(0, Math.max(0, lineFeedbackPreview.limit))
+    : critique.line_feedback;
 
   return (
     <div className="flex flex-col gap-8">
@@ -79,8 +99,13 @@ export function CritiqueSection({ critique, staleAction }: CritiqueSectionProps)
           Your original line, what to change, and a suggested rewrite. Most impactful first.
         </p>
         <div className="mt-4">
-          <LineFeedbackList items={critique.line_feedback} />
+          <LineFeedbackList items={lineItems} />
         </div>
+        {lineFeedbackPreview && (
+          <div className="mt-4 rounded-md border border-dashed border-border-strong bg-bg px-4 py-3 text-sm text-fg-muted">
+            {lineFeedbackPreview.note}
+          </div>
+        )}
       </section>
 
       <div className="grid gap-6 sm:grid-cols-2">

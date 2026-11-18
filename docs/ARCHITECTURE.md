@@ -5893,8 +5893,12 @@ shared with §13.13.2):
 - `locateQuoteInSource` retrofits for the other quote fields.
 - `scripts/evals/critique.ts` and the injection eval for this prompt (required before
   `critique-v2`).
-- Revision comparison (Phase 5), and the landing-page sample showcase switching to a
-  critique.
+- Revision comparison (Phase 5).
+- *(Done early, 2026-11-18, visible-first.)* The landing page's sample showcase is now a
+  fictional critique, `components/SampleCritiqueShowcase.tsx` with data in
+  `lib/marketing/sampleCritique.ts`. It renders through the real `CritiqueSection`, using
+  the optional `lineFeedbackPreview` and `showDate` props. It has no API or Claude
+  calls.
 - The `report_id`/`profile_id` FKs (0016).
 - **Retirement:**
   - M3.6 puts the same components on `/reports/[id]`.
