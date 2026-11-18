@@ -5,6 +5,7 @@ import {
   getLatestCritique,
   getStandaloneCritique,
   insertResumeCritique,
+  listLatestCritiqueSummaries,
   refundCritiqueCharge,
   STANDALONE_CRITIQUE_KEY,
 } from "@/lib/supabase/queries/critiques";
@@ -21,7 +22,7 @@ type Call = [string, ...unknown[]];
 function recorder(result: { data: unknown; error: unknown }) {
   const calls: Call[] = [];
   const builder: Record<string, unknown> = {};
-  for (const method of ["select", "insert", "update", "eq", "is", "order", "limit"]) {
+  for (const method of ["select", "insert", "update", "eq", "in", "is", "order", "limit"]) {
     builder[method] = (...args: unknown[]) => {
       calls.push([method, ...args]);
       return builder;
@@ -103,6 +104,53 @@ describe("getStandaloneCritique (session client)", () => {
   it("throws CritiqueQueryError on failure", async () => {
     const { client } = recorder({ data: null, error: { message: "boom" } });
     await expect(getStandaloneCritique(client, "r1", "v")).rejects.toBeInstanceOf(CritiqueQueryError);
+  });
+});
+
+describe("listLatestCritiqueSummaries (session client)", () => {
+  it("reads summary columns only, owner-scoped, newest first, and keeps one row per resume", async () => {
+    const rows = [
+      { id: "c3", resume_id: "r1", overall_score: 80, dimension_scores: [], prompt_version: "critique-v2", created_at: "2026-11-18T10:00:00Z" },
+      { id: "c2", resume_id: "r2", overall_score: 55, dimension_scores: [], prompt_version: "critique-v1", created_at: "2026-11-17T10:00:00Z" },
+      { id: "c1", resume_id: "r1", overall_score: 60, dimension_scores: [], prompt_version: "critique-v1", created_at: "2026-11-16T10:00:00Z" },
+    ];
+    const { client, from, calls } = recorder({ data: rows, error: null });
+    const result = await listLatestCritiqueSummaries(client, "u1", ["r1", "r2", "r3"]);
+    expect(result.map((r) => r.id)).toEqual(["c3", "c2"]);
+    expect(from).toHaveBeenCalledWith("resume_critiques");
+    expect(calls).toEqual([
+      ["select", "id, resume_id, overall_score, dimension_scores, prompt_version, created_at"],
+      ["eq", "user_id", "u1"],
+      ["in", "resume_id", ["r1", "r2", "r3"]],
+      ["order", "created_at", { ascending: false }],
+    ]);
+  });
+
+  it("never selects critique text columns", async () => {
+    const { client, calls } = recorder({ data: [], error: null });
+    await listLatestCritiqueSummaries(client, "u1", ["r1"]);
+    const columns = String(calls[0][1]);
+    for (const column of ["summary", "line_feedback", "student_context", "ats_issues", "*"]) {
+      expect(columns).not.toContain(column);
+    }
+  });
+
+  it("skips the query entirely for an empty id list", async () => {
+    const { client, from } = recorder({ data: [], error: null });
+    await expect(listLatestCritiqueSummaries(client, "u1", [])).resolves.toEqual([]);
+    expect(from).not.toHaveBeenCalled();
+  });
+
+  it("returns [] for a null data payload", async () => {
+    const { client } = recorder({ data: null, error: null });
+    await expect(listLatestCritiqueSummaries(client, "u1", ["r1"])).resolves.toEqual([]);
+  });
+
+  it("throws CritiqueQueryError on failure", async () => {
+    const { client } = recorder({ data: null, error: { code: "57014", message: "timeout" } });
+    await expect(listLatestCritiqueSummaries(client, "u1", ["r1"])).rejects.toThrow(
+      /list_latest_critique_summaries failed \(57014\)/,
+    );
   });
 });
 

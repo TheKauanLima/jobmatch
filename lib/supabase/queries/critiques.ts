@@ -100,6 +100,46 @@ export async function getStandaloneCritique(
   return data;
 }
 
+/** The columns the dashboard needs per critique: score, date and the dimensions (for the top priority). */
+export type CritiqueSummaryRow = Pick<
+  ResumeCritiqueRow,
+  "id" | "resume_id" | "overall_score" | "dimension_scores" | "prompt_version" | "created_at"
+>;
+
+/**
+ * The newest critique summary for each of `resumeIds` (any prompt version,
+ * any origin), for the dashboard's resume list: one query instead of one
+ * `getLatestCritique` per resume. Resumes without a critique are simply
+ * absent from the result. Returns rows newest first, at most one per resume.
+ *
+ * Session client: RLS (`resume_critiques_select_own`) is the guarantee, and
+ * the explicit `user_id` filter (the session user, never request input)
+ * keeps the read owner-scoped even if called with an unexpected id. Selects
+ * only the summary columns, never summary/line-feedback text.
+ */
+export async function listLatestCritiqueSummaries(
+  session: SessionClient,
+  userId: string,
+  resumeIds: readonly string[],
+): Promise<CritiqueSummaryRow[]> {
+  if (resumeIds.length === 0) return [];
+
+  const { data, error } = await session
+    .from("resume_critiques")
+    .select("id, resume_id, overall_score, dimension_scores, prompt_version, created_at")
+    .eq("user_id", userId)
+    .in("resume_id", [...resumeIds])
+    .order("created_at", { ascending: false });
+
+  if (error) throw new CritiqueQueryError("list_latest_critique_summaries", error);
+
+  const latest = new Map<string, CritiqueSummaryRow>();
+  for (const row of data ?? []) {
+    if (!latest.has(row.resume_id)) latest.set(row.resume_id, row);
+  }
+  return [...latest.values()];
+}
+
 // ---------------------------------------------------------------------------
 // Writes (service-role client)
 // ---------------------------------------------------------------------------
