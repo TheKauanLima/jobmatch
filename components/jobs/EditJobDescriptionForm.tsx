@@ -44,6 +44,12 @@ function CharCount({ value, max }: { value: string; max: number }) {
 
 interface EditJobDescriptionFormProps {
   jobDescription: JobDescription;
+  /**
+   * Render without the card border and heading, for use inside a container
+   * that already provides them (`JobOwnerTools`). The visibility notice is
+   * kept either way.
+   */
+  embedded?: boolean;
 }
 
 /**
@@ -77,6 +83,7 @@ interface EditJobDescriptionFormProps {
  */
 export function EditJobDescriptionForm({
   jobDescription,
+  embedded = false,
 }: EditJobDescriptionFormProps) {
   const router = useRouter();
   const [title, setTitle] = useState(jobDescription.title);
@@ -157,13 +164,20 @@ export function EditJobDescriptionForm({
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
+      aria-label={embedded ? "Edit this job posting" : undefined}
+      className={
+        embedded
+          ? "flex flex-col gap-3"
+          : "flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
+      }
     >
       <div>
-        <h2 className="text-base font-semibold text-fg">
-          Edit this job description
-        </h2>
-        <p className="mt-1 text-sm text-fg-muted">
+        {!embedded && (
+          <h2 className="text-base font-semibold text-fg">
+            Edit this job description
+          </h2>
+        )}
+        <p className={embedded ? "text-sm text-fg-muted" : "mt-1 text-sm text-fg-muted"}>
           Changes here are visible to every signed-in user. Existing matches
           against this posting keep their original rationale — only the title
           and company shown next to them update.

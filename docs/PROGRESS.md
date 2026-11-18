@@ -262,7 +262,29 @@ this file at the end of every work session.
       against the live schema.
     - **Not yet verified:** a real end-to-end critique on the deployed site with a
       real account.
-11. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
+11. **Visible-first UI round, done 2026-11-18** (frontend only; no backend, migrations or
+    Claude calls; screenshots checked by the orchestrator; no separate reviewer pass
+    for these low-risk UI changes).
+    - **Landing page:** a sample critique showcase (`ee1e22a`), and the hero/footer
+      copy now leads with the critique.
+    - **Dashboard overhaul** (`app/dashboard`, `components/dashboard`,
+      `lib/client/dashboard.ts`):
+      - a "next best step" card;
+      - resumes with critique scores;
+      - top matches (best 3 of the last 20);
+      - today's critique allowance;
+      - a first-run welcome.
+      - One new read query, `listLatestCritiqueSummaries` (session client,
+        user-filtered, scores only).
+      - The "Latest job listings" teaser was removed.
+    - **Jobs board polish** (`app/jobs`, `components/jobs`, `lib/client/jobsBoard.ts`):
+      - cards with level and source badges, relative dates and text snippets;
+      - URL-state search and level pills, empty, error and loading states;
+      - a detail page with key facts, The Muse attribution, safe "Apply" links and
+        "Check my fit".
+      - Uses only main's current API (M1.5 stays parked).
+    - 1,555 tests.
+12. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
    `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
 
 ### User to-dos (not blocking current work)
