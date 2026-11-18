@@ -52,16 +52,15 @@ export default function Home() {
       <AccountStatusNotice />
       <FadeInSection as="section" className="mx-auto w-full max-w-5xl px-6 pt-20 pb-16 sm:pt-28 sm:pb-24">
         <p className="text-sm font-semibold tracking-wide text-fg-muted uppercase">
-          AI-powered job matching
+          AI resume critique &amp; job matching
         </p>
         <h1 className="mt-3 max-w-2xl text-4xl font-semibold tracking-tight text-fg sm:text-5xl">
           Know exactly how your resume stacks up.
         </h1>
         <p className="mt-5 max-w-xl text-base leading-7 text-fg-muted sm:text-lg">
-          Upload a resume, get an AI-powered strengths and weaknesses
-          breakdown, and see how it matches against job descriptions — a mix
-          of postings the community shares and internship/entry-level
-          listings pulled in automatically for you.
+          Upload a resume and get a detailed critique: a score for each area,
+          your top three fixes, and line-by-line rewrites. Then see how it
+          matches real internship and entry-level postings.
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-3">
           <Link

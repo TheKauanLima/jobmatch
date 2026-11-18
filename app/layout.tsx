@@ -18,7 +18,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Kalify",
-  description: "Match your resume against job descriptions with AI-powered analysis.",
+  description:
+    "Get a detailed AI critique of your resume, with scores, top fixes and line-by-line rewrites, and match it against real internship and entry-level jobs.",
 };
 
 export default async function RootLayout({ children }: LayoutProps<"/">) {
@@ -102,9 +103,9 @@ function SiteFooter({ userEmail }: { userEmail: string | null }) {
             Kalify
           </p>
           <p className="mt-2 text-sm leading-6 text-fg-muted">
-            AI-powered resume analysis and job matching — upload a resume,
-            get a strengths and weaknesses breakdown, and see how it stacks
-            up against real postings.
+            AI resume critique and job matching: upload a resume, get scores,
+            top fixes and line-by-line rewrites, and see how it stacks up
+            against real postings.
           </p>
         </div>
 
