@@ -41,26 +41,12 @@
  * out, which the generator cannot express), and `Record<string, never>` for
  * no-argument RPCs. Keep narrowing on regeneration.
  *
- * Updated by hand for supabase/migrations/0009_job_ingestion_v2.sql (M1.5),
- * written before it was applied, the same way as 0007/0008: job_descriptions
- * v2 columns, job_sources / job_source_boards / job_source_runs, the listing
- * RPCs, search_job_descriptions v2 (adds `scope`), and the ingest functions.
- * Regenerate and diff once 0009 is applied. Deliberate narrowings added for
- * 0009 (keep them on regeneration): string-literal unions for visibility /
- * closed_reason / remote_type / salary_period / source / sync_mode / run
- * status, `content_hash` omitted from job_descriptions Insert/Update (it is
- * maintained by a trigger and never written by app code, same treatment as
- * `search_vector`), `source_metadata` / `config` typed as JSON objects,
- * `search_job_descriptions.scope` as `'shared' | 'mine'`, and
- * `delete_job_listing` returning `'deleted' | 'soft_deleted'`.
- *
  * Updated by hand for supabase/migrations/0010_resume_critiques.sql (V1,
- * §13.20.2), written before it was applied: resume_critiques and the
- * request_resume_critique RPC. 0010 is applied to the live DB ahead of the
- * parked 0009 (§13.3.0); after it is applied this file is regenerated from
- * the live project (which then has 0010 but not 0009) and the 0009 entries
- * above are re-added by the M1.5 branch when 0009 lands. No new narrowings
- * for 0010: its jsonb columns stay `Json` (shaped by types/domain.ts#toCritique).
+ * §13.20.2): resume_critiques and the request_resume_critique RPC. 0010 was
+ * applied to the live DB on 2026-11-18, ahead of the parked 0009 (§13.3.0).
+ * 0009's (M1.5) entries live on branch `wip/m1.5-ingestion` and come back
+ * when 0009 lands. No new narrowings for 0010: its jsonb columns stay `Json`
+ * (shaped by types/domain.ts#toCritique).
  */
 
 export type Json =
@@ -72,29 +58,7 @@ export type Json =
   | Json[];
 
 export type ResumeStatus = "uploaded" | "processing" | "analyzed" | "failed";
-/** `job_sources.slug` check constraint (0009). */
-export type JobSourceSlug =
-  | "themuse"
-  | "usajobs"
-  | "greenhouse"
-  | "lever"
-  | "adzuna";
-/** `job_descriptions.source` check constraint (0009; 0004 had user/themuse). */
-export type JobDescriptionSource = "user" | JobSourceSlug;
-/** `job_descriptions.visibility` check constraint (0009). */
-export type JobListingVisibility = "shared" | "private";
-/** `job_descriptions.closed_reason` check constraint (0009). */
-export type JobClosedReason = "expired" | "removed_at_source" | "manual";
-/** `job_descriptions.remote_type` check constraint (0009). */
-export type JobRemoteType = "onsite" | "hybrid" | "remote";
-/** `job_descriptions.salary_period` check constraint (0009). */
-export type JobSalaryPeriod = "hour" | "year" | "month";
-/** `job_sources.sync_mode` check constraint (0009). */
-export type JobSourceSyncMode = "snapshot" | "incremental";
-/** `job_source_runs.status` check constraint (0009). */
-export type JobSourceRunStatus = "running" | "succeeded" | "partial" | "failed";
-/** A jsonb column constrained to `jsonb_typeof(...) = 'object'`. */
-export type JsonObject = { [key: string]: Json | undefined };
+export type JobDescriptionSource = "user" | "themuse";
 
 /** `background_tasks.status` check constraint (0007). */
 export type BackgroundTaskStatus =
@@ -208,36 +172,6 @@ export interface Database {
            * See docs/ARCHITECTURE.md §10.
            */
           deleted_at: string | null;
-          // --- 0009 (job ingestion v2, docs/ARCHITECTURE.md §13.3.3) ------
-          visibility: JobListingVisibility;
-          /** Non-null iff `visibility = 'private'`; on delete cascade. */
-          owner_user_id: string | null;
-          source_board: string | null;
-          apply_url: string | null;
-          employment_type: string | null;
-          remote_type: JobRemoteType | null;
-          /** ISO-3166 alpha-2. */
-          location_country: string | null;
-          /** `numeric`; PostgREST serializes it as a JSON number. */
-          salary_min: number | null;
-          salary_max: number | null;
-          /** ISO-4217. */
-          salary_currency: string | null;
-          salary_period: JobSalaryPeriod | null;
-          last_seen_at: string | null;
-          expires_at: string | null;
-          closed_at: string | null;
-          closed_reason: JobClosedReason | null;
-          /**
-           * sha256 hex of title/company/description, maintained by the
-           * `job_descriptions_content_hash` trigger. Omitted from `Insert`/
-           * `Update`: app code never writes it (a written value is
-           * overwritten anyway).
-           */
-          content_hash: string;
-          dedupe_key: string | null;
-          duplicate_of: string | null;
-          source_metadata: JsonObject;
         };
         Insert: {
           id?: string;
@@ -254,24 +188,6 @@ export interface Database {
           location?: string | null;
           posted_at?: string | null;
           deleted_at?: string | null;
-          visibility?: JobListingVisibility;
-          owner_user_id?: string | null;
-          source_board?: string | null;
-          apply_url?: string | null;
-          employment_type?: string | null;
-          remote_type?: JobRemoteType | null;
-          location_country?: string | null;
-          salary_min?: number | null;
-          salary_max?: number | null;
-          salary_currency?: string | null;
-          salary_period?: JobSalaryPeriod | null;
-          last_seen_at?: string | null;
-          expires_at?: string | null;
-          closed_at?: string | null;
-          closed_reason?: JobClosedReason | null;
-          dedupe_key?: string | null;
-          duplicate_of?: string | null;
-          source_metadata?: JsonObject;
         };
         Update: Partial<
           Database["public"]["Tables"]["job_descriptions"]["Insert"]
@@ -503,184 +419,23 @@ export interface Database {
         >;
         Relationships: [];
       };
-      /**
-       * External job sources and sync settings (0009, §13.3.3). Server-only:
-       * RLS on, no policies; only service_role reads or writes it.
-       */
-      job_sources: {
-        Row: {
-          slug: JobSourceSlug;
-          display_name: string;
-          enabled: boolean;
-          sync_mode: JobSourceSyncMode;
-          dedupe_priority: number;
-          default_ttl_days: number;
-          config: JsonObject;
-          last_run_at: string | null;
-          last_success_at: string | null;
-          created_at: string;
-          updated_at: string;
-        };
-        Insert: {
-          slug: JobSourceSlug;
-          display_name: string;
-          enabled?: boolean;
-          sync_mode: JobSourceSyncMode;
-          dedupe_priority: number;
-          default_ttl_days: number;
-          config?: JsonObject;
-          last_run_at?: string | null;
-          last_success_at?: string | null;
-          created_at?: string;
-          updated_at?: string;
-        };
-        Update: Partial<Database["public"]["Tables"]["job_sources"]["Insert"]>;
-        Relationships: [];
-      };
-      /** Per-company boards for snapshot sources (0009). Server-only. */
-      job_source_boards: {
-        Row: {
-          id: string;
-          source_slug: JobSourceSlug;
-          board_token: string;
-          company_name: string | null;
-          enabled: boolean;
-          include_unlabeled_titles: boolean;
-          last_synced_at: string | null;
-          last_error_code: string | null;
-          consecutive_failures: number;
-          created_at: string;
-          updated_at: string;
-        };
-        Insert: {
-          id?: string;
-          source_slug: JobSourceSlug;
-          board_token: string;
-          company_name?: string | null;
-          enabled?: boolean;
-          include_unlabeled_titles?: boolean;
-          last_synced_at?: string | null;
-          last_error_code?: string | null;
-          consecutive_failures?: number;
-          created_at?: string;
-          updated_at?: string;
-        };
-        Update: Partial<
-          Database["public"]["Tables"]["job_source_boards"]["Insert"]
-        >;
-        Relationships: [];
-      };
-      /** One row per source/board sync run (0009). Server-only. */
-      job_source_runs: {
-        Row: {
-          id: string;
-          source_slug: JobSourceSlug;
-          board_id: string | null;
-          task_id: string | null;
-          started_at: string;
-          finished_at: string | null;
-          status: JobSourceRunStatus;
-          fetched: number;
-          inserted: number;
-          updated: number;
-          unchanged: number;
-          closed: number;
-          skipped_filtered: number;
-          skipped_invalid: number;
-          /** No PII; never listing text. */
-          error_summary: string | null;
-        };
-        Insert: {
-          id?: string;
-          source_slug: JobSourceSlug;
-          board_id?: string | null;
-          task_id?: string | null;
-          started_at?: string;
-          finished_at?: string | null;
-          status?: JobSourceRunStatus;
-          fetched?: number;
-          inserted?: number;
-          updated?: number;
-          unchanged?: number;
-          closed?: number;
-          skipped_filtered?: number;
-          skipped_invalid?: number;
-          error_summary?: string | null;
-        };
-        Update: Partial<
-          Database["public"]["Tables"]["job_source_runs"]["Insert"]
-        >;
-        Relationships: [];
-      };
     };
     Views: Record<string, never>;
     Functions: {
       /**
-       * Ranked full-text search over `job_descriptions` (0005; v2 in 0009
-       * adds `scope`: 'shared' = active shared listings, 'mine' = everything
-       * the caller submitted except duplicates; any other value raises
-       * `validation_scope`). SECURITY INVOKER, authenticated only. See
+       * Ranked full-text search over `job_descriptions`, added by
+       * supabase/migrations/0005_job_description_search.sql — see
        * `lib/supabase/queries/jobDescriptions.ts#searchJobDescriptions` and
-       * docs/ARCHITECTURE.md §9, §13.3.3.
+       * docs/ARCHITECTURE.md §9.
        */
       search_job_descriptions: {
         Args: {
           search_query: string;
           level_filter?: string | null;
-          scope?: "shared" | "mine";
           limit_count?: number;
           offset_count?: number;
         };
         Returns: Database["public"]["Tables"]["job_descriptions"]["Row"][];
-      };
-      // --- 0009: listing RPCs (authenticated, security definer) ---------
-      /**
-       * Submit a listing as `auth.uid()`; consumes `job_listing_create`.
-       * Raises `unauthenticated` (42501), `validation_*`,
-       * `rate_limited:job_listing_create` (P0001).
-       */
-      create_job_listing: {
-        Args: {
-          p_title: string;
-          p_company: string | null;
-          p_description: string;
-          p_source_url: string | null;
-          p_location: string | null;
-          p_level: string | null;
-          p_visibility: JobListingVisibility;
-        };
-        Returns: Database["public"]["Tables"]["job_descriptions"]["Row"];
-      };
-      /**
-       * Edit the caller's own user listing. Patch keys: title, company,
-       * description, source_url, location, level, visibility. Raises
-       * `not_found_or_not_owner`, `visibility_downgrade`, `validation_*`,
-       * `rate_limited:job_listing_update`.
-       */
-      update_job_listing: {
-        Args: { p_id: string; p_patch: Json };
-        Returns: Database["public"]["Tables"]["job_descriptions"]["Row"];
-      };
-      /** Private → hard delete ('deleted'); shared → soft delete ('soft_deleted'). */
-      delete_job_listing: {
-        Args: { p_id: string };
-        Returns: "deleted" | "soft_deleted";
-      };
-      // --- 0009: ingest functions (service_role only) -------------------
-      /** Enqueue today's ingest.sync_source tasks; returns syncs requested. */
-      enqueue_source_syncs: {
-        Args: Record<string, never>;
-        Returns: number;
-      };
-      /** Close shared listings past expires_at; returns the number closed. */
-      expire_stale_job_descriptions: {
-        Args: Record<string, never>;
-        Returns: number;
-      };
-      /** Recompute canonical/duplicate_of for the given keys; returns rows changed. */
-      resolve_job_duplicates: {
-        Args: { p_dedupe_keys: string[] };
-        Returns: number;
       };
       // --- 0007: task queue functions (service_role only) ---------------
       enqueue_task: {

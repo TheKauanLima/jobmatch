@@ -1,37 +1,25 @@
 import { NextResponse } from "next/server";
 
-import { jobListingRpcErrorResponse } from "@/lib/api/jobListingErrors";
 import { requireSession, UnauthorizedError } from "@/lib/auth/session";
 import { createClient } from "@/lib/supabase/server";
 import {
-  createJobListing,
+  createJobDescription,
   decodeJobDescriptionOffsetCursor,
   encodeJobDescriptionCursor,
   encodeJobDescriptionOffsetCursor,
-  isJobDescriptionScope,
   JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JOB_DESCRIPTIONS_MAX_LIMIT,
-  JobListingRpcError,
+  JobDescriptionQueryError,
   listJobDescriptions,
   searchJobDescriptions,
-  type JobDescriptionScope,
 } from "@/lib/supabase/queries/jobDescriptions";
-import {
-  JOB_LISTING_DEFAULT_VISIBILITY,
-  jobDescriptionCreateSchema,
-} from "@/lib/validation/schemas";
+import { jobDescriptionCreateSchema } from "@/lib/validation/schemas";
 import { toJobDescription } from "@/types/domain";
 
 /**
- * GET /api/job-descriptions — list job descriptions. `?scope=shared|mine`
- * (docs/ARCHITECTURE.md §13.13.4, default `shared`): `shared` returns active
- * shared listings only (no closed, duplicate, soft-deleted or private rows,
- * not even the caller's own private ones); `mine` returns everything the
- * caller submitted (shared and private, closed and soft-deleted included,
- * duplicates excluded). Any other value is a 400. `?q=` and `?level=` work
- * in both scopes, and both scopes use keyset pagination without `q`.
- * Other query params per docs/ARCHITECTURE.md §2/§9.3: `?limit=20`, `?level=<level>` (added per §7
+ * GET /api/job-descriptions — list shared job descriptions. Query params per
+ * docs/ARCHITECTURE.md §2/§9.3: `?limit=20`, `?level=<level>` (added per §7
  * for external-listing ingestion — e.g. `Internship`/`Entry Level`; omitted/
  * empty means no filter, combinable with `?q=`), `?q=<term>` (added per §9,
  * full-text search over `title`/`company`/`description`/`location` — see
@@ -58,18 +46,6 @@ export async function GET(request: Request) {
     const cursorParam = url.searchParams.get("cursor");
     const levelParam = url.searchParams.get("level");
     const qParam = url.searchParams.get("q");
-    const scopeParam = url.searchParams.get("scope");
-
-    let scope: JobDescriptionScope = "shared";
-    if (scopeParam !== null && scopeParam !== "") {
-      if (!isJobDescriptionScope(scopeParam)) {
-        return NextResponse.json(
-          { error: "scope must be 'shared' or 'mine'.", code: "validation_failed" },
-          { status: 400 },
-        );
-      }
-      scope = scopeParam;
-    }
 
     let limit = JOB_DESCRIPTIONS_DEFAULT_LIMIT;
     if (limitParam !== null) {
@@ -103,7 +79,6 @@ export async function GET(request: Request) {
         limit,
         offset,
         level: levelParam,
-        scope,
       });
 
       const next_cursor = hasMore
@@ -120,9 +95,6 @@ export async function GET(request: Request) {
       limit,
       cursor: cursorParam,
       level: levelParam,
-      scope,
-      // The session user's id, never request input (§13.15 item 3).
-      callerId: user.id,
     });
 
     const lastItem = items[items.length - 1];
@@ -150,12 +122,10 @@ export async function GET(request: Request) {
 }
 
 /**
- * POST /api/job-descriptions — submit a job listing through the
- * `create_job_listing` RPC (docs/ARCHITECTURE.md §13.13.4; direct inserts
- * are revoked since 0009). The RPC records `submitted_by = auth.uid()`,
- * applies the visibility (`shared` by default until M4.3 makes it
- * required; `private` rows are visible only to the submitter), and charges
- * `job_listing_create` (429 at the daily limit). Auth required.
+ * POST /api/job-descriptions — submit a job description. Auth required
+ * (any authenticated user — this is shared data, not owner-scoped reads,
+ * but every row records who submitted it via `submitted_by = auth.uid()`
+ * per the `job_descriptions_insert_own` RLS policy).
  */
 export async function POST(request: Request) {
   let user;
@@ -188,14 +158,14 @@ export async function POST(request: Request) {
 
   try {
     const supabase = await createClient();
-    const jobDescription = await createJobListing(supabase, {
+    const jobDescription = await createJobDescription(supabase, {
+      submittedBy: user.id,
       title: parsed.data.title,
       company: parsed.data.company,
       description: parsed.data.description,
       sourceUrl: parsed.data.source_url,
       location: parsed.data.location,
       level: parsed.data.level,
-      visibility: parsed.data.visibility ?? JOB_LISTING_DEFAULT_VISIBILITY,
     });
 
     return NextResponse.json(
@@ -203,16 +173,11 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
-    if (err instanceof JobListingRpcError) {
-      return jobListingRpcErrorResponse(err, {
-        route: "POST /api/job-descriptions",
-        failureMessage: "Failed to save job description.",
-        notFoundStatus: 404,
-      });
-    }
+    const message =
+      err instanceof JobDescriptionQueryError ? err.message : "unknown error";
     console.error(
       "POST /api/job-descriptions: failed to save job description:",
-      err instanceof Error ? err.message : "unknown error",
+      message,
     );
 
     return NextResponse.json(

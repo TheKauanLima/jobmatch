@@ -5,24 +5,13 @@
  * contracts") — keep the two in sync.
  */
 
-import { getSourceDisplay, type SourceAttribution } from "@/lib/jobs/sources/display";
 import type {
   Database,
-  JobClosedReason,
   JobDescriptionSource,
-  JobListingVisibility,
-  JobRemoteType,
   ResumeStatus,
 } from "@/types/database";
 
-export type {
-  JobClosedReason,
-  JobDescriptionSource,
-  JobListingVisibility,
-  JobRemoteType,
-  ResumeStatus,
-  SourceAttribution,
-};
+export type { JobDescriptionSource, ResumeStatus };
 
 export type ResumeRow = Database["public"]["Tables"]["resumes"]["Row"];
 
@@ -149,16 +138,6 @@ export type JobDescriptionRow =
  * `deleted_at` (genuinely client-facing now, unlike `submitted_by`/
  * `external_id`/`search_vector`) lets the UI render a "This posting was
  * removed" state per §10.5.
- *
- * v2 fields (docs/ARCHITECTURE.md §13.13.4, M1.5): `visibility`,
- * `is_closed` / `closed_reason` / `expires_at` (closed rows still resolve by
- * id; the UI shows a Closed badge and hides Apply), `apply_url` (falls back
- * to `source_url` in the UI), `employment_type`, `remote_type`, and
- * `source_display_name` / `attribution` for the link-back (§13.6.7).
- * Internal columns stay out: `owner_user_id` (same reason as
- * `submitted_by`), `dedupe_key`, `duplicate_of`, `content_hash`,
- * `last_seen_at`, `source_board`, `source_metadata`, salary fields (not in
- * the §13.13.4 list).
  */
 export type JobDescription = {
   id: string;
@@ -174,15 +153,6 @@ export type JobDescription = {
   posted_at: string | null;
   is_own: boolean;
   deleted_at: string | null;
-  visibility: JobListingVisibility;
-  is_closed: boolean;
-  closed_reason: JobClosedReason | null;
-  expires_at: string | null;
-  apply_url: string | null;
-  employment_type: string | null;
-  remote_type: JobRemoteType | null;
-  source_display_name: string;
-  attribution: SourceAttribution | null;
 };
 
 /**
@@ -196,7 +166,6 @@ export function toJobDescription(
   row: JobDescriptionRow,
   callerId: string,
 ): JobDescription {
-  const display = getSourceDisplay(row.source);
   return {
     id: row.id,
     title: row.title,
@@ -211,15 +180,6 @@ export function toJobDescription(
     posted_at: row.posted_at,
     is_own: row.submitted_by === callerId,
     deleted_at: row.deleted_at,
-    visibility: row.visibility,
-    is_closed: row.closed_at !== null,
-    closed_reason: row.closed_reason,
-    expires_at: row.expires_at,
-    apply_url: row.apply_url,
-    employment_type: row.employment_type,
-    remote_type: row.remote_type,
-    source_display_name: display.displayName,
-    attribution: display.attribution,
   };
 }
 

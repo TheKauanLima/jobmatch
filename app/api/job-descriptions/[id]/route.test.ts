@@ -4,14 +4,14 @@ const {
   mockRequireSession,
   mockCreateClient,
   mockGetJobDescriptionById,
-  mockUpdateJobListing,
-  mockDeleteJobListing,
+  mockUpdateJobDescription,
+  mockSoftDeleteJobDescription,
 } = vi.hoisted(() => ({
   mockRequireSession: vi.fn(),
   mockCreateClient: vi.fn(),
   mockGetJobDescriptionById: vi.fn(),
-  mockUpdateJobListing: vi.fn(),
-  mockDeleteJobListing: vi.fn(),
+  mockUpdateJobDescription: vi.fn(),
+  mockSoftDeleteJobDescription: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/session", async () => {
@@ -32,13 +32,12 @@ vi.mock("@/lib/supabase/queries/jobDescriptions", async () => {
   return {
     ...actual,
     getJobDescriptionById: mockGetJobDescriptionById,
-    updateJobListing: mockUpdateJobListing,
-    deleteJobListing: mockDeleteJobListing,
+    updateJobDescription: mockUpdateJobDescription,
+    softDeleteJobDescription: mockSoftDeleteJobDescription,
   };
 });
 
 const { GET, PATCH, DELETE } = await import("@/app/api/job-descriptions/[id]/route");
-const { JobListingRpcError } = await import("@/lib/supabase/queries/jobDescriptions");
 const { UnauthorizedError } = await import("@/lib/auth/session");
 
 const fakeUser = { id: "user-1" };
@@ -150,7 +149,7 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
     const res = await PATCH(patchRequest({}), ctx("jd-1"));
     expect(res.status).toBe(400);
     expect(mockGetJobDescriptionById).not.toHaveBeenCalled();
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
+    expect(mockUpdateJobDescription).not.toHaveBeenCalled();
   });
 
   it("returns 404 when the row doesn't exist at all (checked before the ownership gate)", async () => {
@@ -159,7 +158,7 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
 
     const res = await PATCH(patchRequest({ title: "New Title" }), ctx("missing-id"));
     expect(res.status).toBe(404);
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
+    expect(mockUpdateJobDescription).not.toHaveBeenCalled();
   });
 
   // Privacy-boundary check: existence of shared job-description data is
@@ -173,7 +172,7 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
     const res = await PATCH(patchRequest({ title: "Hijacked title" }), ctx("jd-1"));
 
     expect(res.status).toBe(403);
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
+    expect(mockUpdateJobDescription).not.toHaveBeenCalled();
   });
 
   // The app-level check must not simply trust RLS to silently no-op: even
@@ -189,15 +188,13 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
     const res = await PATCH(patchRequest({ title: "Hijacked title" }), ctx("jd-1"));
 
     expect(res.status).toBe(403);
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
+    expect(mockUpdateJobDescription).not.toHaveBeenCalled();
   });
 
-  it("returns 403 if update_job_listing raises not_found_or_not_owner (defense-in-depth — e.g. a race where the row changed between the pre-check and the write)", async () => {
+  it("returns 403 if updateJobDescription itself returns null (defense-in-depth — e.g. a race where the row changed between the pre-check and the write)", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockRejectedValue(
-      new JobListingRpcError("update_job_listing", { code: "P0001", message: "not_found_or_not_owner" }),
-    );
+    mockUpdateJobDescription.mockResolvedValue(null);
 
     const res = await PATCH(patchRequest({ title: "New Title" }), ctx("jd-1"));
     expect(res.status).toBe(403);
@@ -206,34 +203,32 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
   it("updates the caller's own row and returns 200 with the updated shape", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockResolvedValue({ ...ownRow, title: "New Title" });
+    mockUpdateJobDescription.mockResolvedValue({ ...ownRow, title: "New Title" });
 
     const res = await PATCH(patchRequest({ title: "New Title" }), ctx("jd-1"));
     const body = await res.json();
 
     expect(res.status).toBe(200);
     expect(body.job_description.title).toBe("New Title");
-    expect(mockUpdateJobListing).toHaveBeenCalledWith(
+    expect(mockUpdateJobDescription).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ id: "jd-1" }),
+      expect.objectContaining({ id: "jd-1", submittedBy: "user-1" }),
     );
-    // The RPC resolves the caller from auth.uid(); no owner is passed in.
-    expect(mockUpdateJobListing.mock.calls[0][1]).not.toHaveProperty("submittedBy");
   });
 
   // The three-way clearableOptional() distinction, exercised end-to-end
   // through the route (schema -> route -> query-layer patch argument), not
   // just at the schema layer in isolation.
   describe("clearableOptional() three-way distinction (omitted / explicit clear / explicit value)", () => {
-    it("an omitted key leaves the field untouched (undefined reaches updateJobListing's patch, so it's left out of p_patch)", async () => {
+    it("an omitted key leaves the field untouched (undefined reaches updateJobDescription's patch, not written)", async () => {
       mockRequireSession.mockResolvedValue({ user: fakeUser });
       mockGetJobDescriptionById.mockResolvedValue(ownRow);
-      mockUpdateJobListing.mockResolvedValue(ownRow);
+      mockUpdateJobDescription.mockResolvedValue(ownRow);
 
       // location/level/company/source_url are all omitted — only title is present.
       await PATCH(patchRequest({ title: "New Title" }), ctx("jd-1"));
 
-      const patchArg = mockUpdateJobListing.mock.calls[0][1].patch;
+      const patchArg = mockUpdateJobDescription.mock.calls[0][1].patch;
       expect(patchArg.title).toBe("New Title");
       expect(patchArg.company).toBeUndefined();
       expect(patchArg.location).toBeUndefined();
@@ -244,11 +239,11 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
     it("an explicit empty string clears company/location to null", async () => {
       mockRequireSession.mockResolvedValue({ user: fakeUser });
       mockGetJobDescriptionById.mockResolvedValue(ownRow);
-      mockUpdateJobListing.mockResolvedValue({ ...ownRow, company: null, location: null });
+      mockUpdateJobDescription.mockResolvedValue({ ...ownRow, company: null, location: null });
 
       await PATCH(patchRequest({ company: "", location: "   " }), ctx("jd-1"));
 
-      const patchArg = mockUpdateJobListing.mock.calls[0][1].patch;
+      const patchArg = mockUpdateJobDescription.mock.calls[0][1].patch;
       expect(patchArg.company).toBeNull();
       expect(patchArg.location).toBeNull();
     });
@@ -256,22 +251,22 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
     it("an explicit JSON null clears company to null (same as an explicit empty string)", async () => {
       mockRequireSession.mockResolvedValue({ user: fakeUser });
       mockGetJobDescriptionById.mockResolvedValue(ownRow);
-      mockUpdateJobListing.mockResolvedValue({ ...ownRow, company: null });
+      mockUpdateJobDescription.mockResolvedValue({ ...ownRow, company: null });
 
       await PATCH(patchRequest({ company: null }), ctx("jd-1"));
 
-      const patchArg = mockUpdateJobListing.mock.calls[0][1].patch;
+      const patchArg = mockUpdateJobDescription.mock.calls[0][1].patch;
       expect(patchArg.company).toBeNull();
     });
 
     it("an explicit non-empty value updates the field normally", async () => {
       mockRequireSession.mockResolvedValue({ user: fakeUser });
       mockGetJobDescriptionById.mockResolvedValue(ownRow);
-      mockUpdateJobListing.mockResolvedValue({ ...ownRow, company: "New Co" });
+      mockUpdateJobDescription.mockResolvedValue({ ...ownRow, company: "New Co" });
 
       await PATCH(patchRequest({ company: "New Co" }), ctx("jd-1"));
 
-      const patchArg = mockUpdateJobListing.mock.calls[0][1].patch;
+      const patchArg = mockUpdateJobDescription.mock.calls[0][1].patch;
       expect(patchArg.company).toBe("New Co");
     });
 
@@ -281,14 +276,14 @@ describe("PATCH /api/job-descriptions/:id — edit own, per docs/ARCHITECTURE.md
 
       const res = await PATCH(patchRequest({ title: "" }), ctx("jd-1"));
       expect(res.status).toBe(400);
-      expect(mockUpdateJobListing).not.toHaveBeenCalled();
+      expect(mockUpdateJobDescription).not.toHaveBeenCalled();
     });
   });
 
   it("returns 500 (not a crash) when the query layer throws unexpectedly", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockRejectedValue(new Error("db down"));
+    mockUpdateJobDescription.mockRejectedValue(new Error("db down"));
 
     const res = await PATCH(patchRequest({ title: "New Title" }), ctx("jd-1"));
     expect(res.status).toBe(500);
@@ -310,7 +305,7 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
 
     const res = await DELETE(new Request("http://x"), ctx("missing-id"));
     expect(res.status).toBe(404);
-    expect(mockDeleteJobListing).not.toHaveBeenCalled();
+    expect(mockSoftDeleteJobDescription).not.toHaveBeenCalled();
   });
 
   // Privacy-boundary check: a crafted DELETE against another real user's own
@@ -322,7 +317,7 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
 
     expect(res.status).toBe(403);
-    expect(mockDeleteJobListing).not.toHaveBeenCalled();
+    expect(mockSoftDeleteJobDescription).not.toHaveBeenCalled();
   });
 
   // Same "app-level check must not rely on RLS alone" concern as PATCH above:
@@ -336,15 +331,13 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
 
     expect(res.status).toBe(403);
-    expect(mockDeleteJobListing).not.toHaveBeenCalled();
+    expect(mockSoftDeleteJobDescription).not.toHaveBeenCalled();
   });
 
-  it("returns 403 if delete_job_listing raises not_found_or_not_owner (defense-in-depth)", async () => {
+  it("returns 403 if softDeleteJobDescription itself returns false (defense-in-depth)", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockDeleteJobListing.mockRejectedValue(
-      new JobListingRpcError("delete_job_listing", { code: "P0001", message: "not_found_or_not_owner" }),
-    );
+    mockSoftDeleteJobDescription.mockResolvedValue(false);
 
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
     expect(res.status).toBe(403);
@@ -353,12 +346,15 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
   it("soft-deletes the caller's own row and returns 204 with an empty body", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockDeleteJobListing.mockResolvedValue("soft_deleted");
+    mockSoftDeleteJobDescription.mockResolvedValue(true);
 
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
 
     expect(res.status).toBe(204);
-    expect(mockDeleteJobListing).toHaveBeenCalledWith(expect.anything(), "jd-1");
+    expect(mockSoftDeleteJobDescription).toHaveBeenCalledWith(
+      expect.anything(),
+      { id: "jd-1", submittedBy: "user-1" },
+    );
     const text = await res.text();
     expect(text).toBe("");
   });
@@ -369,7 +365,7 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
       ...ownRow,
       deleted_at: "2026-01-01T00:00:00.000Z",
     });
-    mockDeleteJobListing.mockResolvedValue("soft_deleted");
+    mockSoftDeleteJobDescription.mockResolvedValue(true);
 
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
     expect(res.status).toBe(204);
@@ -378,136 +374,8 @@ describe("DELETE /api/job-descriptions/:id — soft-delete own, per docs/ARCHITE
   it("returns 500 (not a crash) when the query layer throws unexpectedly", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockDeleteJobListing.mockRejectedValue(new Error("db down"));
+    mockSoftDeleteJobDescription.mockRejectedValue(new Error("db down"));
 
-    const res = await DELETE(new Request("http://x"), ctx("jd-1"));
-    expect(res.status).toBe(500);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// M1.5 (docs/ARCHITECTURE.md §13.13.4): private listings, visibility, RPC errors
-// ---------------------------------------------------------------------------
-
-/** The caller's own private listing. */
-const ownPrivateRow = { ...ownRow, visibility: "private", owner_user_id: "user-1", expires_at: null };
-
-function rpcError(message: string, code = "P0001") {
-  return new JobListingRpcError("update_job_listing", { code, message });
-}
-
-describe("GET /api/job-descriptions/:id — v2", () => {
-  it("returns 404 for another user's private listing (RLS returns no row)", async () => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockGetJobDescriptionById.mockResolvedValue(null);
-    const res = await GET(new Request("http://x"), ctx("someone-elses-private"));
-    expect(res.status).toBe(404);
-  });
-
-  it("still resolves a closed (expired) listing by id, flagged is_closed", async () => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockGetJobDescriptionById.mockResolvedValue({ ...themuseRow, closed_at: "2026-02-01T00:00:00.000Z", closed_reason: "expired" });
-    const res = await GET(new Request("http://x"), ctx("jd-1"));
-    const body = await res.json();
-    expect(res.status).toBe(200);
-    expect(body.job_description).toMatchObject({ is_closed: true, closed_reason: "expired", source_display_name: "The Muse" });
-  });
-
-  it("returns the caller's own private listing with visibility 'private' and no owner id", async () => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-    mockGetJobDescriptionById.mockResolvedValue(ownPrivateRow);
-    const res = await GET(new Request("http://x"), ctx("jd-1"));
-    const body = await res.json();
-    expect(body.job_description.visibility).toBe("private");
-    expect(body.job_description).not.toHaveProperty("owner_user_id");
-  });
-});
-
-describe("PATCH /api/job-descriptions/:id — v2", () => {
-  beforeEach(() => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-  });
-
-  it("returns 404 (not 403) for another user's private listing: RLS hides it, so the pre-check finds nothing", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(null);
-    const res = await PATCH(patchRequest({ visibility: "shared" }), ctx("someone-elses-private"));
-    expect(res.status).toBe(404);
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
-  });
-
-  it("private -> shared passes visibility through and returns the shared row", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownPrivateRow);
-    mockUpdateJobListing.mockResolvedValue({ ...ownRow, visibility: "shared", owner_user_id: null });
-    const res = await PATCH(patchRequest({ visibility: "shared" }), ctx("jd-1"));
-    expect(res.status).toBe(200);
-    expect(mockUpdateJobListing.mock.calls[0][1].patch).toEqual({
-      title: undefined,
-      company: undefined,
-      description: undefined,
-      sourceUrl: undefined,
-      location: undefined,
-      level: undefined,
-      visibility: "shared",
-    });
-    expect((await res.json()).job_description.visibility).toBe("shared");
-  });
-
-  it("maps visibility_downgrade (shared -> private) to 400 with that code", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockRejectedValue(rpcError("visibility_downgrade"));
-    const res = await PATCH(patchRequest({ visibility: "private" }), ctx("jd-1"));
-    expect(res.status).toBe(400);
-    expect((await res.json()).code).toBe("visibility_downgrade");
-  });
-
-  it("returns 400 for an unknown visibility without calling the RPC", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    const res = await PATCH(patchRequest({ visibility: "public" }), ctx("jd-1"));
-    expect(res.status).toBe(400);
-    expect(mockUpdateJobListing).not.toHaveBeenCalled();
-  });
-
-  it("maps rate_limited:job_listing_update to 429 with kind job_listing_update", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockRejectedValue(rpcError("rate_limited:job_listing_update"));
-    const res = await PATCH(patchRequest({ description: "changed" }), ctx("jd-1"));
-    const body = await res.json();
-    expect(res.status).toBe(429);
-    expect(body).toMatchObject({ code: "rate_limited", kind: "job_listing_update" });
-    expect(typeof body.retry_after).toBe("string");
-  });
-
-  it("maps the RPC's unauthenticated (42501) to 401", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockUpdateJobListing.mockRejectedValue(rpcError("unauthenticated", "42501"));
-    const res = await PATCH(patchRequest({ title: "x" }), ctx("jd-1"));
-    expect(res.status).toBe(401);
-  });
-});
-
-describe("DELETE /api/job-descriptions/:id — v2", () => {
-  beforeEach(() => {
-    mockRequireSession.mockResolvedValue({ user: fakeUser });
-  });
-
-  it("hard-deletes the caller's own private listing and returns 204", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownPrivateRow);
-    mockDeleteJobListing.mockResolvedValue("deleted");
-    const res = await DELETE(new Request("http://x"), ctx("jd-1"));
-    expect(res.status).toBe(204);
-    expect(mockDeleteJobListing).toHaveBeenCalledWith(expect.anything(), "jd-1");
-  });
-
-  it("returns 404 for another user's private listing (hidden by RLS) without calling the RPC", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(null);
-    const res = await DELETE(new Request("http://x"), ctx("someone-elses-private"));
-    expect(res.status).toBe(404);
-    expect(mockDeleteJobListing).not.toHaveBeenCalled();
-  });
-
-  it("returns 500 for an unexpected RPC error", async () => {
-    mockGetJobDescriptionById.mockResolvedValue(ownRow);
-    mockDeleteJobListing.mockRejectedValue(new JobListingRpcError("delete_job_listing", { code: "XX000", message: "boom" }));
     const res = await DELETE(new Request("http://x"), ctx("jd-1"));
     expect(res.status).toBe(500);
   });

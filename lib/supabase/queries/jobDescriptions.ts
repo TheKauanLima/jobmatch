@@ -1,39 +1,22 @@
 /**
- * Postgres access for the `job_descriptions` table (docs/ARCHITECTURE.md §3,
- * §13.3.3, §13.13.4).
+ * Postgres access for the `job_descriptions` table, per
+ * docs/ARCHITECTURE.md §3. Unlike `lib/supabase/queries/resumes.ts`, this
+ * table is *shared* data — `SELECT` is open to any authenticated user (RLS
+ * policy `job_descriptions_select_all_authenticated`), so functions here do
+ * not filter reads by `user_id`. `createJobDescription`, `updateJobDescription`,
+ * and `softDeleteJobDescription` (the latter two added per
+ * docs/ARCHITECTURE.md §10) all scope their writes (`submitted_by`) to the
+ * caller, matching the `job_descriptions_insert_own`/`job_descriptions_update_own`
+ * RLS policies.
  *
- * Reads go through the caller's session client, so RLS
- * (`job_descriptions_select_visible`: shared rows, plus the caller's own
- * private rows) decides what exists. Listing and search add the scope on
- * top: `shared` = active shared listings only, `mine` = everything the
- * caller submitted except hidden duplicates.
- *
- * Writes by users go through the security-definer RPCs from 0009
- * (`create_job_listing`, `update_job_listing`, `delete_job_listing`):
- * direct INSERT/UPDATE/DELETE is revoked from `authenticated`. Their errors
- * are classified into `JobListingRpcError.reason` for the routes.
- *
- * The ingestion helpers at the bottom (`upsertExternalJobDescriptions`,
- * `closeMissingSnapshotListings`, the backfill helpers) take the
- * **service-role** client: they're called only from `lib/jobs/**` and
- * `lib/tasks/**`.
- *
- * Returns full DB rows; route handlers shape them with `types/domain.ts`.
- * Error messages carry the operation plus PostgREST's message, never row
- * content.
+ * Returns full DB rows — route handlers are responsible for shaping rows
+ * into the public response types in `types/domain.ts` before returning
+ * them.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import type {
-  Database,
-  JobDescriptionSource,
-  JobListingVisibility,
-  JobRemoteType,
-  JobSalaryPeriod,
-  JsonObject,
-  RateLimitKind,
-} from "@/types/database";
+import type { Database, JobDescriptionSource } from "@/types/database";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -55,17 +38,14 @@ export const JOB_DESCRIPTIONS_MAX_LIMIT = 100;
 /**
  * Maximum length (characters) accepted for `?q=` on
  * `GET /api/job-descriptions`, per docs/ARCHITECTURE.md §9.1/§9.3. A
- * query-param bound, validated inline in the route like `?limit=`.
+ * query-param bound, same category as `JOB_DESCRIPTIONS_DEFAULT_LIMIT`/
+ * `JOB_DESCRIPTIONS_MAX_LIMIT` above, not a POST-body field — so it lives
+ * here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
+ * `lib/validation/schemas.ts`, matching §3's existing rule that `?level=`/
+ * `?limit=` are validated inline in the route handler, not via a `zod`
+ * schema.
  */
 export const JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH = 200;
-
-/** `?scope=` values for `GET /api/job-descriptions` (§13.13.4). */
-export const JOB_DESCRIPTION_SCOPES = ["shared", "mine"] as const;
-export type JobDescriptionScope = (typeof JOB_DESCRIPTION_SCOPES)[number];
-
-export function isJobDescriptionScope(value: string): value is JobDescriptionScope {
-  return (JOB_DESCRIPTION_SCOPES as readonly string[]).includes(value);
-}
 
 /**
  * A decoded pagination cursor: the `(created_at, id)` position of the last
@@ -75,9 +55,14 @@ export type JobDescriptionCursor = { createdAt: string; id: string };
 
 /**
  * Encodes a `(created_at, id)` pair into the opaque cursor string returned
- * as `next_cursor` (per docs/ARCHITECTURE.md §2). `id` is the tiebreaker
- * for rows with an identical `created_at`. Joining with `_` is safe because
- * neither an ISO-8601 timestamp nor a uuid can contain that character.
+ * as `next_cursor` (per docs/ARCHITECTURE.md §2). `id` is included as a
+ * tiebreaker: ordering by `created_at` alone gives Postgres no guarantee
+ * among rows with an identical `created_at` (plausible with bulk/seeded
+ * inserts, or two inserts landing in the same instant), and a strict
+ * `created_at < cursor` filter would let a tied row that wasn't returned on
+ * an earlier page fall through every later page since it's never `<` the
+ * cursor. Joining with `_` is safe because neither an ISO-8601 timestamp
+ * nor a uuid can contain that character.
  */
 export function encodeJobDescriptionCursor(
   row: Pick<JobDescriptionRow, "created_at" | "id">,
@@ -85,19 +70,23 @@ export function encodeJobDescriptionCursor(
   return `${row.created_at}_${row.id}`;
 }
 
+/**
+ * Decodes a cursor produced by `encodeJobDescriptionCursor`. Returns `null`
+ * for a malformed/unparseable cursor rather than throwing — an invalid
+ * cursor degrades to "no filter" (start from the newest row) instead of a
+ * hard failure, which is an acceptable default for this shared, read-only
+ * listing.
+ */
 // Both halves are validated against a strict shape before being interpolated
-// into a PostgREST `.or()` filter string below: the cursor is a
-// client-supplied query param, so filter-syntax characters must never reach
-// that string unchecked.
+// into a PostgREST `.or()` filter string below — `created_at`/`id` never
+// come from a trusted source (the cursor is a client-supplied query param),
+// so a value containing filter-syntax characters (`,`, `(`, `)`, etc.) must
+// never reach that string unchecked.
 const ISO_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/**
- * Decodes a cursor produced by `encodeJobDescriptionCursor`. Returns `null`
- * for a malformed cursor rather than throwing: it degrades to "first page".
- */
 export function decodeJobDescriptionCursor(
   raw: string,
 ): JobDescriptionCursor | null {
@@ -116,54 +105,34 @@ export function decodeJobDescriptionCursor(
 }
 
 /**
- * Keyset listing ordered `created_at desc, id desc` (`id` makes the order
- * deterministic for tied timestamps, which keeps pagination correct).
- * Fetches `limit + 1` rows so the caller can tell whether another page
- * exists; `hasMore` is true when that extra row was found (it is trimmed).
- *
- * Scopes (§13.13.4):
- * - `shared` (default): `visibility = 'shared'` plus the active predicate
- *   (`deleted_at`, `closed_at`, `duplicate_of` all null). Excludes every
- *   private row, including the caller's own.
- * - `mine`: `submitted_by = callerId`, shared and private, closed and
- *   soft-deleted included; only hidden duplicates are excluded. `callerId`
- *   must be the session user's id (never request input); RLS still applies.
+ * Lists job descriptions across all users (shared data), ordered by
+ * `created_at desc, id desc` — `id` is a secondary sort key purely to make
+ * the ordering deterministic when two rows share a `created_at`, which in
+ * turn makes keyset pagination correct (see `encodeJobDescriptionCursor`).
+ * Cursor pagination: pass the opaque cursor from the previous page's
+ * `next_cursor` to fetch the next page, filtered as
+ * `(created_at, id) < (cursor.createdAt, cursor.id)` in row-value order
+ * (expressed via `.or()` since supabase-js has no direct tuple-comparison
+ * builder method). Fetches `limit + 1` rows so the caller can tell whether
+ * another page exists without a separate count query; `hasMore` is true
+ * when that extra row was found (in which case it is trimmed off `items`).
  */
 export async function listJobDescriptions(
   supabase: Client,
-  params: {
-    limit?: number;
-    cursor?: string | null;
-    level?: string | null;
-    scope?: JobDescriptionScope;
-    callerId?: string;
-  },
+  params: { limit?: number; cursor?: string | null; level?: string | null },
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
     Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
     JOB_DESCRIPTIONS_MAX_LIMIT,
   );
-  const scope = params.scope ?? "shared";
 
   let query = supabase
     .from("job_descriptions")
     .select("*")
-    .is("duplicate_of", null)
+    .is("deleted_at", null)
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(limit + 1);
-
-  if (scope === "mine") {
-    if (!params.callerId) {
-      throw new JobDescriptionQueryError("listJobDescriptions: scope 'mine' requires callerId.");
-    }
-    query = query.eq("submitted_by", params.callerId);
-  } else {
-    query = query
-      .eq("visibility", "shared")
-      .is("deleted_at", null)
-      .is("closed_at", null);
-  }
 
   if (params.level) {
     query = query.eq("level", params.level);
@@ -196,8 +165,11 @@ export async function listJobDescriptions(
 /**
  * Encodes an integer offset into the opaque cursor string returned as
  * `next_cursor` for search-mode (`?q=`) pagination, per
- * docs/ARCHITECTURE.md §9.2. A distinct shape from the keyset cursor so a
- * cursor from one mode fails the other mode's decode.
+ * docs/ARCHITECTURE.md §9.2. Deliberately a distinct string shape from
+ * `encodeJobDescriptionCursor`'s `<created_at>_<id>` so a cursor produced
+ * under one pagination mode simply fails the other mode's decode (see
+ * `decodeJobDescriptionOffsetCursor`) rather than being silently
+ * misinterpreted.
  */
 export function encodeJobDescriptionOffsetCursor(offset: number): string {
   return `offset_${offset}`;
@@ -205,7 +177,13 @@ export function encodeJobDescriptionOffsetCursor(offset: number): string {
 
 const OFFSET_CURSOR_PATTERN = /^offset_(\d+)$/;
 
-/** Decodes an offset cursor; `null` (first page) when malformed. */
+/**
+ * Decodes a cursor produced by `encodeJobDescriptionOffsetCursor`. Returns
+ * `null` for a malformed/unparseable cursor — including a keyset cursor
+ * from `encodeJobDescriptionCursor` replayed in the wrong mode — rather than
+ * throwing, so it degrades to "no cursor" (first page), same "malformed
+ * cursor → first page" behavior `decodeJobDescriptionCursor` already has.
+ */
 export function decodeJobDescriptionOffsetCursor(raw: string): number | null {
   const match = OFFSET_CURSOR_PATTERN.exec(raw);
   if (!match) {
@@ -217,10 +195,18 @@ export function decodeJobDescriptionOffsetCursor(raw: string): number | null {
 }
 
 /**
- * Ranked full-text search via `search_job_descriptions` v2 (0009), with the
- * same scopes as `listJobDescriptions` (the function applies them in SQL;
- * `mine` resolves the caller from `auth.uid()`). Offset pagination
- * (§9.2); fetches `limit + 1` rows for `hasMore`.
+ * Ranked full-text search over job descriptions via the
+ * `search_job_descriptions` Postgres function (added by
+ * `supabase/migrations/0005_job_description_search.sql`), per
+ * docs/ARCHITECTURE.md §9. Structured the same way as `listJobDescriptions`:
+ * fetches `limit + 1` rows so the caller can tell whether another page
+ * exists without a separate count query; `hasMore` is true when that extra
+ * row was found (in which case it is trimmed off `items`).
+ *
+ * Unlike `listJobDescriptions`'s keyset cursor, pagination here is a plain
+ * integer offset (§9.2's deliberate tradeoff — see
+ * `encodeJobDescriptionOffsetCursor`'s docstring and §9.2 for why a
+ * rank-based keyset cursor was rejected, not just deferred).
  */
 export async function searchJobDescriptions(
   supabase: Client,
@@ -229,7 +215,6 @@ export async function searchJobDescriptions(
     limit?: number;
     offset?: number;
     level?: string | null;
-    scope?: JobDescriptionScope;
   },
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
@@ -240,10 +225,15 @@ export async function searchJobDescriptions(
 
   const { data, error } = await supabase.rpc("search_job_descriptions", {
     search_query: params.query,
-    // `||`, not `??`: an empty `?level=` means "no filter" (§2/§9.3), and
-    // `level = ''` would match nothing.
+    // `||`, not `??`: an empty string (from `?level=` present-but-empty)
+    // must also fall back to "no filter," matching `listJobDescriptions`'s
+    // `if (params.level) { ... }` check just above — `??` would only
+    // substitute for `null`/`undefined` and let `""` through, which the
+    // `search_job_descriptions` RPC's `level = level_filter` would then
+    // match against literally (zero rows, since no real row has
+    // `level = ''`) instead of skipping the filter as documented in
+    // docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no filter").
     level_filter: params.level || null,
-    scope: params.scope ?? "shared",
     limit_count: limit + 1,
     offset_count: offset,
   });
@@ -262,10 +252,12 @@ export async function searchJobDescriptions(
 }
 
 /**
- * Fetches a single job description by id through RLS: another user's
- * private listing returns `null`, exactly like a missing row (§13.13.4 →
- * 404). Closed, duplicate and soft-deleted rows still resolve. A malformed
- * (non-uuid) `id` also returns `null` (see `lib/supabase/postgresErrors.ts`).
+ * Fetches a single job description by id. Returns `null` if it doesn't
+ * exist — callers turn that into a `404`. No ownership scoping: this is
+ * shared data readable by any authenticated user, per
+ * docs/ARCHITECTURE.md §1/§2. Also returns `null` (rather than throwing)
+ * for a malformed (non-uuid) `id` — see `lib/supabase/postgresErrors.ts`
+ * for why that collapses into the same `404` instead of a misleading `500`.
  */
 export async function getJobDescriptionById(
   supabase: Client,
@@ -291,9 +283,12 @@ export async function getJobDescriptionById(
 }
 
 /**
- * Batch-fetches job descriptions by id (used by
- * `lib/supabase/queries/matches.ts` to join titles onto matches without an
- * N+1). RLS applies. Returns `[]` for an empty `ids` array.
+ * Batch-fetches job descriptions by id, used by
+ * `lib/supabase/queries/matches.ts` to join `title`/`company` summaries
+ * onto a list of `matches` rows without an N+1 query per match. No
+ * ownership scoping (shared data, same as `getJobDescriptionById`). Returns
+ * `[]` immediately for an empty `ids` array rather than issuing a query with
+ * an empty `.in()` filter.
  */
 export async function getJobDescriptionsByIds(
   supabase: Client,
@@ -318,191 +313,165 @@ export async function getJobDescriptionsByIds(
   return data ?? [];
 }
 
-// ---------------------------------------------------------------------
-// Listing RPCs (session client; 0009)
-// ---------------------------------------------------------------------
-
 /**
- * Why a listing RPC failed, classified from the §13.13 RPC error format:
- * - `rate_limited` — `rate_limited:<kind>` → 429
- * - `not_found` — `not_found_or_not_owner` (a race past the route's
- *   pre-check) → 404/403 per the route
- * - `visibility_downgrade` — shared → private → 400
- * - `validation` — `validation_*` → 400
- * - `unauthenticated` — SQLSTATE 42501 (no `auth.uid()`) → 401
- * - `internal` — anything else → 500
+ * Inserts a new `job_descriptions` row. `submittedBy` is always the caller
+ * (`auth.uid()`), matching the `job_descriptions_insert_own` RLS policy —
+ * never trust a client-supplied owner.
  */
-export type JobListingRpcFailure =
-  | "rate_limited"
-  | "not_found"
-  | "visibility_downgrade"
-  | "validation"
-  | "unauthenticated"
-  | "internal";
-
-export class JobListingRpcError extends Error {
-  readonly reason: JobListingRpcFailure;
-  /** For `rate_limited`: the limit kind from the message. */
-  readonly rateLimitKind: RateLimitKind | null;
-  /** For `validation`: the machine code, e.g. `validation_title`. */
-  readonly validationCode: string | null;
-
-  constructor(
-    operation: string,
-    error: { code?: string | null; message?: string | null },
-  ) {
-    const message = (error.message ?? "").trim();
-    super(`${operation} failed${error.code ? ` (${error.code})` : ""}: ${message.slice(0, 200) || "unknown error"}`);
-    this.name = "JobListingRpcError";
-
-    const rateLimited = /^rate_limited:([a-z_]+)$/.exec(message);
-    const validation = /^validation_[a-z_]+$/.exec(message);
-    this.rateLimitKind = rateLimited ? (rateLimited[1] as RateLimitKind) : null;
-    this.validationCode = validation ? validation[0] : null;
-
-    if (error.code === "42501") this.reason = "unauthenticated";
-    else if (rateLimited) this.reason = "rate_limited";
-    else if (message.startsWith("not_found")) this.reason = "not_found";
-    else if (message === "visibility_downgrade") this.reason = "visibility_downgrade";
-    else if (validation) this.reason = "validation";
-    else this.reason = "internal";
-  }
-}
-
-/** `create_job_listing`: submits as `auth.uid()`; consumes `job_listing_create`. */
-export async function createJobListing(
+export async function createJobDescription(
   supabase: Client,
   params: {
+    submittedBy: string;
     title: string;
     company?: string | null;
     description: string;
     sourceUrl?: string | null;
     location?: string | null;
     level?: string | null;
-    visibility: JobListingVisibility;
   },
 ): Promise<JobDescriptionRow> {
-  const { data, error } = await supabase.rpc("create_job_listing", {
-    p_title: params.title,
-    p_company: params.company ?? null,
-    p_description: params.description,
-    p_source_url: params.sourceUrl ?? null,
-    p_location: params.location ?? null,
-    p_level: params.level ?? null,
-    p_visibility: params.visibility,
-  });
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .insert({
+      submitted_by: params.submittedBy,
+      title: params.title,
+      company: params.company ?? null,
+      description: params.description,
+      source_url: params.sourceUrl ?? null,
+      location: params.location ?? null,
+      level: params.level ?? null,
+    })
+    .select("*")
+    .single();
 
-  if (error) throw new JobListingRpcError("create_job_listing", error);
-  if (!data || typeof data !== "object") {
-    throw new JobListingRpcError("create_job_listing", { message: "no row returned" });
+  if (error || !data) {
+    throw new JobDescriptionQueryError(
+      `Failed to create job description: ${error?.message ?? "no row returned"}`,
+      error,
+    );
   }
+
   return data;
 }
-
-export type JobListingPatch = {
-  title?: string;
-  company?: string | null;
-  description?: string;
-  sourceUrl?: string | null;
-  location?: string | null;
-  level?: string | null;
-  visibility?: JobListingVisibility;
-};
 
 /**
- * `update_job_listing`. Keys absent from `patch` (`undefined`) are left
- * out of `p_patch` and untouched; an explicit `null` clears a nullable
- * column. Consumes `job_listing_update` only when the content changes.
+ * Updates a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.3. Scoped to `.eq("submitted_by", submittedBy)`
+ * in addition to relying on RLS (the `job_descriptions_update_own` policy
+ * added by `supabase/migrations/0006_job_description_mutability.sql`) — same
+ * "checked twice" ownership pattern every other query function in this
+ * codebase follows (see docs/ARCHITECTURE.md §2's intro). Returns the
+ * updated row, or `null` if no row matched (not found, not owned, or a
+ * `source='themuse'` row — the RLS policy's `source = 'user'` check would
+ * also block that last case, but the explicit filter here means the "not
+ * found" `null` path is uniform regardless of which check actually stopped
+ * it). Callers turn `null` into a `403`, not `404`, per §2 — existence of
+ * shared job description data is already public via `GET`.
+ *
+ * `patch`'s nullable fields (`company`/`sourceUrl`/`location`/`level`) are
+ * deliberately checked against `!== undefined`, not truthiness: `undefined`
+ * means "key absent from the PATCH body, leave this column untouched" and
+ * is skipped, while `null` means "clear this column back to null" and is
+ * written through as a real `null`. `lib/validation/schemas.ts`'s
+ * `jobDescriptionUpdateSchema` is what makes `null` reachable here at all
+ * from a JSON request body (it normalizes an explicit empty string to
+ * `null` before this function ever sees it) — this is the fix for a real
+ * gap: without it, a submitter had no way to un-set an already-set optional
+ * field via the API, only to change it to a different non-empty value.
  */
-export async function updateJobListing(
+export async function updateJobDescription(
   supabase: Client,
-  params: { id: string; patch: JobListingPatch },
-): Promise<JobDescriptionRow> {
-  const patch: Record<string, string | null> = {};
-  const { title, company, description, sourceUrl, location, level, visibility } = params.patch;
-  if (title !== undefined) patch.title = title;
-  if (company !== undefined) patch.company = company;
-  if (description !== undefined) patch.description = description;
-  if (sourceUrl !== undefined) patch.source_url = sourceUrl;
-  if (location !== undefined) patch.location = location;
-  if (level !== undefined) patch.level = level;
-  if (visibility !== undefined) patch.visibility = visibility;
+  params: {
+    id: string;
+    submittedBy: string;
+    patch: {
+      title?: string;
+      company?: string | null;
+      description?: string;
+      sourceUrl?: string | null;
+      location?: string | null;
+      level?: string | null;
+    };
+  },
+): Promise<JobDescriptionRow | null> {
+  const update: Database["public"]["Tables"]["job_descriptions"]["Update"] = {};
+  if (params.patch.title !== undefined) update.title = params.patch.title;
+  if (params.patch.company !== undefined) update.company = params.patch.company;
+  if (params.patch.description !== undefined) update.description = params.patch.description;
+  if (params.patch.sourceUrl !== undefined) update.source_url = params.patch.sourceUrl;
+  if (params.patch.location !== undefined) update.location = params.patch.location;
+  if (params.patch.level !== undefined) update.level = params.patch.level;
 
-  const { data, error } = await supabase.rpc("update_job_listing", {
-    p_id: params.id,
-    p_patch: patch,
-  });
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update(update)
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("*")
+    .maybeSingle();
 
-  if (error) throw new JobListingRpcError("update_job_listing", error);
-  if (!data || typeof data !== "object") {
-    throw new JobListingRpcError("update_job_listing", { message: "no row returned" });
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return null;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to update job description ${params.id}: ${error.message}`,
+      error,
+    );
   }
+
   return data;
 }
 
-/** `delete_job_listing`: private → hard delete, shared → soft delete. */
-export async function deleteJobListing(
+/**
+ * Soft-deletes (hides) a job description the caller submitted, per
+ * docs/ARCHITECTURE.md §10.1/§10.3: sets `deleted_at = now()` rather than
+ * deleting the row, so `matches` referencing it (belonging to the submitter
+ * or to any other user) keep resolving exactly as before. Same ownership
+ * filtering as `updateJobDescription`. Returns `true`/`false` for "a row was
+ * updated" — idempotent, deleting an already-deleted row still returns
+ * `true` (it just re-writes the same kind of value), no special-cased
+ * "already deleted" error.
+ */
+export async function softDeleteJobDescription(
   supabase: Client,
-  id: string,
-): Promise<"deleted" | "soft_deleted"> {
-  const { data, error } = await supabase.rpc("delete_job_listing", { p_id: id });
+  params: { id: string; submittedBy: string },
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", params.id)
+    .eq("submitted_by", params.submittedBy)
+    .select("id")
+    .maybeSingle();
 
-  if (error) throw new JobListingRpcError("delete_job_listing", error);
-  if (data !== "deleted" && data !== "soft_deleted") {
-    throw new JobListingRpcError("delete_job_listing", { message: "unexpected result" });
+  if (error) {
+    if (isInvalidInputSyntaxError(error)) {
+      return false;
+    }
+    throw new JobDescriptionQueryError(
+      `Failed to soft-delete job description ${params.id}: ${error.message}`,
+      error,
+    );
   }
-  return data;
+
+  return data !== null;
 }
 
-// ---------------------------------------------------------------------
-// Ingestion (service-role client only)
-// ---------------------------------------------------------------------
-
-/** One externally-sourced listing, mapped and ready to upsert (see `lib/jobs/sync.ts`). */
+/** One externally-sourced listing, mapped and ready to upsert (see `lib/jobs/`). */
 export type ExternalJobDescriptionUpsert = {
   externalId: string;
   title: string;
   company: string | null;
   description: string;
-  sourceUrl: string;
-  applyUrl: string | null;
+  sourceUrl: string | null;
   level: string | null;
   location: string | null;
   postedAt: string | null;
-  sourceBoard: string | null;
-  employmentType: string | null;
-  remoteType: JobRemoteType | null;
-  locationCountry: string | null;
-  salaryMin: number | null;
-  salaryMax: number | null;
-  salaryCurrency: string | null;
-  salaryPeriod: JobSalaryPeriod | null;
-  lastSeenAt: string;
-  expiresAt: string | null;
-  dedupeKey: string | null;
-  sourceMetadata: JsonObject;
 };
 
-export type ExternalUpsertResult = {
-  /** Rows written (inserted + updated + unchanged). */
-  count: number;
-  inserted: number;
-  /** Existing rows whose title/company/description changed. */
-  updated: number;
-  /** Existing rows with the same content (still get last_seen_at etc. bumped). */
-  unchanged: number;
-  /** Rows reopened because they had been closed as removed_at_source (§13.6.5). */
-  reopened: number;
-  /**
-   * Dedupe keys existing rows had before this upsert changed them (e.g. a
-   * retitled listing). Those key groups must be re-resolved too, or their
-   * other rows would keep pointing at a row that no longer shares the key.
-   */
-  previousDedupeKeys: string[];
-};
-
-/** Batch size for `upsertExternalJobDescriptions` (§13.6.6: chunks of 50). */
-export const EXTERNAL_UPSERT_BATCH_SIZE = 50;
+/** Batch size for `upsertExternalJobDescriptions` — keeps individual requests small. */
+const EXTERNAL_UPSERT_BATCH_SIZE = 50;
 
 function chunk<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -512,270 +481,63 @@ function chunk<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
-type ExistingExternalRow = Pick<
-  JobDescriptionRow,
-  "external_id" | "title" | "company" | "description" | "closed_reason" | "dedupe_key"
->;
-
 /**
- * Upserts externally-sourced listings on the `(source, external_id)` unique
- * constraint (0004), in chunks of 50 (§13.6.6). Every row gets the given
- * `lastSeenAt`, so unchanged rows are still marked as seen.
+ * Upserts a batch of externally-sourced job listings (e.g. from The Muse —
+ * see `lib/jobs/themuse.ts`/`lib/jobs/sync.ts`), keyed on the
+ * `(source, external_id)` unique constraint added by
+ * `supabase/migrations/0004_external_job_listings.sql`. Re-running a sync
+ * for a listing already ingested updates that row in place (title/
+ * description/location can change between syncs) rather than creating a
+ * duplicate. `submitted_by` is left `null` — these rows have no Kalify
+ * user as their submitter.
  *
- * Per chunk it first reads the existing rows' content and `closed_reason`
- * so it can (a) report inserted / updated / unchanged counts for
- * `job_source_runs` and (b) reopen rows closed as `removed_at_source`
- * (§13.6.5). The reopen rows are written in a separate request that
- * includes `closed_at`/`closed_reason = null`; every other row is written
- * without those columns, so the upsert never reopens a row closed for any
- * other reason (expired, manual) and never races the expiry sweep.
- * `visibility`, `submitted_by`, `owner_user_id`, `deleted_at` and
- * `duplicate_of` are never written here (new rows get the defaults:
- * shared, no owner); `content_hash` is set by its trigger.
+ * Callers MUST pass a service-role client (`lib/supabase/admin.ts`): there
+ * is no authenticated user in a cron/sync context, so the
+ * `job_descriptions_insert_own` RLS policy (which requires
+ * `submitted_by = auth.uid()`) would reject every row under a normal
+ * session-scoped client.
  *
- * Duplicate external ids within one call are collapsed (last one wins),
- * because Postgres rejects an upsert that touches the same row twice.
- *
- * Callers MUST pass the service-role client (direct writes are revoked from
- * `authenticated`).
+ * Sent in batches of `EXTERNAL_UPSERT_BATCH_SIZE` to keep each Postgrest
+ * request small; a full sync typically upserts a few hundred rows.
  */
 export async function upsertExternalJobDescriptions(
   supabase: Client,
   source: Exclude<JobDescriptionSource, "user">,
   rows: ExternalJobDescriptionUpsert[],
-  options: { signal?: AbortSignal } = {},
-): Promise<ExternalUpsertResult> {
-  const result: ExternalUpsertResult = {
-    count: 0,
-    inserted: 0,
-    updated: 0,
-    unchanged: 0,
-    reopened: 0,
-    previousDedupeKeys: [],
-  };
-  if (rows.length === 0) return result;
+): Promise<{ count: number }> {
+  if (rows.length === 0) {
+    return { count: 0 };
+  }
 
-  const unique = [...new Map(rows.map((row) => [row.externalId, row])).values()];
-
-  for (const batch of chunk(unique, EXTERNAL_UPSERT_BATCH_SIZE)) {
-    let existingQuery = supabase
+  let count = 0;
+  for (const batch of chunk(rows, EXTERNAL_UPSERT_BATCH_SIZE)) {
+    const { error, count: batchCount } = await supabase
       .from("job_descriptions")
-      .select("external_id, title, company, description, closed_reason, dedupe_key")
-      .eq("source", source)
-      .in(
-        "external_id",
-        batch.map((row) => row.externalId),
+      .upsert(
+        batch.map((row) => ({
+          source,
+          external_id: row.externalId,
+          title: row.title,
+          company: row.company,
+          description: row.description,
+          source_url: row.sourceUrl,
+          level: row.level,
+          location: row.location,
+          posted_at: row.postedAt,
+          submitted_by: null,
+        })),
+        { onConflict: "source,external_id", count: "exact" },
       );
-    if (options.signal) existingQuery = existingQuery.abortSignal(options.signal);
-    const { data: existingData, error: existingError } = await existingQuery;
-    if (existingError) {
+
+    if (error) {
       throw new JobDescriptionQueryError(
-        `Failed to read existing external job descriptions: ${existingError.message}`,
-        existingError,
+        `Failed to upsert external job descriptions: ${error.message}`,
+        error,
       );
     }
 
-    const existing = new Map<string, ExistingExternalRow>(
-      ((existingData ?? []) as ExistingExternalRow[])
-        .filter((row) => row.external_id !== null)
-        .map((row) => [row.external_id as string, row]),
-    );
-
-    const normal: Database["public"]["Tables"]["job_descriptions"]["Insert"][] = [];
-    const reopen: Database["public"]["Tables"]["job_descriptions"]["Insert"][] = [];
-
-    for (const row of batch) {
-      const values = toInsertValues(source, row);
-      const prior = existing.get(row.externalId);
-      if (!prior) {
-        result.inserted++;
-      } else if (prior.title === row.title && prior.company === row.company && prior.description === row.description) {
-        result.unchanged++;
-      } else {
-        result.updated++;
-      }
-
-      if (prior?.dedupe_key && prior.dedupe_key !== row.dedupeKey) {
-        result.previousDedupeKeys.push(prior.dedupe_key);
-      }
-
-      if (prior?.closed_reason === "removed_at_source") {
-        reopen.push({ ...values, closed_at: null, closed_reason: null });
-        result.reopened++;
-      } else {
-        normal.push(values);
-      }
-    }
-
-    for (const group of [normal, reopen]) {
-      if (group.length === 0) continue;
-      let upsert = supabase
-        .from("job_descriptions")
-        .upsert(group, { onConflict: "source,external_id" });
-      if (options.signal) upsert = upsert.abortSignal(options.signal);
-      const { error } = await upsert;
-      if (error) {
-        throw new JobDescriptionQueryError(
-          `Failed to upsert external job descriptions: ${error.message}`,
-          error,
-        );
-      }
-    }
-
-    result.count += batch.length;
+    count += batchCount ?? batch.length;
   }
 
-  return result;
-}
-
-function toInsertValues(
-  source: Exclude<JobDescriptionSource, "user">,
-  row: ExternalJobDescriptionUpsert,
-): Database["public"]["Tables"]["job_descriptions"]["Insert"] {
-  // Every row in a request carries the same keys: PostgREST builds one
-  // column list per request.
-  return {
-    source,
-    external_id: row.externalId,
-    submitted_by: null,
-    title: row.title,
-    company: row.company,
-    description: row.description,
-    source_url: row.sourceUrl,
-    apply_url: row.applyUrl,
-    level: row.level,
-    location: row.location,
-    posted_at: row.postedAt,
-    source_board: row.sourceBoard,
-    employment_type: row.employmentType,
-    remote_type: row.remoteType,
-    location_country: row.locationCountry,
-    salary_min: row.salaryMin,
-    salary_max: row.salaryMax,
-    salary_currency: row.salaryCurrency,
-    salary_period: row.salaryPeriod,
-    last_seen_at: row.lastSeenAt,
-    expires_at: row.expiresAt,
-    dedupe_key: row.dedupeKey,
-    source_metadata: row.sourceMetadata,
-  };
-}
-
-/**
- * Snapshot close (§13.6.5): after a COMPLETE, error-free board fetch, close
- * the board's open rows not seen since the run started
- * (`closed_reason = 'removed_at_source'`). Never call it after a partial or
- * failed fetch. Returns the closed rows' dedupe keys (for
- * `resolve_job_duplicates`) and count.
- */
-export async function closeMissingSnapshotListings(
-  supabase: Client,
-  params: {
-    source: Exclude<JobDescriptionSource, "user">;
-    sourceBoard: string;
-    runStartedAt: string;
-    signal?: AbortSignal;
-  },
-): Promise<{ closed: number; dedupeKeys: string[] }> {
-  let query = supabase
-    .from("job_descriptions")
-    .update({ closed_at: new Date().toISOString(), closed_reason: "removed_at_source" })
-    .eq("source", params.source)
-    .eq("source_board", params.sourceBoard)
-    .is("closed_at", null)
-    .lt("last_seen_at", params.runStartedAt)
-    .select("dedupe_key");
-  if (params.signal) query = query.abortSignal(params.signal);
-  const { data, error } = await query;
-
-  if (error) {
-    throw new JobDescriptionQueryError(
-      `Failed to close removed snapshot listings: ${error.message}`,
-      error,
-    );
-  }
-  const rows = (data ?? []) as Pick<JobDescriptionRow, "dedupe_key">[];
-  return {
-    closed: rows.length,
-    dedupeKeys: rows.map((row) => row.dedupe_key).filter((key): key is string => key !== null),
-  };
-}
-
-/** Columns `maintenance.backfill_job_keys` reads. */
-export type JobKeyBackfillRow = Pick<
-  JobDescriptionRow,
-  | "id"
-  | "source"
-  | "title"
-  | "company"
-  | "location"
-  | "posted_at"
-  | "created_at"
-  | "updated_at"
-  | "last_seen_at"
-  | "expires_at"
-  | "dedupe_key"
->;
-
-/**
- * External rows still missing `last_seen_at` or `expires_at` (i.e. ingested
- * before 0009 and not re-synced since), in id order after `afterId`.
- */
-export async function listJobsNeedingKeyBackfill(
-  supabase: Client,
-  params: { afterId: string | null; limit: number; signal?: AbortSignal },
-): Promise<JobKeyBackfillRow[]> {
-  let query = supabase
-    .from("job_descriptions")
-    .select("id, source, title, company, location, posted_at, created_at, updated_at, last_seen_at, expires_at, dedupe_key")
-    .neq("source", "user")
-    .or("last_seen_at.is.null,expires_at.is.null")
-    .order("id", { ascending: true })
-    .limit(params.limit);
-  if (params.afterId) query = query.gt("id", params.afterId);
-  if (params.signal) query = query.abortSignal(params.signal);
-
-  const { data, error } = await query;
-  if (error) {
-    throw new JobDescriptionQueryError(
-      `Failed to list job descriptions for key backfill: ${error.message}`,
-      error,
-    );
-  }
-  return (data ?? []) as JobKeyBackfillRow[];
-}
-
-/**
- * Writes the backfilled keys for one row. Only fills columns that are still
- * null (`.is(..., null)` guards would need one request per column, so the
- * caller passes the existing value through when it is already set).
- */
-export async function updateJobKeys(
-  supabase: Client,
-  params: {
-    id: string;
-    dedupeKey: string | null;
-    lastSeenAt: string;
-    expiresAt: string;
-    signal?: AbortSignal;
-  },
-): Promise<void> {
-  let query = supabase
-    .from("job_descriptions")
-    .update({
-      dedupe_key: params.dedupeKey,
-      last_seen_at: params.lastSeenAt,
-      expires_at: params.expiresAt,
-    })
-    .eq("id", params.id)
-    .neq("source", "user");
-  if (params.signal) query = query.abortSignal(params.signal);
-
-  const { error } = await query;
-  if (error) {
-    throw new JobDescriptionQueryError(
-      `Failed to backfill keys for job description ${params.id}: ${error.message}`,
-      error,
-    );
-  }
+  return { count };
 }

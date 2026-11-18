@@ -1,15 +1,6 @@
 import type { z } from "zod";
 
 import {
-  onSyncSourceDead,
-  runSyncSourceTask,
-  syncSourcePayloadSchema,
-} from "@/lib/tasks/handlers/ingest/syncSource";
-import {
-  backfillJobKeysPayloadSchema,
-  runBackfillJobKeysTask,
-} from "@/lib/tasks/handlers/maintenance/backfillJobKeys";
-import {
   noopPayloadSchema,
   runNoopTask,
 } from "@/lib/tasks/handlers/maintenance/noop";
@@ -47,31 +38,6 @@ export const TASK_REGISTRY = {
     usesAi: false,
     payloadSchema: noopPayloadSchema,
     handler: runNoopTask,
-  }),
-  // §13.6.6. Also enqueued from SQL by enqueue_source_syncs() (0009), which
-  // repeats priority / max attempts / lease; registry.test.ts asserts they
-  // match the migration.
-  "ingest.sync_source": defineTask({
-    class: "background",
-    priority: 10,
-    maxAttempts: 4,
-    leaseSeconds: 270,
-    maxDurationMs: 220_000,
-    usesAi: false,
-    payloadSchema: syncSourcePayloadSchema,
-    handler: runSyncSourceTask,
-    onDead: onSyncSourceDead,
-  }),
-  // One-time backfill after 0009 (§13.3.3).
-  "maintenance.backfill_job_keys": defineTask({
-    class: "background",
-    priority: 5,
-    maxAttempts: 3,
-    leaseSeconds: 270,
-    maxDurationMs: 200_000,
-    usesAi: false,
-    payloadSchema: backfillJobKeysPayloadSchema,
-    handler: runBackfillJobKeysTask,
   }),
 } as const;
 
