@@ -223,8 +223,10 @@ this file at the end of every work session.
    - **Carried to M1.8:** jsdom/Testing Library tests for click-driven behaviour,
      and the Next 16 `middleware.ts` → `proxy.ts` rename.
 8. **M1.5 job ingestion v2: IN PROGRESS, stopped mid-way 2026-11-16 (user shutdown).**
-   - **Where it is:** partial, unreviewed work on branch `wip/m1.5-ingestion` (NOT
-     main): migration 0009, source adapters (`lib/jobs/sources/`, html, normalize,
+   - **Where it is:** partial, unreviewed work on branch `wip/m1.5-ingestion` (commit
+     15e9ab6). It was accidentally committed and pushed to main on 2026-11-16, then
+     taken off main with a revert commit on 2026-11-18. To resume, check out the
+     branch, or revert the revert. Contents: migration 0009, source adapters (`lib/jobs/sources/`, html, normalize,
      studentFilter), generic `sync.ts`, ingest/backfill handlers, routes switched to
      the RPCs, `vercel.json` cron removed, hand-edited `types/database.ts`.
    - **Last step in progress:** the handler tests. Tests/tsc/eslint were NOT run at
@@ -239,7 +241,28 @@ this file at the end of every work session.
      4. Smoke-test 0009 on the live DB in a rolled-back transaction.
      5. Apply with the user's OK.
      6. Merge.
-9. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
+9. **Direction change 2026-11-17: visible-first.** The user wants demoable improvements
+   ahead of backend roadmap work, so the roadmap order is now subordinate to visible
+   payoff.
+10. ~~V1 Resume critique (visible-first)~~ — **DONE 2026-11-18.**
+    - **Design:** §13.20 (architect).
+    - **V1.1 backend:** review → APPROVED WITH NITS, all 10 applied. Race losers are
+      not refunded (budget guard). The same-owner trigger fires only on the ownership
+      columns.
+    - **Migration 0010:** smoke-tested in a rolled-back transaction on the live DB,
+      then **applied** (user approved). It was applied ahead of the parked 0009, per
+      the §13.3.0 exception.
+    - **Live latency/cost:** ~40 s and ~$0.09 per critique (3 synthetic resumes,
+      effort high). The wait copy now says "under a minute".
+    - **V1.2 frontend:** critique card on `/resumes/[id]` (score ring, top 3
+      priorities, 5 dimension cards, line-by-line rewrites with copy, ATS issues,
+      mobile and dark mode). The frontend got no separate reviewer pass (low-risk
+      UI; plain-text rendering is test-enforced).
+    - **`types/database.ts`:** keep the hand edits; check only the 0010 entries
+      against the live schema.
+    - **Not yet verified:** a real end-to-end critique on the deployed site with a
+      real account.
+11. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
    `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
 
 ### User to-dos (not blocking current work)

@@ -8,13 +8,89 @@ backend-dev, **[FE]** frontend-dev, **[QA]** qa-tester, **[RV]** reviewer.
 - **[RV] gate:** reviewer checks the PR against §13 and the §13.15 checklist before the
   milestone counts as done. A blocking finding sends it back to the owner.
 - Migrations are new files only (0007+), applied in the order of §13.3.0. Regenerate
-  `types/database.ts` after each one. Never edit 0001–0006.
+  `types/database.ts` after each one. Never edit 0001–0006. One recorded exception:
+  0010 (V1) is applied before the parked 0009 (§13.3.0 note).
 - Each milestone updates `.env.local.example` and adds tests for its own code. The
   separate [QA] milestones cover cross-cutting and adversarial testing.
 - If a milestone has to deviate from §13, the owner stops and reports back to the
   orchestrator. Architect updates §13 first; the code never silently diverges.
 - 🟢 marks milestones that can start immediately.
 - ⛔ marks milestones blocked on a user decision (§13.19).
+
+---
+
+## Visible-first track (2026-11-17; takes priority over the parked M1.5)
+
+### V1 🟢 Resume critique (visible-first) [BE → FE]
+Implements §13.20 (and pulls forward §13.5.4 (3), §13.5.6 critique rules, §13.13.2
+quote display). Depends on: M1.1, M1.1b, M1.1c, M1.2 (all done). Two passes: V1.1
+backend, then V1.2 frontend.
+
+**V1.1 [BE]**
+1. `supabase/migrations/0010_resume_critiques.sql` exactly per §13.20.2: table,
+   indexes, RLS + grants, same-owner trigger, `request_resume_critique`, and the
+   revokes.
+   - **Smoke test** on the live DB in a rolled-back transaction:
+     - user B can't select A's critique;
+     - the RPC raises `not_found` for B on A's resume;
+     - 5 calls succeed and the 6th raises `rate_limited:resume_report`;
+     - a mismatched `user_id` insert raises;
+     - deleting the resume cascades.
+   - Stop and report. The orchestrator applies the migration with the user's OK, then
+     backend-dev regenerates `types/database.ts` from live.
+2. `lib/claude/tasks/critiqueResume.ts` plus `locateQuoteInSource` (§13.20.3).
+   - Set the config `untrustedInputs` to `['resume_text']`.
+   - Add the `OUTPUT_SCHEMAS` entry and wire snapshot.
+3. `lib/supabase/queries/critiques.ts`, `lib/critique/service.ts`, and
+   `app/api/resumes/[id]/critique/route.ts` (GET + POST, §13.20.4). Add
+   `Critique` + `toCritique` (with derived `priorities`) to `types/domain.ts`.
+4. Live check with a real key on 3 synthetic resumes (one containing `m²`/`™`/`½`).
+   Record the cost from `ai_usage_events` and p50/p95 latency in the PR (input to
+   §13.20.9 Q1).
+
+**V1.1 acceptance:**
+- POST on a fresh resume returns `201` with 5 dimensions in fixed order, 3 priorities,
+  and an overall score equal to the rounded mean.
+- A second POST returns `200` with the same id. It makes no Claude call and no new
+  `rate_limit_events` row (the route test asserts both).
+- Every stored `original_text` is an exact substring of `resumes.extracted_text`.
+  Fixtures with `m²`, `™`, `½`, full-width digits and `ﬁ` round-trip exactly.
+- No stored rewrite contains an unbracketed number that isn't in its original line.
+- Route tests cover:
+  - `401`;
+  - `404 not_found` vs `404 no_critique`;
+  - `422` (no charge);
+  - `429` with `kind: 'resume_report'`;
+  - `503 budget_exhausted` (no charge);
+  - `502` with a refund for `ai_unavailable` and none for `ai_refused`;
+  - the unique-violation race (refund + `200`).
+- Prompt tests: the resume appears only inside `<resume_text>` and is escaped
+  (forged-tag fixture). The system prompt starts with `UNTRUSTED_DATA_RULES`.
+- No resume or response text in logs. `createAdminClient` is used only in the
+  §13.14-listed critique files.
+- tsc, eslint and vitest pass.
+
+**V1.2 [FE]** (after V1.1 is merged and 0010 applied)
+1. `lib/client/critique.ts`: labels, bands, POST response → state/copy mapping
+   (§13.13.9 + `budget_exhausted`), with unit tests.
+2. `components/reports/{CritiqueSection,DimensionScoreCard,LineFeedbackItem,CritiquePriorities}.tsx`
+   (presentational, `critique: Critique` prop) and
+   `components/resumes/RunCritiqueButton.tsx`.
+3. `app/resumes/[id]/page.tsx`: fetch `GET /api/resumes/:id/critique` alongside the
+   existing fetches, and render the card above "File details" per §13.20.6. Add the
+   matching skeleton to `app/resumes/[id]/loading.tsx`.
+
+**V1.2 acceptance:**
+- Reopening the page shows the stored critique with no POST (network check).
+- The pending state shows the 1–2 minute message and the button can't be
+  double-submitted.
+- Every error status/code shows its copy inline.
+- A resume containing `m²` / `™` shows those exact characters in line feedback.
+- `[placeholders]` and "Needs your numbers" are visible. Scores are readable as text,
+  not by color alone.
+- §6 tokens only (no raw colors). Usable at 375 px width. Light and dark themes both
+  checked.
+- No `dangerouslySetInnerHTML`.
 
 ---
 
@@ -352,12 +428,12 @@ the orchestrator.
 ## Phase 2 — Structure
 
 ### M2.1 Skills and role-family taxonomy [BE]
-Implements §13.3.4, §13.7. Depends on: M1.5, for **migration ordering only** (0010
+Implements §13.3.4, §13.7. Depends on: M1.5, for **migration ordering only** (0011
 must apply after 0009). Authoring the JSON data (task 1) can start any time,
 including during Phase 1.
 1. [BE] Author `data/taxonomy/skills.json` (~400 skills, ~1,200 aliases, covering
    non-tech fields too) and `role-families.json` (~35).
-2. [BE] `scripts/taxonomy/build-seed.ts` generates `0011`. Migration `0010_taxonomy.sql`.
+2. [BE] `scripts/taxonomy/build-seed.ts` generates `0012`. Migration `0011_taxonomy.sql`.
 3. [BE] `lib/taxonomy/normalize.ts` and `vocabulary.ts` (prompt rendering, cached).
    Add `GET /api/taxonomy/role-families`.
 
@@ -370,7 +446,7 @@ including during Phase 1.
 ### M2.2 Job requirement extraction (batch + sync) [BE]
 Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.5.4(2),
 13.6.6 (batch/poll/sync), 13.7.3. Depends on: M2.1, M1.5, M1.1, M1.1b.
-1. [BE] Migration `0013_job_requirements.sql`, including the user-listing extraction
+1. [BE] Migration `0014_job_requirements.sql`, including the user-listing extraction
    trigger.
 2. [BE] `lib/claude/tasks/extractJobRequirements.ts` (schema, prompt with
    vocabulary, validate) and `lib/claude/batches.ts`.
@@ -387,7 +463,7 @@ Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.
 4. [BE] Batch item outcomes and refusals (§13.5.3 "Per-item outcome" and "Batch
    refusals", 2026-11-12):
    - Batch requests send no `betas` and no `fallbacks`.
-   - The `claude_batch_items.error_code` check constraint in 0013, and the poll
+   - The `claude_batch_items.error_code` check constraint in 0014, and the poll
      handler's outcome → `error_code` mapping.
    - The `jobs.retry_refused_requirement` kind (§13.4.3 registry row): its no-op
      guards, the ingest-budget snooze, a sync `runExtractJobRequirements`, and
@@ -420,7 +496,7 @@ Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.
 
 ### M2.3 Resume profile extraction [BE]
 Implements §13.3.5, 13.5.4(1), 13.10.3. Depends on: M2.1, M1.2, M1.1.
-1. [BE] Migration `0012_resume_profiles.sql`.
+1. [BE] Migration `0013_resume_profiles.sql`.
 2. [BE] `lib/claude/tasks/extractResumeProfile.ts` with evidence-quote validation.
    Replace `extractResumeProfile`'s `null` in `OUTPUT_SCHEMAS` with its schema and
    add its wire snapshot (§13.5.2 enum decision, item 6: `null` means "not
@@ -436,7 +512,7 @@ Implements §13.3.5, 13.5.4(1), 13.10.3. Depends on: M2.1, M1.2, M1.1.
 
 ### M2.4 Embeddings ⛔ Q1 [BE]
 Implements §13.3.7, 13.8.1, 13.8.2. Depends on: M2.2, M2.3, and the Q1 decision.
-1. [BE] Migration `0014_embeddings.sql`: extension, tables, the HNSW index, the
+1. [BE] Migration `0015_embeddings.sql`: extension, tables, the HNSW index, the
    inactive-listing trigger, and `match_candidates` (service-only, explicit owner
    predicate).
 2. [BE] `lib/embeddings/{provider,voyage,text,usage}.ts`. Handlers `jobs.embed_pending`
@@ -480,7 +556,9 @@ Depends on: M2.1–M2.4.
 ### M3.1 Reports schema and pipeline orchestration [BE]
 Implements §13.3.8, 13.10, 13.13.1 (upload change), 13.13.2 (GET/retry). Depends on:
 M2.3, M2.4.
-1. [BE] Migration `0015_reports.sql`: tables, `matches` v2 columns, the RPCs
+1. [BE] Migration `0016_reports.sql`: tables (`resume_critiques` already exists from
+   0010; only add its `report_id` → `resume_reports` cascade and `profile_id` →
+   `resume_profiles` set-null FKs, §13.20.2), `matches` v2 columns, the RPCs
    `request_resume_report`, `request_fit_check`, `retry_report`, and the refund logic
    hooks.
 2. [BE] `advance.ts` (stage machine and fan-in) and `resume.build_matches`. This
@@ -503,15 +581,14 @@ M2.3, M2.4.
 
 ### M3.2 Detailed critique [BE]
 Implements §13.5.4(3), 13.5.6 (critique rules). Depends on: M3.1.
-1. [BE] `lib/claude/tasks/critiqueResume.ts` (rubric, student guidance,
-   fabrication guard) and the `resume.critique` handler, replacing the stub.
-   Replace `critiqueResume`'s `null` in `OUTPUT_SCHEMAS` with its schema and add its
-   wire snapshot (§13.5.2 enum decision, item 6).
+1. [BE] Extend V1's `lib/claude/tasks/critiqueResume.ts` (§13.20) with the
+   `candidate_profile` input (relevance judged against the target role families),
+   bump it to `critique-v2`, and add `candidate_profile` to `untrustedInputs`. Add
+   the `resume.critique` handler, replacing the stub; it writes `resume_critiques`
+   with `report_id`/`profile_id` set. Update the wire snapshot.
 2. [BE] Map quotes back to the original text, per §13.13.2 "Displaying quoted text".
-   - `semanticValidation.ts#locateQuoteInSource`: NFKC plus invisible-character
-     normalization, keeping an offset map back to the original.
-   - Store `original_text` as the **original-source span**, never Claude's NFKC quote.
-   - Apply the same helper to every quote field: profile evidence (retrofit M2.3 if it
+   - `semanticValidation.ts#locateQuoteInSource` and its use for critique
+     `original_text` ship in V1. Here, apply the same helper to every other quote field: profile evidence (retrofit M2.3 if it
      shipped without it), `evidence_quote`, and fit-check `resume_line` /
      `resume_evidence`.
 
@@ -572,8 +649,8 @@ Implements §13.4.6, 13.13.2, 13.13.9, 13.14 (`/reports/[id]`, `components/repor
 Depends on: M3.1. Sections light up as M3.2–M3.4 land (the API returns null sections
 until then).
 1. [FE] `usePolledResource` hook. The upload form navigates to `/reports/[id]`.
-2. [FE] `ReportProgress`/`StageList`, `CritiqueSection` (dimension cards, line
-   feedback with original vs rewrite, and a "needs your numbers" marker),
+2. [FE] `ReportProgress`/`StageList`, `CritiqueSection` (reuse V1's components
+   from `components/reports/` unchanged; §13.20.5),
    `RoleCard` with jobs (assessed vs "Estimated match" label), retry button,
    error-code copy, and the delayed-budget notice.
 3. [FE] `/resumes/[id]` links to the latest report and offers "Refresh matches".
@@ -593,7 +670,8 @@ Implements §13.13.3, 13.14 (`/matches/[id]`, `components/fitcheck`). Depends on
 M3.6.
 1. [FE] `RunMatchForm`/`MatchFromJobForm` handle 202 and navigate to `/matches/[id]`,
    which shows status, `RequirementTable`, `TailoringSuggestions`, and talking points.
-2. [FE] Remove `AnalyzeResumeButton`/`AnalysisPanel` usage. The report replaces them.
+2. [FE] Remove `AnalyzeResumeButton`/`AnalysisPanel`/`RunCritiqueButton` usage. The
+   report replaces them.
 
 **Acceptance:**
 - No frontend calls to `/analyze` or `/analysis` remain.
@@ -619,6 +697,10 @@ Depends on: M3.7.
 1. [BE] Delete the `/api/resumes/:id/analyze` and `/analysis` routes,
    `lib/claude/prompts/*`, `lib/claude/parse.ts`, and `lib/claude/rateLimit.ts`. Make
    `resume_analyses` read-only by revoking insert in a new migration. Update tests.
+2. [BE] Delete V1's `POST /api/resumes/:id/critique` and `lib/critique/service.ts`
+   (the GET may stay or be replaced by the report). Drop `request_resume_critique` in
+   the same cleanup migration. Remove the critique entries from the §13.14
+   service-role list and the `registerUsageSink` exception.
 
 **Acceptance:**
 - `tsc`, lint, and tests pass.
@@ -631,7 +713,7 @@ Depends on: M3.7.
 ### M4.1 Market statistics [BE]
 Implements §13.3.9, 13.9.1, 13.13.6, 13.8.5 (narration inputs). Depends on: M2.2,
 M3.4.
-1. [BE] Migration `0016_market_stats.sql` with the MVs, the refresh function, and
+1. [BE] Migration `0017_market_stats.sql` with the MVs, the refresh function, and
    `get_role_market_stats`. Add the `market.refresh_stats` handler and schedule it.
 2. [BE] `GET /api/market/roles/:slug`. `resume.narrate_roles` now builds
    `market_snapshot` (level-bucket fallback, `MARKET_MIN_SAMPLE`).
@@ -668,7 +750,7 @@ Implements §13.2.1(2), 13.11.1, 13.13.4. Depends on: M1.5, M3.5.
 ### M4.4 URL import with SSRF protection [BE]
 Implements §13.3.10, 13.11.2, 13.11.3. Depends on: M4.3. Deny-list ⛔ Q5 (default
 per §13.11.2 until answered).
-1. [BE] Migration `0017_listing_imports.sql` and `request_url_import`.
+1. [BE] Migration `0018_listing_imports.sql` and `request_url_import`.
 2. [BE] `lib/net/{ipPolicy,safeFetch,extractListingText}.ts` (new deps listed in
    §13.11.3). Handler `import.fetch_listing` (fetch → extract → requirements →
    create listing → optional fit check).
@@ -705,7 +787,7 @@ Depends on: M4.1–M4.5.
 ### M5.1 Email provider and weekly digest ⛔ Q6 [BE]
 Implements §13.3.11 (prefs/digest_runs), 13.12.1, 13.13.7 (notifications/unsubscribe).
 Depends on: M3.3 and the Q6 decision.
-1. [BE] Migration `0018_digests_and_revisions.sql` (the digest parts and the weekly
+1. [BE] Migration `0019_digests_and_revisions.sql` (the digest parts and the weekly
    cron).
 2. [BE] `lib/email/{provider,resend}.ts` and the template. Handlers `digest.plan` and
    `digest.send_user` (idempotency key, record before send).
@@ -720,7 +802,7 @@ Depends on: M3.3 and the Q6 decision.
 
 ### M5.2 Resume revisions and comparison [BE]
 Implements §13.3.11 (`previous_resume_id`), 13.12.2, 13.13.2 (compare). Depends on:
-M3.2, M3.4. The migration part shares 0018 with M5.1; if M5.1 hasn't landed, put it
+M3.2, M3.4. The migration part shares 0019 with M5.1; if M5.1 hasn't landed, put it
 in its own next-numbered migration.
 1. [BE] `previous_resume_id` and its trigger. Upload accepts the field. Add
    `GET /api/reports/compare`.
@@ -746,6 +828,7 @@ deletion completeness including the new tables.
 ## One-line milestone index
 | ID | Title | Owner | Depends on | Start now |
 |---|---|---|---|---|
+| V1 | Resume critique, visible-first (sync route, 0010 applied before 0009) | BE → FE | M1.1, M1.1b, M1.1c, M1.2 | 🟢 |
 | M1.1 | Claude layer v2 foundation (structured outputs, Opus 5.5, delete repair/retry) | BE | — | 🟢 |
 | M1.1b | SDK 1.8.0 upgrade + contract check + enum probe + `buildOutputFormat` seam | BE | M1.1; before M2.2/M2.3 | |
 | M1.1c | Disable SDK OpenTelemetry on the Claude client + content-mode guard | BE | M1.1b; before M2.3 | |

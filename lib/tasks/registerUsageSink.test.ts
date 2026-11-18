@@ -117,6 +117,7 @@ describe("registerUsageSink", () => {
   it.each([
     "app/api/worker/tick/route.ts",
     "app/api/resumes/[id]/analyze/route.ts",
+    "app/api/resumes/[id]/critique/route.ts",
     "app/api/matches/route.ts",
   ])("%s imports the registration module", (file) => {
     const source = readFileSync(join(process.cwd(), file), "utf8");

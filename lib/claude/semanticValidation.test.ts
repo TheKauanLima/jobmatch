@@ -2,13 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import { ClaudeInvalidOutputError } from "@/lib/claude/errors";
 import { escapeUntrusted } from "@/lib/claude/promptEscaping";
+import { NFKC_QUOTES, ORIGINAL_SPANS, UNICODE_RESUME } from "@/tests/fixtures/resumes/critique";
 import {
   assertHandlesExact,
   assertIntInRange,
   assertNonEmptyString,
   cleanStringList,
+  createQuoteLocator,
   createQuoteMatcher,
   fabricatedNumbers,
+  locateQuoteInSource,
+  numbersIntroduced,
   normalizeForQuoteMatch,
   quoteAppearsIn,
   slugsInVocabulary,
@@ -184,5 +188,131 @@ describe("scalar asserts and list cleaning", () => {
 
   it("cleanStringList trims, drops empties and counts drops", () => {
     expect(cleanStringList([" a ", "", "  ", "b"])).toEqual({ kept: ["a", "b"], dropped: 2 });
+  });
+});
+
+describe("locateQuoteInSource (§13.13.2 quote display)", () => {
+  const slice = (quote: string, source: string) => {
+    const span = locateQuoteInSource(quote, source);
+    return span === null ? null : source.slice(span.start, span.end);
+  };
+
+  it.each(Object.keys(NFKC_QUOTES) as Array<keyof typeof NFKC_QUOTES>)(
+    "maps the NFKC quote %s back to the user's exact characters",
+    (key) => {
+      expect(slice(NFKC_QUOTES[key], UNICODE_RESUME)).toBe(ORIGINAL_SPANS[key]);
+    },
+  );
+
+  it("round-trips ², ™, ½, full-width digits and ligatures (the span is an exact substring)", () => {
+    const source = "Area 40 m² • Brand™ • ½ scale • ３５ runs • ﬁnal ﬂow";
+    expect(slice("40 m2", source)).toBe("40 m²");
+    expect(slice("BrandTM", source)).toBe("Brand™");
+    expect(slice("1⁄2 scale", source)).toBe("½ scale");
+    expect(slice("35 runs", source)).toBe("３５ runs");
+    expect(slice("final flow", source)).toBe("ﬁnal ﬂow");
+  });
+
+  it("maps across stripped invisible characters (zero-width, soft hyphen, BOM)", () => {
+    const source = "Led​ a team of­ four﻿ engineers";
+    expect(slice("led a team of four engineers", source)).toBe(source);
+    expect(slice("team of four", source)).toBe("team of­ four");
+  });
+
+  it("is case-, quote-, dash- and whitespace-insensitive, returning the original span", () => {
+    const source = "Built   “Smart”\tdashboards — fast";
+    expect(slice('built "smart" dashboards - fast', source)).toBe(source);
+  });
+
+  it("never includes the leading bullet or surrounding whitespace", () => {
+    const source = "EXPERIENCE\n  •  Shipped the mobile app\n";
+    expect(slice("Shipped the mobile app", source)).toBe("Shipped the mobile app");
+  });
+
+  it("matches across a line break, mapping both lines' characters", () => {
+    const source = "Designed a sensor\n- for airflow";
+    expect(slice("designed a sensor for airflow", source)).toBe(source);
+  });
+
+  it("handles CRLF line endings", () => {
+    const source = "Line one\r\n• Line two here";
+    expect(slice("line one line two", source)).toBe("Line one\r\n• Line two");
+  });
+
+  it("keeps an expanded ligature whole when the quote starts inside it", () => {
+    // U+FB01 -> "fi": a quote starting at "i" still maps to the whole ligature.
+    expect(slice("inal", "ﬁnal")).toBe("ﬁnal");
+  });
+
+  it("handles astral characters and decomposed combining marks", () => {
+    expect(slice("café \u{1D401}old", "Café \u{1D401}old résumé")).toBe("Café \u{1D401}old");
+    // NFKC folds the math bold B to "b" on both sides.
+    expect(slice("bold résumé", "Café \u{1D401}old résumé")).toBe(
+      "\u{1D401}old résumé",
+    );
+  });
+
+  it("returns the first occurrence", () => {
+    expect(locateQuoteInSource("abc", "xx abc yy abc")).toEqual({ start: 3, end: 6 });
+  });
+
+  it("returns null when the quote doesn't appear", () => {
+    expect(locateQuoteInSource("led a team of five", "Led a team of four")).toBeNull();
+  });
+
+  it("returns null for empty, whitespace-only and invisible-only quotes", () => {
+    expect(locateQuoteInSource("", "abc")).toBeNull();
+    expect(locateQuoteInSource("  \n ", "abc")).toBeNull();
+    expect(locateQuoteInSource("​‍", "abc")).toBeNull();
+  });
+
+  it("agrees with quoteAppearsIn on the fixtures", () => {
+    for (const quote of [...Object.values(NFKC_QUOTES), "not in the resume at all"]) {
+      expect(locateQuoteInSource(quote, UNICODE_RESUME) !== null).toBe(quoteAppearsIn(quote, UNICODE_RESUME));
+    }
+  });
+
+  it("finds a quote copied from the escaped prompt text", () => {
+    const source = "Wrote a <resume_text> parser in Rust™";
+    expect(slice(escapeUntrusted(source), source)).toBe(source);
+  });
+
+  it("createQuoteLocator gives the same spans as locateQuoteInSource", () => {
+    const locate = createQuoteLocator(UNICODE_RESUME);
+    for (const quote of Object.values(NFKC_QUOTES)) {
+      expect(locate(quote)).toEqual(locateQuoteInSource(quote, UNICODE_RESUME));
+    }
+  });
+});
+
+describe("numbersIntroduced (critique fabrication guard, §13.5.6)", () => {
+  it("is empty when every number comes from the original line", () => {
+    expect(numbersIntroduced("Audited 12 buildings (40,000 m2)", "Helped audit 12 buildings, 40,000 m² total")).toEqual([]);
+  });
+
+  it("flags a number that isn't in the original", () => {
+    expect(numbersIntroduced("Cut costs by 30%", "Helped cut costs")).toEqual(["30"]);
+  });
+
+  it("ignores numbers inside [placeholders], including full-width brackets", () => {
+    expect(numbersIntroduced("Cut costs by [30%] for [5 clients]", "Helped cut costs")).toEqual([]);
+    expect(numbersIntroduced("Cut costs by ［30%］", "Helped cut costs")).toEqual([]);
+  });
+
+  it("an unclosed bracket protects nothing", () => {
+    expect(numbersIntroduced("Cut costs by [30%", "Helped cut costs")).toEqual(["30"]);
+  });
+
+  it("compares whole tokens, so 3 is new next to an original 30", () => {
+    expect(numbersIntroduced("Led 3 teams", "Led 30 people")).toEqual(["3"]);
+  });
+
+  it("treats thousands separators as equal and folds full-width digits", () => {
+    expect(numbersIntroduced("Served 1200 users", "Served 1,200 users")).toEqual([]);
+    expect(numbersIntroduced("Ran 35 tests", "Ran ３５ tests")).toEqual([]);
+  });
+
+  it("decimal numbers must match exactly", () => {
+    expect(numbersIntroduced("GPA 3.9", "GPA 3.6")).toEqual(["3.9"]);
   });
 });

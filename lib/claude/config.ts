@@ -20,8 +20,12 @@ import type { ReservedTagWord } from "@/lib/claude/promptEscaping";
 export const CLAUDE_DEFAULT_MODEL = "claude-opus-5-5";
 
 /**
- * Deadline budget for the synchronous v1 routes (POST /api/resumes/:id/analyze,
- * POST /api/matches), which export `maxDuration = 300`.
+ * Deadline budget for the synchronous routes (POST /api/resumes/:id/analyze,
+ * POST /api/matches, and the V1 POST /api/resumes/:id/critique, §13.20.4),
+ * which export `maxDuration = 300`. The critique route uses the same 270 s
+ * deadline, but its per-attempt timeout is the critiqueResume task's own
+ * 190 s (see CLAUDE_TASKS), so a slow first attempt leaves no room for the
+ * invalid-output retry and ends as a refunded 502.
  *
  * - `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s): the route creates
  *   `AbortSignal.timeout(...)` with it at the very start of the handler and
@@ -41,6 +45,13 @@ export const CLAUDE_DEFAULT_MODEL = "claude-opus-5-5";
  */
 export const SYNC_ROUTE_CLAUDE_DEADLINE_MS = 270_000;
 export const SYNC_ROUTE_ATTEMPT_TIMEOUT_MS = 120_000;
+
+/**
+ * Cost ceiling for resume text sent to Claude (§13.5.7): prompts carry at most
+ * this many characters of the resume. Semantic validation still matches
+ * quotes against the full stored text.
+ */
+export const RESUME_PROMPT_MAX_CHARS = 30_000;
 
 export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -85,8 +96,10 @@ export const CLAUDE_TASKS = {
     maxTokens: 20_000,
     timeoutMs: 190_000,
     mode: "sync",
+    // V1 standalone critique (§13.20.3): no profile input. M3.2 adds
+    // "candidate_profile" together with the critique-v2 prompt.
     promptVersion: "critique-v1",
-    untrustedInputs: ["resume_text", "candidate_profile"],
+    untrustedInputs: ["resume_text"],
   },
   extractJobRequirements: {
     // §13.19 Q2: candidate for a cheaper model after the M2.5 eval.

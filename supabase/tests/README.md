@@ -8,7 +8,7 @@ against a **local** Supabase stack in Docker, never against the live project.
 | pgTAP tests (single session, each file in one rolled-back transaction) | `supabase/tests/database/*.test.sql` | `npx supabase test db` |
 | Multi-connection concurrency checks (class cap, SKIP LOCKED, atomic rate-limit consume) | `scripts/db-concurrency-check.mjs` | `node scripts/db-concurrency-check.mjs` |
 
-Current coverage (migrations 0007/0008, milestone M1.3):
+Current coverage (migrations 0007/0008, milestone M1.3; 0010, V1.1):
 
 - `001_claim_tasks` covers `claim_tasks`: validation, class caps (live leases
   of every kind count), ordering, `run_after`, unknown kinds, lease-expiry
@@ -32,6 +32,18 @@ Current coverage (migrations 0007/0008, milestone M1.3):
     executable even by `service_role`;
   - `search_path` / `SECURITY DEFINER` hardening;
   - RLS and table privileges on the new tables.
+- `007_resume_critiques` (migration 0010, V1.1; **not yet run on a local
+  Supabase stack**, validated on PGlite with a Supabase role/auth shim)
+  covers:
+  - RLS on, the single owner-select policy, table privileges, check
+    constraints and the `resume_critiques_standalone_key` cache key;
+  - the same-owner trigger (`validation_owner_mismatch` on insert and update);
+  - owner-only reads (B can't see A's critiques) and no direct writes;
+  - `request_resume_critique`: privileges and hardening, `unauthenticated`,
+    `not_found` for another user's resume, 5 charges then
+    `rate_limited:resume_report`, charging only `auth.uid()`, `ref_id` = the
+    returned id;
+  - cascade on resume and user delete.
 
 ## One-time setup (Windows)
 

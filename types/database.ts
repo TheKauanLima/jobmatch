@@ -53,6 +53,14 @@
  * `search_vector`), `source_metadata` / `config` typed as JSON objects,
  * `search_job_descriptions.scope` as `'shared' | 'mine'`, and
  * `delete_job_listing` returning `'deleted' | 'soft_deleted'`.
+ *
+ * Updated by hand for supabase/migrations/0010_resume_critiques.sql (V1,
+ * §13.20.2), written before it was applied: resume_critiques and the
+ * request_resume_critique RPC. 0010 is applied to the live DB ahead of the
+ * parked 0009 (§13.3.0); after it is applied this file is regenerated from
+ * the live project (which then has 0010 but not 0009) and the 0009 entries
+ * above are re-added by the M1.5 branch when 0009 lands. No new narrowings
+ * for 0010: its jsonb columns stay `Json` (shaped by types/domain.ts#toCritique).
  */
 
 export type Json =
@@ -444,6 +452,58 @@ export interface Database {
         Relationships: [];
       };
       /**
+       * Resume critiques (0010, §13.3.8, §13.20.2). Owner-select only for
+       * `authenticated`; inserted only by the service role
+       * (lib/supabase/queries/critiques.ts#insertResumeCritique). A
+       * BEFORE INSERT OR UPDATE OF resume_id, user_id trigger raises `validation_owner_mismatch`
+       * unless the resume belongs to `user_id`. `report_id` / `profile_id`
+       * get their FKs in 0016.
+       */
+      resume_critiques: {
+        Row: {
+          id: string;
+          report_id: string | null;
+          resume_id: string;
+          user_id: string;
+          profile_id: string | null;
+          prompt_version: string;
+          model: string;
+          overall_score: number;
+          summary: string;
+          student_context: Json;
+          dimension_scores: Json;
+          line_feedback: Json;
+          section_feedback: Json;
+          ats_issues: Json;
+          missing_sections: Json;
+          dropped_items: number;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          report_id?: string | null;
+          resume_id: string;
+          user_id: string;
+          profile_id?: string | null;
+          prompt_version: string;
+          model: string;
+          overall_score: number;
+          summary: string;
+          student_context: Json;
+          dimension_scores: Json;
+          line_feedback?: Json;
+          section_feedback?: Json;
+          ats_issues?: Json;
+          missing_sections?: Json;
+          dropped_items?: number;
+          created_at?: string;
+        };
+        Update: Partial<
+          Database["public"]["Tables"]["resume_critiques"]["Insert"]
+        >;
+        Relationships: [];
+      };
+      /**
        * External job sources and sync settings (0009, §13.3.3). Server-only:
        * RLS on, no policies; only service_role reads or writes it.
        */
@@ -774,6 +834,17 @@ export interface Database {
       consume_account_reauth_attempt: {
         Args: Record<string, never>;
         Returns: boolean;
+      };
+      // --- 0010: user RPC (authenticated) -------------------------------
+      /**
+       * Charges one `resume_report` unit to the caller for a critique of
+       * the caller's own resume and returns the future critique id (also
+       * the ledger `ref_id`). Raises `unauthenticated` (42501),
+       * `not_found`, or `rate_limited:resume_report` (P0001). §13.20.2.
+       */
+      request_resume_critique: {
+        Args: { p_resume_id: string };
+        Returns: string;
       };
     };
     Enums: Record<string, never>;

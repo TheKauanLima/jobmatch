@@ -86,6 +86,145 @@ export function createQuoteMatcher(source: string): (quote: string) => boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Locating a quote in the original source (§13.13.2 "Displaying quoted text")
+// ---------------------------------------------------------------------------
+
+/** A half-open span `[start, end)` of UTF-16 offsets into the original source. */
+export type SourceSpan = { start: number; end: number };
+
+const GRAPHEME_SEGMENTER = new Intl.Segmenter("und", { granularity: "grapheme" });
+const WHITE_SPACE_CHAR = new RegExp(`^${WS}$`, "u");
+const LINE_BREAK_CHAR = /^[\r\n]$/;
+// The LINE_START_BULLETS character set, applied one character at a time.
+const LINE_START_BULLET_CHAR = new RegExp(`^[${WS}•▪◦·*-]$`, "u");
+
+/**
+ * `normalizeForQuoteMatch` with an offset map: the normalized text, plus for
+ * each UTF-16 unit of it the `[start, end)` span of the original text it
+ * came from.
+ *
+ * The steps are the same, in the same order (NFKC, invisible-character
+ * stripping, lowercase, quote and dash folding, per-line bullet stripping,
+ * line joining, whitespace collapsing, trimming). The first five are applied
+ * per grapheme cluster rather than to the whole string, so every output
+ * character maps back to exactly one cluster of the original. A cluster that
+ * expands (`ﬁ` -> `fi`, `½` -> `1⁄2`) maps all of its output characters to
+ * the whole cluster, and a cluster that vanishes (an invisible character)
+ * maps to nothing.
+ *
+ * Per-cluster NFKC equals whole-string NFKC except for compositions that
+ * cross a cluster boundary, which Unicode practically rules out (combining
+ * marks and Hangul vowel/trailing jamo extend a cluster). Lowercasing per
+ * cluster loses only context rules like the Greek final sigma. Neither
+ * matters, because `locateQuoteInSource` normalizes the quote with this same
+ * function, so both sides are always folded identically.
+ */
+function normalizeWithOffsets(source: string): { text: string; starts: number[]; ends: number[] } {
+  type Unit = { ch: string; start: number; end: number };
+
+  // Steps 1-5, per grapheme cluster.
+  const folded: Unit[] = [];
+  for (const { segment, index } of GRAPHEME_SEGMENTER.segment(source)) {
+    const out = stripInvisibleChars(segment.normalize("NFKC"))
+      .toLowerCase()
+      .replace(SINGLE_QUOTES, "'")
+      .replace(DOUBLE_QUOTES, '"')
+      .replace(DASHES, "-");
+    for (const ch of out) {
+      folded.push({ ch, start: index, end: index + segment.length });
+    }
+  }
+
+  // Steps 6-7: strip bullets/whitespace at each line start, turn line breaks
+  // into spaces (`split(/\r\n|\r|\n/).join(" ")`; a CRLF pair becomes two
+  // spaces here, which the collapse below merges into one).
+  const lined: Unit[] = [];
+  let atLineStart = true;
+  for (const unit of folded) {
+    if (LINE_BREAK_CHAR.test(unit.ch)) {
+      lined.push({ ...unit, ch: " " });
+      atLineStart = true;
+      continue;
+    }
+    if (atLineStart && LINE_START_BULLET_CHAR.test(unit.ch)) {
+      continue;
+    }
+    atLineStart = false;
+    lined.push(unit);
+  }
+
+  // Step 8: collapse whitespace runs to one space (spanning the whole run).
+  const collapsed: Unit[] = [];
+  for (const unit of lined) {
+    if (WHITE_SPACE_CHAR.test(unit.ch)) {
+      const prev = collapsed[collapsed.length - 1];
+      if (prev && prev.ch === " ") {
+        prev.end = unit.end;
+      } else {
+        collapsed.push({ ch: " ", start: unit.start, end: unit.end });
+      }
+    } else {
+      collapsed.push(unit);
+    }
+  }
+
+  // Step 9: trim.
+  let first = 0;
+  let last = collapsed.length;
+  while (first < last && collapsed[first].ch === " ") first += 1;
+  while (last > first && collapsed[last - 1].ch === " ") last -= 1;
+
+  let text = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (const unit of collapsed.slice(first, last)) {
+    text += unit.ch;
+    // An astral character is two UTF-16 units; both map to the same span.
+    for (let i = 0; i < unit.ch.length; i += 1) {
+      starts.push(unit.start);
+      ends.push(unit.end);
+    }
+  }
+  return { text, starts, ends };
+}
+
+/**
+ * Finds `quote` in `source` the way `quoteAppearsIn` does (both sides
+ * normalized), and returns the span of the ORIGINAL `source` that matched,
+ * or `null` if the quote doesn't appear or is empty after normalization.
+ *
+ * Callers store `source.slice(start, end)`: the user's exact characters
+ * (`m²`, `™`, `½`, full-width digits, ligatures), never the NFKC quote Claude
+ * returned (§13.13.2). The span starts at the first matched character and
+ * ends after the last one, so it never includes a leading bullet or
+ * surrounding whitespace. The first occurrence wins.
+ *
+ * Match against the full stored source, not a truncated prompt slice.
+ */
+export function locateQuoteInSource(quote: string, source: string): SourceSpan | null {
+  return createQuoteLocator(source)(quote);
+}
+
+/**
+ * Same as `locateQuoteInSource`, but normalizes `source` once, for
+ * validators that locate many quotes in one resume.
+ */
+export function createQuoteLocator(source: string): (quote: string) => SourceSpan | null {
+  const normalized = normalizeWithOffsets(source);
+  return (quote: string) => {
+    const q = normalizeWithOffsets(quote).text;
+    if (q.length === 0) {
+      return null;
+    }
+    const at = normalized.text.indexOf(q);
+    if (at === -1) {
+      return null;
+    }
+    return { start: normalized.starts[at], end: normalized.ends[at + q.length - 1] };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Handles, slugs, numbers
 // ---------------------------------------------------------------------------
 
@@ -164,6 +303,38 @@ export function fabricatedNumbers(text: string): string[] {
     }
   }
   return found;
+}
+
+/** A run of decimal digits, with internal `,` / `.` separators (`1,200`, `3.5`). */
+const NUMBER_TOKEN = new RegExp("\\p{Nd}+(?:[.,]\\p{Nd}+)*", "gu");
+/** A `[...]` placeholder (no nesting). An unclosed `[` protects nothing. */
+const BRACKETED_PLACEHOLDER = /\[[^[\]]*\]/g;
+
+function numberTokens(text: string): string[] {
+  return [...text.matchAll(NUMBER_TOKEN)].map((m) => m[0]);
+}
+
+/**
+ * Numbers in `rewrite` that are not in `original` and not inside a
+ * `[...]` placeholder: the §13.5.6 critique fabrication guard ("a rewrite may
+ * only use facts in the original line"). An empty array means the rewrite
+ * adds no number.
+ *
+ * Both sides are NFKC-normalized first, so full-width digits and `m²` / `½`
+ * compare equal to what Claude saw (`m2`, `1⁄2`). Thousands separators are
+ * ignored when comparing (`1,200` = `1200`). Comparison is per whole token,
+ * so `3` is "new" next to an original `30`.
+ *
+ * Limitation: only digit tokens are checked. Spelled-out numbers ("three",
+ * "a dozen", "doubled") and number-like words are not detected; the prompt's
+ * no-fabrication rule is the only guard against those.
+ */
+export function numbersIntroduced(rewrite: string, original: string): string[] {
+  const canonical = (token: string) => token.replace(/,/g, "");
+  const allowed = new Set(numberTokens(original.normalize("NFKC")).map(canonical));
+  return numberTokens(rewrite.normalize("NFKC").replace(BRACKETED_PLACEHOLDER, " ")).filter(
+    (token) => !allowed.has(canonical(token)),
+  );
 }
 
 // ---------------------------------------------------------------------------

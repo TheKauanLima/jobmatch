@@ -8,6 +8,7 @@ import { buildStructuredParams } from "@/lib/claude/client";
 import { CLAUDE_TASKS, type ClaudeTaskName } from "@/lib/claude/config";
 import { buildOutputFormat } from "@/lib/claude/outputFormat";
 import { matchResultSchema, resumeAnalysisResultSchema } from "@/lib/claude/parse";
+import { CritiqueResumeSchema } from "@/lib/claude/tasks/critiqueResume";
 import { importsOf, isTestFile, REPO_ROOT, repoSourceFiles, stripComments } from "@/tests/helpers/sdkImports";
 
 /**
@@ -33,7 +34,7 @@ import { importsOf, isTestFile, REPO_ROOT, repoSourceFiles, stripComments } from
  */
 const OUTPUT_SCHEMAS: Record<ClaudeTaskName, z.ZodType | null> = {
   extractResumeProfile: null, // M2.3
-  critiqueResume: null, // M3.x
+  critiqueResume: CritiqueResumeSchema, // V1 (§13.20.3)
   extractJobRequirements: null, // M2.2
   rerankJobsForRole: null, // M3.x
   narrateRoleFit: null, // M3.x
@@ -206,12 +207,12 @@ describe("OUTPUT_SCHEMAS registry", () => {
     const implemented = (Object.keys(CLAUDE_TASKS) as ClaudeTaskName[]).filter((task) =>
       sources.some(({ file, code }) => file === `lib/claude/tasks/${task}.ts` || names(task, code)),
     );
-    expect(implemented).toEqual(expect.arrayContaining(["analyzeResume", "matchResumeToJob"]));
+    expect(implemented).toEqual(expect.arrayContaining(["analyzeResume", "critiqueResume", "matchResumeToJob"]));
     expect(implemented.filter((task) => OUTPUT_SCHEMAS[task] === null)).toEqual([]);
   });
 
   it("registers the schemas of the tasks implemented so far", () => {
-    expect(registered.map(([task]) => task).sort()).toEqual(["analyzeResume", "matchResumeToJob"]);
+    expect(registered.map(([task]) => task).sort()).toEqual(["analyzeResume", "critiqueResume", "matchResumeToJob"]);
   });
 });
 

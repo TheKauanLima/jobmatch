@@ -2123,15 +2123,25 @@ conventions are new:
 | 0007 | `0007_background_infra.sql` | M1.2 | `private` schema, `background_tasks`, `ai_usage_events`, `rate_limit_events`, `private.rate_limits`, task functions, `private.consume_rate_limit` |
 | 0008 | `0008_worker_schedule.sql` | M1.2 | `pg_cron`, `pg_net`; worker-tick + housekeeping cron jobs reading Vault secrets |
 | 0009 | `0009_job_ingestion_v2.sql` | M1.5 | `job_descriptions` v2 columns, visibility/owner, column grants, RLS rewrite, guard trigger, listing RPCs, `job_sources`, `job_source_boards`, `job_source_runs`, `search_job_descriptions` v2, expiry/dedupe functions, ingest cron |
-| 0010 | `0010_taxonomy.sql` | M2.1 | `skills`, `skill_aliases`, `role_families` |
-| 0011 | `0011_taxonomy_seed.sql` | M2.1 | Generated from `data/taxonomy/*.json` (§13.7) |
-| 0012 | `0012_resume_profiles.sql` | M2.3 | `resume_profiles`, `resume_profile_skills` |
-| 0013 | `0013_job_requirements.sql` | M2.2 | `job_requirements`, `job_requirement_skills`, `claude_batches`, `claude_batch_items`, user-listing extraction trigger |
-| 0014 | `0014_embeddings.sql` | M2.4 | `vector` extension, `resume_embeddings`, `job_embeddings` (HNSW), close/delete trigger, `match_candidates` |
-| 0015 | `0015_reports.sql` | M3.1 | `resume_reports`, `resume_critiques`, `report_roles`, `report_job_recommendations`, `matches` v2 columns, `request_resume_report`, `request_fit_check`, `retry_report` |
-| 0016 | `0016_market_stats.sql` | M4.1 | `private.role_skill_demand` MV, `get_role_market_stats`, refresh function |
-| 0017 | `0017_listing_imports.sql` | M4.4 | `job_listing_imports`, `request_url_import` |
-| 0018 | `0018_digests_and_revisions.sql` | M5.1/M5.2 | `resumes.previous_resume_id`, `notification_preferences`, `digest_runs`, weekly cron |
+| 0010 | `0010_resume_critiques.sql` | V1 (§13.20) | `resume_critiques` (created early, `report_id`/`profile_id` FKs deferred to 0016), same-owner trigger, `request_resume_critique` |
+| 0011 | `0011_taxonomy.sql` | M2.1 | `skills`, `skill_aliases`, `role_families` |
+| 0012 | `0012_taxonomy_seed.sql` | M2.1 | Generated from `data/taxonomy/*.json` (§13.7) |
+| 0013 | `0013_resume_profiles.sql` | M2.3 | `resume_profiles`, `resume_profile_skills` |
+| 0014 | `0014_job_requirements.sql` | M2.2 | `job_requirements`, `job_requirement_skills`, `claude_batches`, `claude_batch_items`, user-listing extraction trigger |
+| 0015 | `0015_embeddings.sql` | M2.4 | `vector` extension, `resume_embeddings`, `job_embeddings` (HNSW), close/delete trigger, `match_candidates` |
+| 0016 | `0016_reports.sql` | M3.1 | `resume_reports`, **alter** `resume_critiques` (add the `report_id` and `profile_id` FKs; §13.20.2), `report_roles`, `report_job_recommendations`, `matches` v2 columns, `request_resume_report`, `request_fit_check`, `retry_report` |
+| 0017 | `0017_market_stats.sql` | M4.1 | `private.role_skill_demand` MV, `get_role_market_stats`, refresh function |
+| 0018 | `0018_listing_imports.sql` | M4.4 | `job_listing_imports`, `request_url_import` |
+| 0019 | `0019_digests_and_revisions.sql` | M5.1/M5.2 | `resumes.previous_resume_id`, `notification_preferences`, `digest_runs`, weekly cron |
+
+**Renumbered 2026-11-17 (§13.20).** `0010_resume_critiques.sql` was inserted for the
+visible-first critique, and every *planned* migration after it moved up by one. None of
+them existed yet. **Application order exception:** 0010 is applied to the live DB
+**before** 0009, which is committed but unapplied while M1.5 is parked. This is allowed
+only because neither file references any object the other creates (0010 depends only on
+0001 and 0007), so both orders give the same schema. A fresh environment applies them in
+file order (0009, then 0010). Until 0009 is applied, no new migration may depend on both
+0009 and 0010 without the architect checking the order first.
 
 `types/database.ts` must be regenerated (`supabase gen types typescript --project-id
 xpubgotqrsosvpiwlpyh`), not hand-edited, after each migration. Hand-editing was a v1
@@ -2445,7 +2455,7 @@ revoke insert, update, delete on public.job_descriptions from anon, authenticate
 ```
 All authenticated writes go through security-definer RPCs that enforce ownership,
 visibility rules, and rate limits. This is needed because a user insert or content
-update triggers a paid Claude extraction (0013 trigger), and a direct PostgREST write
+update triggers a paid Claude extraction (0014 trigger), and a direct PostgREST write
 would bypass the rate limit:
 - `create_job_listing(p_title, p_company, p_description, p_source_url, p_location,
   p_level, p_visibility) returns job_descriptions`: requires `auth.uid()`, consumes
@@ -2522,7 +2532,7 @@ rows, then calls `resolve_job_duplicates`. `content_hash` is filled for existing
 by `update job_descriptions set title = title` in the migration, which fires the
 trigger.
 
-#### 13.3.4 Taxonomy (0010/0011)
+#### 13.3.4 Taxonomy (0011/0012)
 **`skills`**: readable by authenticated, written only by the service role.
 
 | column | type | notes |
@@ -2550,7 +2560,7 @@ management | unknown`. **Student seniority enum** (`resume_profiles.seniority`):
 `student_no_experience | student_with_experience | new_grad | early_career |
 experienced`.
 
-#### 13.3.5 Resume profiles (0012)
+#### 13.3.5 Resume profiles (0013)
 **`resume_profiles`**: owner-select only.
 
 | column | type | notes |
@@ -2579,7 +2589,7 @@ not null` (array of `{quote, section}`; every quote verified to occur in the res
 text, §13.5.6), `created_at`. Indexes: `(profile_id)`, `(skill_id)`; unique
 `(profile_id, skill_id) where skill_id is not null`.
 
-#### 13.3.6 Job requirements and batches (0013)
+#### 13.3.6 Job requirements and batches (0014)
 **`job_requirements`**: one current row per listing; re-extraction replaces it.
 
 | column | type | notes |
@@ -2638,7 +2648,7 @@ content_hash`, `security definer`, `search_path=''`): when `new.source = 'user'`
 `user_id = coalesce(new.owner_user_id, new.submitted_by)`. External rows are picked up
 by the batch submitter instead (§13.6.6).
 
-#### 13.3.7 Embeddings (0014)
+#### 13.3.7 Embeddings (0015)
 `create extension if not exists vector with schema extensions;` (pgvector 0.8.2). The
 dimension is fixed at **1024** (§13.8.1). Switching to a model with a different
 dimension means a new column plus a re-embed, documented as a migration path, not
@@ -2702,7 +2712,7 @@ of order) and limits to `p_limit`. `similarity = 1 - distance`. RLS does not app
 under the service role, so **the explicit owner predicate is the privacy guarantee
 here**. pgTAP tests it directly (§13.16).
 
-#### 13.3.8 Reports, critiques, recommendations, fit checks (0015)
+#### 13.3.8 Reports, critiques, recommendations, fit checks (0016; `resume_critiques` itself is created by 0010)
 **`resume_reports`**: owner-select only.
 
 | column | type | notes |
@@ -2726,13 +2736,15 @@ here**. pgTAP tests it directly (§13.16).
 Indexes: `(resume_id, created_at desc)`, `(user_id, created_at desc)`. Partial unique
 `(resume_id) where status in ('queued','running')`: one in-flight report per resume.
 
-**`resume_critiques`**: owner-select only. Columns: `id`, `report_id uuid unique →
-resume_reports cascade`, `resume_id → resumes cascade`, `user_id`, `profile_id`,
-`prompt_version`, `model`, `overall_score int` (mean of the 5 dimension scores,
-computed in TS), `summary text`, `student_context jsonb`, `dimension_scores jsonb`,
-`line_feedback jsonb`, `section_feedback jsonb`, `ats_issues jsonb`,
-`missing_sections jsonb`, `dropped_items int not null default 0` (count removed by
-semantic validation; for monitoring), `created_at`.
+**`resume_critiques`**: owner-select only. **Created early by 0010 (§13.20.2), which
+is the authoritative DDL.** 0016 only adds the two deferred FKs. Columns: `id`,
+`report_id uuid null unique → resume_reports cascade` (null for standalone V1
+critiques), `resume_id → resumes cascade`, `user_id`, `profile_id uuid null →
+resume_profiles set null`, `prompt_version`, `model`, `overall_score int` (mean of the
+5 dimension scores, computed in TS), `summary text`, `student_context jsonb`,
+`dimension_scores jsonb`, `line_feedback jsonb`, `section_feedback jsonb`,
+`ats_issues jsonb`, `missing_sections jsonb`, `dropped_items int not null default 0`
+(count removed by semantic validation; for monitoring), `created_at`.
 
 **`report_roles`**: owner-select only. Columns: `id`, `report_id → resume_reports
 cascade`, `user_id`, `role_family_id → role_families`, `rank smallint`,
@@ -2798,7 +2810,7 @@ starts with `if auth.uid() is null then raise exception 'unauthenticated'`):
   tasks (`status='queued', attempts=0, run_after=now()`), resets failed stages to
   `pending`, increments `retry_count`. No rate-limit charge.
 
-#### 13.3.9 Market stats (0016)
+#### 13.3.9 Market stats (0017)
 - `private.role_skill_demand` materialized view:
   ```sql
   with live as (
@@ -2842,7 +2854,7 @@ starts with `if auth.uid() is null then raise exception 'unauthenticated'`):
   Ordered by `posting_count desc`. Safe to expose because it reads only aggregates of
   shared external data.
 
-#### 13.3.10 Listing imports (0017)
+#### 13.3.10 Listing imports (0018)
 **`job_listing_imports`**: owner-select only. Columns: `id`, `user_id → auth.users
 cascade`, `url text not null` (≤ 2048), `final_url text null`, `host text not null`,
 `visibility text not null check ('shared','private')`, `fit_check_resume_id uuid
@@ -2857,7 +2869,7 @@ default null) returns job_listing_imports`: requires auth, checks basic shape
 resume is owned if given, consumes `url_import`, inserts, and enqueues
 `import.fetch_listing`.
 
-#### 13.3.11 Digests and revisions (0018)
+#### 13.3.11 Digests and revisions (0019)
 - `resumes.previous_resume_id uuid null → resumes(id) on delete set null`, plus trigger
   `resumes_previous_same_owner` that raises unless the referenced resume has the same
   `user_id`.
@@ -3830,7 +3842,7 @@ reviewable change.
 | task | model (const) | effort | max_tokens | timeout | mode | prompt_version | untrusted inputs |
 |---|---|---|---|---|---|---|---|
 | `extractResumeProfile` | `CLAUDE_DEFAULT_MODEL` | `medium` | 16 000 | 160 s | sync | `profile-v1` | `resume_text` |
-| `critiqueResume` | default | `high` | 20 000 | 190 s | sync | `critique-v1` | `resume_text`, `candidate_profile` |
+| `critiqueResume` | default | `high` | 20 000 | 190 s | sync | `critique-v1` (V1 standalone, §13.20); M3.2 bumps to `critique-v2` | `resume_text` (V1); M3.2 adds `candidate_profile` |
 | `extractJobRequirements` | default (**Q2 candidate for cheaper model**) | `low` | 8 000 | 140 s | **batch** for shared external; sync for user/private/imports/fit-check | `jobreq-v1` | `job_description_text` or `fetched_page_text` |
 | `rerankJobsForRole` | default | `medium` | 16 000 | 160 s | sync | `rerank-v1` | `candidate_profile`, `job_posting` ×≤5 |
 | `narrateRoleFit` | default | `medium` | 12 000 | 160 s | sync | `narrate-v1` | `candidate_profile`, `role_data` |
@@ -4030,7 +4042,10 @@ projects, coursework, and leadership as first-class evidence.
 ```
 Same vocabulary block as (1), sharing one constant so cache prefixes match.
 
-**(3) `critiqueResume`**: runs after the profile exists. Output:
+**(3) `critiqueResume`**: runs after the profile exists. *(V1, §13.20: implemented
+early as a **standalone** variant with no profile, `critique-v1`. The output schema
+below is unchanged. M3.2 adds the `candidate_profile` input and bumps to
+`critique-v2`.)* Output:
 ```ts
 {
   summary: string,
@@ -4394,7 +4409,7 @@ are authored by backend-dev in M2.1 and reviewed for coverage of student-relevan
 fields, not only tech. `scripts/taxonomy/build-seed.ts` generates
 `0011_taxonomy_seed.sql` (`insert … on conflict (slug) do update set name, category`;
 aliases `on conflict do nothing`). Later additions mean regenerating into a **new**
-migration file (`00NN_taxonomy_update_<date>.sql`), never editing 0011.
+migration file (`00NN_taxonomy_update_<date>.sql`), never editing 0012.
 
 #### 13.7.2 `normalizeSkillLabel(label)` (`lib/taxonomy/normalize.ts`)
 NFKC → lowercase → trim → `&` → `and` → remove every character except `[a-z0-9+#]`.
@@ -4596,7 +4611,9 @@ midnight, same convention as §5.
   3. **The v1 synchronous routes** (`/api/resumes/:id/analyze`, v1 `POST
      /api/matches`) **record** spend through `registerUsageSink` but are **not
      budget-gated**. They only have the per-user 20/day caps (§5). This lasts until
-     M3.5 (matches async) and M3.9 (analyze deleted).
+     M3.5 (matches async) and M3.9 (analyze deleted). The V1 critique route
+     (§13.20.4) **is** budget-gated: it checks before charging, and the call it starts
+     can still finish over the budget (source 1).
 - `INGEST_DAILY_BUDGET_USD` (default **5**) and `INGEST_DAILY_EXTRACTION_CAP`
   (default **300**) bound background extraction separately, so ingestion can never
   starve students.
@@ -4785,9 +4802,11 @@ per §13.3.12). Queued tasks for that resume are cancelled before the row delete
 frontend stops calling them in M3.6/M3.7.
 
 **v1 synchronous Claude routes under the M1.1 layer (interim, until M3.5/M3.9).**
-These are `POST /api/resumes/:id/analyze` and the v1 synchronous `POST /api/matches`.
-They are the only routes that still call Claude inline, as a temporary exception to
-the §13.13 "no route calls Claude" rule.
+These are `POST /api/resumes/:id/analyze`, the v1 synchronous `POST /api/matches`, and
+(since 2026-11-17) the V1 `POST /api/resumes/:id/critique` (§13.20.4). They are the
+only routes that call Claude inline, as a temporary exception to the §13.13 "no route
+calls Claude" rule. Everything below applies to all three. The critique route differs
+only where §13.20.4 says so (per-attempt timeout, budget gate, refunds).
 - Both export **`maxDuration = 300`**, the Hobby maximum.
 - Each bounds the **whole Claude operation** with one overall deadline,
   **`SYNC_ROUTE_CLAUDE_DEADLINE_MS` = 270 s**:
@@ -4874,6 +4893,10 @@ the §13.13 "no route calls Claude" rule.
 }
 ```
 Sections are `null` until their stage completes, so the UI renders progressively.
+The `critique` object is produced by the same `toCritique` mapper as the V1 critique
+route (§13.20.4). It therefore also carries `id`, `created_at`, `model`,
+`prompt_version`, `is_current` and the derived `priorities[3]`, and the M3.6 UI reuses
+the V1 components unchanged.
 
 **Displaying quoted text (binding for M3.2 backend and M3.6 frontend).** Claude
 sees NFKC-normalized text (§13.5.5), so the quotes it returns are NFKC, not the
@@ -5303,7 +5326,10 @@ the same semantics for RFC 8058 one-click.
 only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidates.ts`,
 `lib/supabase/queries/{tasks,usage,embeddings,sources}.ts`, `app/api/worker/**`,
 `app/api/cron/**`, `app/api/unsubscribe/**`, and `app/api/reports/[id]/roles/[slug]/jobs`
-(via `lib/matching/candidates.ts`). Anywhere else it's a blocking finding.
+(via `lib/matching/candidates.ts`), plus, for the V1 critique (§13.20.5),
+`lib/critique/service.ts` and the two admin functions in
+`lib/supabase/queries/critiques.ts` (`insertResumeCritique`, `refundCritiqueCharge`).
+Anywhere else it's a blocking finding.
 
 **Accepted boundary exception: usage recording from the v1 routes.**
 - `app/api/resumes/[id]/analyze/route.ts` and `app/api/matches/route.ts` import
@@ -5314,6 +5340,8 @@ only in `lib/tasks/**`, `lib/jobs/**`, `lib/account/**`, `lib/matching/candidate
 - The `userId` it writes comes from the route's verified session (passed through
   `callStructured`'s `usageContext`), never from request input.
 - The exception ends when those routes stop calling Claude inline (M3.5 / M3.9).
+- `app/api/resumes/[id]/critique/route.ts` (§13.20) is covered by the same exception,
+  on the same terms, until M3.9.
 - No other route may import `registerUsageSink` unless it calls Claude.
 
 ### 13.15 Security and privacy review checklist (reviewer uses this for every v2 PR)
@@ -5572,3 +5600,316 @@ rely on it for debugging and don't add it to any environment. Passing a raw
    - set `WORKER_SECRET` and `APP_BASE_URL` in Vercel **production only**;
    - make sure Vercel Deployment Protection does not block `/api/worker/tick` on the
      production domain.
+
+### 13.20 Visible-first: resume critique V1 — 2026-11-17
+
+**Why.** The user wants visible, demoable features first. The detailed critique
+(§13.0 goal 1) can ship now on the existing stack, without waiting for taxonomy,
+profiles, reports or the worker pipeline (M2.x–M3.1). It is **forward-compatible by
+construction**. It uses the same output schema (§13.5.4 (3)), the same table
+(`resume_critiques`, §13.3.8), the same API object (§13.13.2 `critique`) and the same
+components (§13.14 `components/reports/`). Three things differ: it runs synchronously
+in a route (like v1 analyze), it has no profile input, and it has no report.
+Roadmap: **V1** in `docs/ROADMAP.md`.
+
+#### 13.20.1 Decisions
+| # | Decision | Why / rejected alternative |
+|---|---|---|
+| 1 | **Sync route** `POST /api/resumes/:id/critique` → `callStructured` (task `critiqueResume`), `maxDuration = 300`, the overall `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s) signal. | Ships without the pipeline. Covered by the §13.13.1 inline-Claude exception until M3.9. |
+| 2 | **New table now** (0010), not a reused one. | No clean no-migration option exists. `resume_analyses` has a fixed strengths/weaknesses shape: storing a critique there would break the v1 Analysis panel and the v1 row-count rate limit, and would need a data migration later. Creating §13.3.8's `resume_critiques` early costs one small migration and leaves nothing to migrate later. |
+| 3 | **Rate limit = 0007 ledger, existing kind `resume_report`** (5/day), charged atomically by a new RPC. No new kind. | The v1 `lib/claude/rateLimit.ts` counts successful rows. That is non-atomic, and failed but billed calls would be free, which is open to abuse. `resume_report` is already labelled "including the critique" in the Usage panel. A critique is the first slice of a report, so sharing the quota with M3 reports is intended, and no kind is left over when M3.9 retires this route. |
+| 4 | **Global budget gate** before charging (§13.9.4). | Public portfolio demo: caps runaway spend at `GLOBAL_DAILY_AI_BUDGET_USD`. Cheap, because the function already exists. |
+| 5 | **Cache:** at most one standalone critique per `(resume_id, prompt_version)`. POST returns the stored one at no charge, and GET only reads. | Opening the page never calls Claude. Resume text is immutable (a re-upload is a new resume), so a re-run would only re-sample the same input. A prompt bump (`is_current = false`) is the only way to get a new run. |
+| 6 | **Top 3 priorities are derived, not generated:** the `top_fix` of the 3 lowest-scoring dimensions. Ties go by the fixed dimension order. Computed in the mapper and not stored. | Keeps the normative §13.5.4 (3) schema unchanged. |
+| 7 | **`relevance` without a profile** is judged against the direction the resume itself shows: objective, field of study, coursework, experience. | No profile or taxonomy exists yet. M3.2 switches to `target_role_family_slugs`. |
+| 8 | **Prompt version:** `critique-v1` is the standalone prompt (`untrustedInputs: ['resume_text']`). M3.2 adds `candidate_profile` and makes it `critique-v2`. | A changed prompt must change the version (§13.5.3). The version also drives the cache key (decision 5). |
+| 9 | **Writes use the service role** (insert and refund). Reads use the session client (RLS). | Keeps §13.3's owner-only convention (users get no insert policy), so a user can't forge critique rows via PostgREST. Every admin query filters on the session `user_id` (§13.15 item 3). |
+
+#### 13.20.2 Migration `0010_resume_critiques.sql`
+**Numbering and application.** 0009 is committed but not applied (M1.5 is parked). This
+file is **0010**, and the planned migrations shift by one (§13.3.0). It depends only on
+0001 (`resumes`) and 0007 (`private.consume_rate_limit`, kind `resume_report`); it
+references nothing from 0009, and 0009 references nothing here. So it is applied to the
+live DB **ahead of 0009**, and both orders give the same schema.
+Procedure:
+1. Reviewer approval.
+2. Smoke test on the live DB inside a rolled-back transaction (checks listed in
+   ROADMAP V1.1).
+3. Apply via the Supabase connector with the **user's OK**, file sent verbatim, name
+   `0010_resume_critiques` (same route as 0007/0008).
+4. Regenerate `types/database.ts` from the live project. That schema has 0010 but not
+   0009, which is correct for `main`.
+
+When M1.5 resumes, its branch regenerates types after 0009 is applied, rather than
+merging its hand-edited `types/database.ts`.
+
+```sql
+create table public.resume_critiques (
+  id uuid primary key default gen_random_uuid(),
+  report_id uuid null unique,          -- FK -> resume_reports(id) on delete cascade: added by 0016
+  resume_id uuid not null references public.resumes(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  profile_id uuid null,                -- FK -> resume_profiles(id) on delete set null: added by 0016
+  prompt_version text not null,
+  model text not null,                 -- served model (response.model)
+  overall_score integer not null check (overall_score between 0 and 100),
+  summary text not null,
+  student_context jsonb not null,
+  dimension_scores jsonb not null check (jsonb_typeof(dimension_scores) = 'array'),
+  line_feedback jsonb not null default '[]',
+  section_feedback jsonb not null default '[]',
+  ats_issues jsonb not null default '[]',
+  missing_sections jsonb not null default '[]',
+  dropped_items integer not null default 0 check (dropped_items >= 0),
+  created_at timestamptz not null default now()
+);
+create index resume_critiques_resume_id_created_at_idx on public.resume_critiques (resume_id, created_at desc);
+create index resume_critiques_user_id_idx on public.resume_critiques (user_id);
+-- Cache key for standalone (V1) critiques; report critiques are keyed by report_id.
+create unique index resume_critiques_standalone_key
+  on public.resume_critiques (resume_id, prompt_version) where report_id is null;
+
+alter table public.resume_critiques enable row level security;
+create policy "resume_critiques_select_own" on public.resume_critiques
+  for select to authenticated using (user_id = (select auth.uid()));
+revoke all on table public.resume_critiques from anon, authenticated;
+grant select on table public.resume_critiques to authenticated;
+```
+- **Same-owner guard:** a `before insert or update` trigger,
+  `resume_critiques_same_owner` (function `private.resume_critiques_same_owner()`,
+  `search_path = ''`, execute revoked from public/anon/authenticated). It raises
+  `validation_owner_mismatch` unless `resumes.user_id = new.user_id`. This is
+  defense-in-depth for the service-role insert.
+- **RPC `public.request_resume_critique(p_resume_id uuid) returns uuid`:** security
+  definer, `set search_path = ''`. Revoke execute from `public, anon`; grant it to
+  `authenticated`. In order:
+  1. `auth.uid()` null → `raise 'unauthenticated' using errcode = '42501'`.
+  2. Resume not owned by the caller → `raise 'not_found' using errcode = 'P0001'`.
+  3. `v_id := gen_random_uuid()`. If
+     `not private.consume_rate_limit(v_uid, 'resume_report', v_id)`, then
+     `raise 'rate_limited:resume_report' using errcode = 'P0001'`.
+  4. Return `v_id`. That id becomes the critique's `id`, so the ledger row's `ref_id`
+     points at the critique, matching the §13.10.4 refund-by-`ref_id` convention.
+
+  M3.9 drops this function in its cleanup migration.
+- **Cascade:** a deleted resume or user removes its critiques. No new Storage. §13.3.12
+  already lists critiques and needs no change.
+
+#### 13.20.3 Claude task `lib/claude/tasks/critiqueResume.ts`
+- Exports per §13.5.1: `CritiqueResumeSchema` (exactly the §13.5.4 (3) shape;
+  `line_feedback` ≤ 25, `dimensions` length 5), `type CritiqueResumeOutput`,
+  `buildCritiqueResumeRequest({ resumeText })` (pure), `validateCritiqueResume(output, {
+  sourceText })`, and `runCritiqueResume({ resumeText, sourceText }, { userId, signal })`.
+  The run function wraps `callStructured` in `retryOnceOnInvalidOutput`, like
+  `analyzeResume`.
+- **Prompt.**
+  - `system` has two blocks, `[UNTRUSTED_DATA_RULES, task instructions + rubric]`,
+    with `cache_control` on the last block.
+  - The rubric defines the five dimensions and the score bands (85–100 strong, 70–84
+    solid, 50–69 needs work, < 50 major revision).
+  - It includes the §13.5.4 (3) student guidance and the no-fabrication rule (bracketed
+    placeholders plus `needs_user_input`).
+  - It asks for `line_feedback` ordered most impactful first, one item per line, and
+    for `original_text` copied verbatim from the resume.
+  - The user message holds only
+    `wrapUntrusted('resume_text', resumeText.slice(0, RESUME_PROMPT_MAX_CHARS))`.
+  - No profile block.
+- **Config change:** `CLAUDE_TASKS.critiqueResume.untrustedInputs = ['resume_text']`.
+  Everything else stays as §13.5.3 (`high`, 20 000, 190 s, `critique-v1`). The 190 s
+  per-attempt timeout replaces `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` for this task, and the
+  270 s overall signal still bounds the whole operation. A slow first attempt therefore
+  leaves no room for the invalid-output retry. That case ends as a `502 ai_unavailable`
+  that is **refunded**.
+- **Validation** (§13.5.6 critique rows, all of them):
+  - exactly one score per dimension, integers 0..100, else invalid;
+  - drop items whose `original_text` can't be located;
+  - drop items whose rewrite adds a number that isn't in the original and isn't inside
+    `[…]`;
+  - if 0 items remain and the resume has ≥ 3 bullet-like lines → invalid.
+
+  The drop count goes to `dropped_items`.
+- **Quote display (binding, §13.13.2):** this pass implements
+  `semanticValidation.ts#locateQuoteInSource(quote, source) → {start, end} | null`.
+  - Each kept item stores `original_text = sourceText.slice(start, end)`, where
+    `sourceText` is the stored, un-normalized `resumes.extracted_text`. Claude's NFKC
+    quote is never stored.
+  - The match is against the **full** stored text, not the truncated prompt slice.
+  - Retrofitting the helper to the other quote fields stays in M3.2.
+- `overall_score = Math.round(mean of the 5 scores)`, computed in TS.
+  `dimension_scores` is stored in the fixed order `impact, clarity, relevance,
+  structure, ats_readability`.
+- Register the schema in `OUTPUT_SCHEMAS` (replacing `critiqueResume: null`) and add
+  its wire snapshot.
+
+#### 13.20.4 API
+**`GET /api/resumes/:id/critique`**: the latest critique for the resume (any
+`prompt_version`), read through the session client.
+- `200 { "critique": Critique }`.
+- `404 { error, code: 'not_found' }` if the resume isn't the caller's.
+- `404 { error, code: 'no_critique' }` if the resume has none.
+- `401`.
+- `Cache-Control: private, no-store`.
+
+**`POST /api/resumes/:id/critique`** (no body). `maxDuration = 300`; imports
+`lib/tasks/registerUsageSink`. Steps, in order:
+1. Create the deadline signal. `requireSession` → `401`.
+2. Load the resume (session client) → `404 not_found`.
+3. **Cache:** if a critique exists with `report_id is null` and
+   `prompt_version = CLAUDE_TASKS.critiqueResume.promptVersion` → `200 { critique }`.
+   No charge, no Claude call.
+4. **Text:** use `extracted_text`, or download and extract it (the same helpers as
+   analyze) and persist it via `updateResume({ extractedText })`. Empty or failed →
+   `422 { code: 'text_extraction_failed' }`. This step happens **before** charging.
+   The route never changes `resumes.status`; that column belongs to the
+   analysis/report flows.
+5. **Budget:** `checkGlobalAiBudget(since => sum(getAiSpendSince(admin, since)))`.
+   - Exhausted → `503 { code: 'budget_exhausted', retry_after: <next UTC midnight> }`.
+   - Query error → `500 { code: 'internal_error' }` (fail closed).
+6. **Charge:** `rpc('request_resume_critique', { p_resume_id })` → `critiqueId`.
+   - `rate_limited:resume_report` → `429 { code: 'rate_limited', kind: 'resume_report',
+     retry_after }`.
+   - `not_found` → `404`.
+   - Anything else → `500`.
+7. `runCritiqueResume(...)`, then validate and map quotes (§13.20.3).
+8. **Insert** with `id = critiqueId`, `user_id` = the session user, through the admin
+   client.
+   - On a unique violation of `resume_critiques_standalone_key` (a concurrent POST
+     won the race): return the existing row with `200`. **The loser's charge is NOT
+     refunded** (decided 2026-11-17 after the V1.1 review). Refunding race losers
+     would let one user fire N parallel POSTs and bill N Claude calls for one unit,
+     about 15 billed calls for 5 units a day, enough to nearly exhaust the $15
+     global budget and take the feature down for everyone. Not refunding bounds
+     billed calls to charged units. Normal users never hit this, because the UI
+     blocks double-submit.
+9. Return `201 { critique }`.
+
+**Failure after step 6:**
+- Refund (set `rate_limit_events.refunded_at` where `ref_id = critiqueId and user_id =
+  session user and refunded_at is null`) **only** for system codes, mirroring §13.10.4:
+  `ai_unavailable` (including the deadline), `ai_bad_request`, and `internal_error`
+  (e.g. the insert failed).
+- No refund for `ai_refused`, `ai_invalid_output` or `ai_truncated`. Refunding
+  model-side outcomes a user can provoke would make repeated paid calls free.
+- Claude errors → `502 { error, code }`. Others → `500 { code: 'internal_error' }`.
+- A failed refund is logged (ids only), never thrown.
+- Copy follows §13.13.9. New row: `budget_exhausted` → "Kalify's AI features have
+  reached today's capacity. Try again after 00:00 UTC."
+
+**`Critique`** (`types/domain.ts`; `toCritique(row, currentPromptVersion)` mapper,
+shared with §13.13.2):
+```jsonc
+{
+  "id": "…", "resume_id": "…", "created_at": "…", "model": "claude-opus-5-5",
+  "prompt_version": "critique-v1", "is_current": true,
+  "overall_score": 71, "summary": "…",
+  "student_context": { "stage": "late_student", "note": "…" },
+  "dimensions": [ { "dimension": "impact", "score": 58, "rationale": "…", "top_fix": "…" } ],  // 5, fixed order
+  "priorities": [ { "dimension": "impact", "score": 58, "top_fix": "…" } ],                    // 3, ascending score
+  "line_feedback": [ { "id": "lf_0", "section": "experience", "original_text": "<user's exact characters>",
+                       "issue_types": ["no_metric"], "feedback": "…",
+                       "suggested_rewrite": "… [X%] …", "needs_user_input": true } ],
+  "section_feedback": [ { "section": "…", "feedback": "…" } ],
+  "ats_issues": [ { "issue": "…", "fix": "…" } ],
+  "missing_sections": [ "…" ]
+}
+```
+`lf_<n>` ids are assigned by index at map time.
+
+#### 13.20.5 Modules (where code lives)
+| File | Owner | Role |
+|---|---|---|
+| `supabase/migrations/0010_resume_critiques.sql` | BE | §13.20.2 |
+| `lib/claude/tasks/critiqueResume.ts` (+ test) | BE | §13.20.3 |
+| `lib/claude/semanticValidation.ts` (+ test) | BE | add `locateQuoteInSource` (offset map through NFKC, invisible-char stripping, and the `normalizeForQuoteMatch` steps) |
+| `lib/claude/config.ts`, `lib/claude/outputSchemas.test.ts` (+ snapshot) | BE | config change; schema registration |
+| `lib/critique/service.ts` (+ test) | BE | `requestCritique(sessionClient, user, resumeId, signal)`: steps 3–9 above. Creates the admin client; returns a discriminated result the route maps to HTTP |
+| `lib/supabase/queries/critiques.ts` (+ test) | BE | `getLatestCritique(session, resumeId)`, `getStandaloneCritique(session, resumeId, promptVersion)` (session client); `insertResumeCritique(admin, …)`, `refundCritiqueCharge(admin, userId, critiqueId)` (admin) |
+| `app/api/resumes/[id]/critique/route.ts` (+ test) | BE | thin GET/POST |
+| `types/domain.ts`, `types/database.ts` (regenerated) | BE | `Critique`, `CritiqueDimension`, `LineFeedback`, `CRITIQUE_DIMENSION_ORDER`, `toCritique` |
+| `lib/client/critique.ts` (+ test) | FE | React-free: dimension and issue-type labels, score band, POST response → UI state and copy |
+| `components/reports/CritiqueSection.tsx`, `DimensionScoreCard.tsx`, `LineFeedbackItem.tsx`, `CritiquePriorities.tsx` | FE | presentational, prop `critique: Critique`; reused unchanged by M3.6 |
+| `components/resumes/RunCritiqueButton.tsx` | FE | V1-only trigger (removed in M3.7) |
+| `app/resumes/[id]/page.tsx` | FE | fetch GET and render the section |
+
+#### 13.20.6 UI (frontend contract)
+- **Placement:** a "Resume critique" card directly under the page header, above "File
+  details". The v1 Analysis and Matches sections stay unchanged, because Matches is
+  gated on the analysis.
+- **Empty state:** one sentence on what the critique covers, a note that it "uses 1 of
+  your daily resume reports", and the `RunCritiqueButton`.
+- **Pending state:** the button is disabled. Show "Reviewing your resume. This usually
+  takes under a minute; keep this tab open." (measured ~40 s on 3 synthetic resumes in V1.1) in an `aria-live="polite"` region. No fake
+  progress bar.
+- **On success:** `router.refresh()`. Errors are mapped by status and `code`, using
+  §13.13.9 copy, inline with `role="alert"`.
+- **Content order:**
+  1. Overall score (`NN/100` plus a band label) with `summary` and the
+     `student_context.note`.
+  2. **Top 3 priorities** (numbered).
+  3. Five `DimensionScoreCard`s, each with label, score, `rationale` as the one-line
+     explanation, and "Fix:" `top_fix`.
+  4. **Line-by-line feedback**, grouped by section. Each item shows `original_text` in
+     a quote block, issue chips, `feedback`, and `suggested_rewrite`, with any
+     `[placeholders]` visually marked plus a "Needs your numbers" tag when
+     `needs_user_input`. Show the first 6 items, then "Show all N".
+  5. A compact "ATS issues" list and a "Missing sections" list.
+  6. Footer: "AI-generated feedback. Review before using; bracketed values are
+     placeholders for your real numbers." plus the date.
+- **Bands** (same three tokens as `MatchScoreBadge`): ≥ 75 `success-*` "Strong";
+  50–74 `warning-*` "Needs polish"; < 50 `danger-*` "Needs work". The score is always
+  shown as text, never conveyed by color alone.
+- **Dimension labels:** impact → "Impact & results", clarity → "Clarity", relevance →
+  "Relevance", structure → "Structure & formatting", ats_readability → "ATS
+  readability". Issue-type labels live in `lib/client/critique.ts`.
+- **Rendering rules:** all Claude and resume text is rendered as React text, never as
+  HTML (no `dangerouslySetInnerHTML`). `original_text` is shown exactly as received:
+  never re-normalized, and never used to search the resume with a normalized string.
+  §6 tokens only, usable at phone width.
+- `is_current = false` → a subtle note "An updated critique is available" with the
+  run button. `section_feedback` is not displayed in V1.
+
+#### 13.20.7 Cost (Opus 5.5, $4 / $20 per MTok, §13.17)
+- **Typical:** ~5k input tokens (≈ 2.5k system + ≈ 2.5k resume) and ~9k output
+  tokens, thinking at `high` included → **≈ $0.02 + $0.18 = ~$0.20 per critique**.
+- **Ceiling for one attempt:** 10k in (30k-char cap) plus 20k out (`max_tokens`) ≈
+  **$0.44**. With the single invalid-output retry, ≈ **$0.88**.
+- **Per user per day:** ≤ 5 charged runs, so ~$1 typical and ≤ ~$4.40 worst case.
+  Refunded system failures may still have been billed (§13.13.1).
+- **Overall:** bounded by `GLOBAL_DAILY_AI_BUDGET_USD` (default $15/day, about 75
+  typical critiques). Cache hits and page views cost $0.
+- At `medium` effort the estimate is ~$0.10, at lower latency (§13.20.9).
+
+#### 13.20.8 Deferred to the full M3.2 / M3.6 (not in V1)
+- Profile input, relevance against target role families, `critique-v2`.
+- `not_a_resume` detection (comes from the profile's `is_resume`).
+- Async execution, an in-flight marker and progress. A reload mid-run followed by a
+  second POST can double-charge. The frontend warning and double-submit guard
+  mitigate this. A concurrent duplicate is charged and not refunded (§13.20.4
+  step 8), which keeps billed calls bounded by charged units.
+- An on-demand "regenerate" (only a prompt bump re-runs).
+- Refunds for model-side failures.
+- `section_feedback` display, a `text_truncated` notice, highlighting quotes inside the
+  resume text.
+- `locateQuoteInSource` retrofits for the other quote fields.
+- `scripts/evals/critique.ts` and the injection eval for this prompt (required before
+  `critique-v2`).
+- Revision comparison (Phase 5), and the landing-page sample showcase switching to a
+  critique.
+- The `report_id`/`profile_id` FKs (0016).
+- **Retirement:**
+  - M3.6 puts the same components on `/reports/[id]`.
+  - M3.7 removes `RunCritiqueButton`.
+  - M3.9 deletes the POST route and drops `request_resume_critique`.
+  - Standalone rows stay readable.
+
+#### 13.20.9 Open questions for the user
+1. **Effort `high` vs `medium`.** `high` (as §13.5.3) gives better critiques: ~$0.20
+   each, with an expected 1–2+ minutes of synchronous wait. `medium` is ~$0.10 and
+   faster. *Recommend:* ship `high`; backend-dev measures p50/p95 latency on 3
+   synthetic resumes in V1.1, and if p95 > 150 s the orchestrator asks the user about
+   switching to `medium` (a one-line config change plus a prompt-version note).
+2. **Shared quota.** Critiques consume the `resume_report` limit (5/day; §13.19 Q3
+   numbers are still unconfirmed). *Recommend:* yes, as decided above. The
+   alternative, a separate `resume_critique` kind, adds a check-constraint change, a
+   seed row and a label.
+3. **Applying 0010 to the live DB** needs the user's OK (§13.20.2 procedure).

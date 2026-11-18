@@ -11,6 +11,7 @@ import { recordAiUsageEvent } from "@/lib/tasks/usageSink";
  *   - app/api/worker/tick/route.ts      (all v2 Claude calls run in the worker)
  *   - app/api/resumes/[id]/analyze/route.ts   (v1, until M3.9)
  *   - app/api/matches/route.ts                (v1, until M3.9)
+ *   - app/api/resumes/[id]/critique/route.ts  (V1 critique, §13.20; until M3.9)
  * A new entry point that calls Claude must add the same import, or its
  * spend silently escapes the global budget.
  *
