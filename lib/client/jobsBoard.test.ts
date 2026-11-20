@@ -347,6 +347,18 @@ describe("getJobSourceInfo", () => {
     expect(info.applyLabel).toBe("Apply on The Muse");
   });
 
+  it.each([
+    ["greenhouse", "Greenhouse"],
+    ["lever", "Lever"],
+  ])("labels %s listings as employer postings without attribution", (source, provider) => {
+    const info = getJobSourceInfo(source);
+    expect(info.label).toBe("Employer posting");
+    expect(info.kind).toBe("external");
+    expect(info.description).toBe(`From the company's careers site (via ${provider})`);
+    expect(info.attribution).toBeNull();
+    expect(info.applyLabel).toBe("Apply on company site");
+  });
+
   it("falls back for unknown sources without echoing the raw value", () => {
     const info = getJobSourceInfo("somewhere-new");
     expect(info.label).toBe("External");

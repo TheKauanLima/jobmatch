@@ -58,7 +58,7 @@ export type Json =
   | Json[];
 
 export type ResumeStatus = "uploaded" | "processing" | "analyzed" | "failed";
-export type JobDescriptionSource = "user" | "themuse";
+export type JobDescriptionSource = "user" | "themuse" | "greenhouse" | "lever";
 
 /** `background_tasks.status` check constraint (0007). */
 export type BackgroundTaskStatus =

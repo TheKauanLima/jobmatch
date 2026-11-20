@@ -3,7 +3,8 @@
 An AI job-finder for students. Upload a resume and get an AI-generated
 strengths/weaknesses breakdown, then match it against a shared board of job
 descriptions — a mix of postings the community submits and internship/entry-level
-listings pulled in automatically from [The Muse](https://www.themuse.com) — to see
+listings pulled in automatically from company career sites (via their public
+Greenhouse and Lever job boards) — to see
 a fit score, rationale, and gaps for each one.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data model, API
@@ -49,9 +50,10 @@ Claude API (resume analysis, job matching) · Tailwind v4 · Vercel.
 
 ## Keeping the job board populated
 
-`GET /api/cron/sync-jobs` pulls the newest Internship/Entry Level listings from
-The Muse's public Jobs API and upserts them into the shared job board — see
-docs/ARCHITECTURE.md §7 for the full design. In production, `vercel.json` schedules
+`GET /api/cron/sync-jobs` polls the public Greenhouse and Lever job boards of the
+companies listed in `lib/jobs/sources/companies.ts`, keeps US Internship/Entry Level
+listings, upserts them into the shared job board, and hides listings that have left
+their board — see docs/ARCHITECTURE.md §7.7 for the full design. In production, `vercel.json` schedules
 this once daily via Vercel Cron once `CRON_SECRET` is set as a project env var; no
 further setup is needed beyond that. To trigger it by hand (e.g. right after first
 deploying, so the board isn't empty on day one, or when developing locally):

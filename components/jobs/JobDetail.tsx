@@ -86,8 +86,9 @@ function Fact({ term, children }: { term: string; children: ReactNode }) {
 }
 
 /**
- * Key facts and actions: posted date, level, location, source (with the
- * attribution link-back The Muse's terms require, docs/ARCHITECTURE.md §7.1),
+ * Key facts and actions: posted date, level, location, source (plain label
+ * for employer postings and community submissions, docs/ARCHITECTURE.md
+ * §7.7.9; an attribution link-back only for legacy The Muse rows, §7.1),
  * an "apply / view original" link to `source_url`, and, when the caller has
  * an analyzed resume, a jump to the match section.
  *

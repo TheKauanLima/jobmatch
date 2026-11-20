@@ -93,6 +93,41 @@ describe("JobKeyFacts", () => {
     expect(html).not.toContain('href="https://www.themuse.com"');
   });
 
+  it.each([
+    [
+      "greenhouse",
+      "Greenhouse",
+      "https://job-boards.greenhouse.io/fabrikam/jobs/4012345",
+      "job-boards.greenhouse.io",
+    ],
+    [
+      "lever",
+      "Lever",
+      "https://jobs.lever.co/fabrikam/0b1c2d3e-aaaa-bbbb-cccc-1234567890ab",
+      "jobs.lever.co",
+    ],
+  ] as const)(
+    "%s posting: plain 'Employer posting' source, no attribution link, apply on company site",
+    (source, provider, sourceUrl, host) => {
+      const html = renderToStaticMarkup(
+        <JobKeyFacts job={job({ source, source_url: sourceUrl })} canMatch={false} now={NOW} />,
+      );
+      expect(html).toContain("Employer posting");
+      expect(html).toContain(`From the company&#x27;s careers site (via ${provider})`);
+      // Exactly one outbound link (the apply link); no empty attribution anchor.
+      expect(html.match(/<a /g)).toHaveLength(1);
+      expect(html).toMatch(
+        new RegExp(
+          `<a href="${sourceUrl.replace(/[.?]/g, "\\$&")}" target="_blank" rel="noopener noreferrer"`,
+        ),
+      );
+      expect(html).toContain("Apply on company site");
+      expect(html).toContain(`Opens ${host} in a new tab`);
+      expect(html).not.toContain("The Muse");
+      expect(html).not.toContain("themuse.com");
+    },
+  );
+
   it("never turns an unsafe source_url into a link", () => {
     const html = renderToStaticMarkup(
       <JobKeyFacts

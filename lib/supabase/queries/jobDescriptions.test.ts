@@ -13,6 +13,7 @@ import {
   listJobDescriptions,
   searchJobDescriptions,
   softDeleteJobDescription,
+  softDeleteMissingExternalJobDescriptions,
   updateJobDescription,
   upsertExternalJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
@@ -48,6 +49,7 @@ function makeQueryBuilder(resolvedValue: {
   builder.limit = record("limit");
   builder.lt = record("lt");
   builder.or = record("or");
+  builder.like = record("like");
   builder.maybeSingle = vi.fn().mockResolvedValue(resolvedValue);
   builder.single = vi.fn().mockResolvedValue(resolvedValue);
   builder.then = (resolve: (v: unknown) => unknown) =>
@@ -681,6 +683,18 @@ describe("upsertExternalJobDescriptions", () => {
     expect(options).toMatchObject({ onConflict: "source,external_id" });
   });
 
+  it("writes deleted_at: null so a listing that reappears on its board is shown again (§7.7.6)", async () => {
+    const { builder, calls } = makeQueryBuilder({ data: [], error: null, count: 1 });
+    const client = makeClient(builder);
+
+    await upsertExternalJobDescriptions(client, "greenhouse", [makeUpsertRow()]);
+
+    const [rows] = calls.find((c) => c.method === "upsert")!.args as [
+      Record<string, unknown>[],
+    ];
+    expect(rows[0]).toMatchObject({ source: "greenhouse", deleted_at: null });
+  });
+
   it("sums counts across batches larger than the batch size", async () => {
     const { builder } = makeQueryBuilder({
       data: [],
@@ -710,6 +724,138 @@ describe("upsertExternalJobDescriptions", () => {
       upsertExternalJobDescriptions(client, "themuse", [makeUpsertRow()]),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
+});
+
+describe("softDeleteMissingExternalJobDescriptions (§7.7.6)", () => {
+  /**
+   * A client whose every `from()` call gets a fresh chainable builder that
+   * resolves to the next queued result, so the select and each update chunk
+   * can be given different outcomes. Records each builder's calls.
+   */
+  function makeSequencedClient(results: { data: unknown; error: unknown }[]) {
+    const builders: { method: string; args: unknown[] }[][] = [];
+    const client = {
+      from: vi.fn(() => {
+        const { builder, calls } = makeQueryBuilder(
+          results[builders.length] ?? { data: null, error: null },
+        );
+        builders.push(calls);
+        return builder;
+      }),
+    } as never;
+    return { client, builders };
+  }
+
+  it("selects only active rows of this source + token prefix, and updates only the missing ones", async () => {
+    const { client, builders } = makeSequencedClient([
+      {
+        data: [
+          { id: "r1", external_id: "acme:1" },
+          { id: "r2", external_id: "acme:2" },
+          { id: "r3", external_id: "acme:3" },
+        ],
+        error: null,
+      },
+      { data: null, error: null },
+    ]);
+
+    const result = await softDeleteMissingExternalJobDescriptions(
+      client,
+      "greenhouse",
+      "acme",
+      new Set(["acme:2"]),
+    );
+
+    expect(result).toEqual({ count: 2 });
+    const [select, update] = builders;
+    expect(select).toEqual([
+      { method: "select", args: ["id, external_id"] },
+      { method: "eq", args: ["source", "greenhouse"] },
+      { method: "like", args: ["external_id", "acme:%"] },
+      { method: "is", args: ["deleted_at", null] },
+    ]);
+    expect(update[0].method).toBe("update");
+    expect(update[0].args[0]).toEqual({ deleted_at: expect.any(String) });
+    expect(update).toContainEqual({ method: "in", args: ["id", ["r1", "r3"]] });
+    expect(update).toContainEqual({ method: "eq", args: ["source", "greenhouse"] });
+    expect(update).toContainEqual({ method: "is", args: ["deleted_at", null] });
+  });
+
+  it("does not issue an update when nothing is missing", async () => {
+    const { client, builders } = makeSequencedClient([
+      { data: [{ id: "r1", external_id: "acme:1" }], error: null },
+    ]);
+
+    const result = await softDeleteMissingExternalJobDescriptions(
+      client,
+      "lever",
+      "acme",
+      new Set(["acme:1"]),
+    );
+
+    expect(result).toEqual({ count: 0 });
+    expect(builders).toHaveLength(1);
+  });
+
+  it("updates in chunks of 100 ids", async () => {
+    const rows = Array.from({ length: 250 }, (_, i) => ({
+      id: `r${i}`,
+      external_id: `acme:${i}`,
+    }));
+    const { client, builders } = makeSequencedClient([
+      { data: rows, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+    ]);
+
+    const result = await softDeleteMissingExternalJobDescriptions(
+      client,
+      "greenhouse",
+      "acme",
+      new Set(),
+    );
+
+    expect(result).toEqual({ count: 250 });
+    const chunkSizes = builders
+      .slice(1)
+      .map((calls) => (calls.find((c) => c.method === "in")!.args[1] as string[]).length);
+    expect(chunkSizes).toEqual([100, 100, 50]);
+  });
+
+  it("throws JobDescriptionQueryError when the select fails, without updating", async () => {
+    const { client, builders } = makeSequencedClient([
+      { data: null, error: { message: "boom" } },
+    ]);
+
+    await expect(
+      softDeleteMissingExternalJobDescriptions(client, "greenhouse", "acme", new Set()),
+    ).rejects.toThrow(JobDescriptionQueryError);
+    expect(builders).toHaveLength(1);
+  });
+
+  it("throws JobDescriptionQueryError when an update chunk fails", async () => {
+    const { client } = makeSequencedClient([
+      { data: [{ id: "r1", external_id: "acme:1" }], error: null },
+      { data: null, error: { message: "boom" } },
+    ]);
+
+    await expect(
+      softDeleteMissingExternalJobDescriptions(client, "greenhouse", "acme", new Set()),
+    ).rejects.toThrow(JobDescriptionQueryError);
+  });
+
+  it.each(["", "Acme", "acme%", "ac_me", "-acme", "a:b"])(
+    "refuses an invalid token %j before querying (LIKE-safety)",
+    async (token) => {
+      const { client, builders } = makeSequencedClient([]);
+
+      await expect(
+        softDeleteMissingExternalJobDescriptions(client, "greenhouse", token, new Set()),
+      ).rejects.toThrow(JobDescriptionQueryError);
+      expect(builders).toHaveLength(0);
+    },
+  );
 });
 
 describe("updateJobDescription — per docs/ARCHITECTURE.md §10.3", () => {
@@ -905,4 +1051,72 @@ describe("softDeleteJobDescription — per docs/ARCHITECTURE.md §10.1/§10.3", 
       softDeleteJobDescription(client, { id: TEST_UUID, submittedBy: "user-1" }),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
+});
+
+describe("softDeleteMissingExternalJobDescriptions: LIKE prefix isolation (QA 2026-11-20)", () => {
+  function escapeRe(ch: string): string {
+    return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  /** Postgres LIKE semantics (`%` any run, `_` one char, `\` escape) as a RegExp. */
+  function likeToRegExp(pattern: string): RegExp {
+    let out = "";
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === "\\" && i + 1 < pattern.length) {
+        out += escapeRe(pattern[++i]);
+      } else if (ch === "%") out += "[\\s\\S]*";
+      else if (ch === "_") out += "[\\s\\S]";
+      else out += escapeRe(ch);
+    }
+    return new RegExp(`^${out}$`);
+  }
+
+  async function likePatternFor(token: string): Promise<string> {
+    const calls: { method: string; args: unknown[] }[] = [];
+    const { builder, calls: builderCalls } = makeQueryBuilder({ data: [], error: null });
+    const client = { from: vi.fn().mockReturnValue(builder) } as never;
+    await softDeleteMissingExternalJobDescriptions(client, "greenhouse", token, new Set());
+    calls.push(...builderCalls);
+    return calls.find((c) => c.method === "like")!.args[1] as string;
+  }
+
+  it("'lyft:%' does not match another company's ids that share a prefix ('lyft-foo:123')", async () => {
+    const pattern = await likePatternFor("lyft");
+    expect(pattern).toBe("lyft:%");
+    const re = likeToRegExp(pattern);
+    expect(re.test("lyft:123")).toBe(true);
+    expect(re.test("lyft-foo:123")).toBe(false);
+    expect(re.test("lyftx:123")).toBe(false);
+    expect(re.test("xlyft:123")).toBe(false);
+  });
+
+  it("a hyphenated token is not a LIKE wildcard and matches only its own ids", async () => {
+    const re = likeToRegExp(await likePatternFor("lyft-foo"));
+    expect(re.test("lyft-foo:1")).toBe(true);
+    expect(re.test("lyft:1")).toBe(false);
+    expect(re.test("lyftafoo:1")).toBe(false);
+  });
+
+  it("no checked-in company's prefix pattern matches another company's external ids", async () => {
+    const { JOB_BOARD_COMPANIES } = await import("@/lib/jobs/sources/companies");
+    for (const a of JOB_BOARD_COMPANIES) {
+      const re = likeToRegExp(await likePatternFor(a.token));
+      for (const b of JOB_BOARD_COMPANIES) {
+        if (b.token === a.token) continue;
+        expect(re.test(`${b.token}:1`), `${a.token} vs ${b.token}`).toBe(false);
+      }
+    }
+  });
+
+  it.each(["acme\n", "acme\\", "ac*me", "acme:1", "ACME", "acme "])(
+    "refuses token %j (wildcard/escape/case/whitespace)",
+    async (token) => {
+      const from = vi.fn();
+      await expect(
+        softDeleteMissingExternalJobDescriptions({ from } as never, "lever", token, new Set()),
+      ).rejects.toThrow(JobDescriptionQueryError);
+      expect(from).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -61,9 +61,9 @@ export function JobsBoardLayout({
           Jobs
         </h1>
         <p className="max-w-2xl text-sm leading-6 text-fg-muted sm:text-base">
-          Internship and entry-level roles from The Muse, plus postings shared
-          by the Kalify community. Open a listing to read the full description
-          and check how your resume fits.
+          Internship and entry-level roles from company career sites, plus
+          postings shared by the Kalify community. Open a listing to read the
+          full description and check how your resume fits.
         </p>
       </header>
 

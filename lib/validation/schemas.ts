@@ -87,12 +87,14 @@ export const JOB_DESCRIPTION_LOCATION_MAX_LENGTH = 200;
 /**
  * Levels a *user* can tag their own submission with, per
  * docs/ARCHITECTURE.md §7. `job_descriptions.level` itself is free text (an
- * externally-ingested row can carry whatever vocabulary its source uses —
- * see `lib/jobs/themuse.ts`), but a manual submission has no external
- * source to inherit a value from, so this fixed list is what the submission
- * form offers. Matches `THEMUSE_SYNC_LEVELS`'s two entries plus the rest of
- * The Muse's own taxonomy, both because it's a familiar, common-sense set of
- * levels and so a user's own listings line up with the same filter pills
+ * externally-ingested row could carry whatever vocabulary its source uses;
+ * the Greenhouse/Lever sync assigns only "Internship" or "Entry Level", see
+ * `classifyStudentLevel` in `lib/jobs/studentFilter.ts`), but a manual
+ * submission has no external source to inherit a value from, so this fixed
+ * list is what the submission form offers. It includes those two values plus
+ * the rest of The Muse's former taxonomy (the original ingestion source,
+ * docs/ARCHITECTURE.md §7.1), both because it's a familiar, common-sense set
+ * of levels and so a user's own listings line up with the same filter pills
  * `/jobs` already offers for externally-ingested ones.
  */
 export const JOB_DESCRIPTION_LEVELS = [

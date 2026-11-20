@@ -362,7 +362,7 @@ export async function createJobDescription(
  * "checked twice" ownership pattern every other query function in this
  * codebase follows (see docs/ARCHITECTURE.md §2's intro). Returns the
  * updated row, or `null` if no row matched (not found, not owned, or a
- * `source='themuse'` row — the RLS policy's `source = 'user'` check would
+ * non-`user` (externally ingested) row — the RLS policy's `source = 'user'` check would
  * also block that last case, but the explicit filter here means the "not
  * found" `null` path is uniform regardless of which check actually stopped
  * it). Callers turn `null` into a `403`, not `404`, per §2 — existence of
@@ -482,14 +482,17 @@ function chunk<T>(items: T[], size: number): T[][] {
 }
 
 /**
- * Upserts a batch of externally-sourced job listings (e.g. from The Muse —
- * see `lib/jobs/themuse.ts`/`lib/jobs/sync.ts`), keyed on the
- * `(source, external_id)` unique constraint added by
- * `supabase/migrations/0004_external_job_listings.sql`. Re-running a sync
- * for a listing already ingested updates that row in place (title/
- * description/location can change between syncs) rather than creating a
- * duplicate. `submitted_by` is left `null` — these rows have no Kalify
- * user as their submitter.
+ * Upserts a batch of externally-sourced job listings (Greenhouse/Lever
+ * company boards — see `lib/jobs/sources/` and `lib/jobs/sync.ts`,
+ * docs/ARCHITECTURE.md §7.7), keyed on the `(source, external_id)` unique
+ * constraint added by `supabase/migrations/0004_external_job_listings.sql`.
+ * Re-running a sync for a listing already ingested updates that row in place
+ * (title/description/location can change between syncs) rather than creating
+ * a duplicate. `submitted_by` is left `null` — these rows have no Kalify
+ * user as their submitter. `deleted_at` is always written as `null`, so a
+ * listing that was soft-deleted after dropping off its board (see
+ * `softDeleteMissingExternalJobDescriptions`) is shown again if it
+ * reappears (§7.7.6).
  *
  * Callers MUST pass a service-role client (`lib/supabase/admin.ts`): there
  * is no authenticated user in a cron/sync context, so the
@@ -525,6 +528,7 @@ export async function upsertExternalJobDescriptions(
           location: row.location,
           posted_at: row.postedAt,
           submitted_by: null,
+          deleted_at: null,
         })),
         { onConflict: "source,external_id", count: "exact" },
       );
@@ -537,6 +541,89 @@ export async function upsertExternalJobDescriptions(
     }
 
     count += batchCount ?? batch.length;
+  }
+
+  return { count };
+}
+
+/** Chunk size for the soft-delete `.in("id", ...)` filter (§7.7.6). */
+const SOFT_DELETE_CHUNK_SIZE = 100;
+
+/** Same rule as `lib/jobs/sources/companies.ts` (enforced there by a test). */
+const BOARD_TOKEN_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * Snapshot close for one company board (docs/ARCHITECTURE.md §7.7.6):
+ * soft-deletes (`deleted_at = now()`) every active row of this
+ * `(source, token)` whose `external_id` is not in `presentExternalIds` —
+ * the board's *unfiltered* job-id set, as `${token}:${id}` strings.
+ *
+ * Only call this after a complete 200 snapshot of the board and a successful
+ * upsert, never after a 404, error, timeout, or skip (`lib/jobs/sync.ts`
+ * enforces this). Soft delete only, never hard delete:
+ * `matches.job_description_id` is `on delete cascade`.
+ *
+ * `token` is safe inside `LIKE` because board tokens match
+ * `^[a-z0-9][a-z0-9-]*$` (no `%`/`_` wildcards); it is re-checked here as
+ * defense in depth. The diff runs in JS and the update is chunked by row id,
+ * so no long id list goes into a PostgREST filter URL. Callers MUST pass the
+ * service-role client (`lib/supabase/admin.ts`).
+ */
+export async function softDeleteMissingExternalJobDescriptions(
+  supabase: Client,
+  source: "greenhouse" | "lever",
+  token: string,
+  presentExternalIds: ReadonlySet<string>,
+): Promise<{ count: number }> {
+  if (!BOARD_TOKEN_PATTERN.test(token)) {
+    throw new JobDescriptionQueryError(
+      "Refusing to soft-delete external job descriptions for an invalid board token.",
+    );
+  }
+
+  const { data, error } = await supabase
+    .from("job_descriptions")
+    .select("id, external_id")
+    .eq("source", source)
+    .like("external_id", `${token}:%`)
+    .is("deleted_at", null);
+
+  if (error) {
+    throw new JobDescriptionQueryError(
+      `Failed to list active external job descriptions: ${error.message}`,
+      error,
+    );
+  }
+
+  const missingIds = (data ?? [])
+    .filter(
+      (row) =>
+        // Defensive: `like` never matches a null external_id, so the null branch is unreachable today.
+        row.external_id === null || !presentExternalIds.has(row.external_id),
+    )
+    .map((row) => row.id);
+
+  if (missingIds.length === 0) {
+    return { count: 0 };
+  }
+
+  const deletedAt = new Date().toISOString();
+  let count = 0;
+  for (const ids of chunk(missingIds, SOFT_DELETE_CHUNK_SIZE)) {
+    const { error: updateError } = await supabase
+      .from("job_descriptions")
+      .update({ deleted_at: deletedAt })
+      .in("id", ids)
+      .eq("source", source)
+      .is("deleted_at", null);
+
+    if (updateError) {
+      throw new JobDescriptionQueryError(
+        `Failed to soft-delete external job descriptions: ${updateError.message}`,
+        updateError,
+      );
+    }
+    count += ids.length;
   }
 
   return { count };

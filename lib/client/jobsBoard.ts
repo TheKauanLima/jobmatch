@@ -17,11 +17,12 @@
 // ---------------------------------------------------------------------
 
 /**
- * Levels the level filter offers, per docs/ARCHITECTURE.md §7.4. These match
- * `THEMUSE_SYNC_LEVELS` (`lib/jobs/themuse.ts`), the only levels the external
- * sync populates, and are the student-relevant segment of
+ * Levels the level filter offers, per docs/ARCHITECTURE.md §7.4 and §7.7.3.
+ * These are exactly the values `classifyStudentLevel`
+ * (`lib/jobs/studentFilter.ts`) assigns during the Greenhouse/Lever sync
+ * (`lib/jobs/sources/`), and are the student-relevant segment of
  * `JOB_DESCRIPTION_LEVELS`. Duplicated rather than imported so this client
- * helper doesn't pull the Muse API client into the browser bundle.
+ * helper doesn't pull server-side sync code into the browser bundle.
  */
 export const JOB_LEVEL_FILTERS = ["Internship", "Entry Level"] as const;
 export type JobLevelFilter = (typeof JOB_LEVEL_FILTERS)[number];
@@ -343,10 +344,18 @@ export type JobSourceInfo = {
 };
 
 /**
- * Display metadata per `job_descriptions.source`. The Muse's API terms
- * require content to link back to The Muse (docs/ARCHITECTURE.md §7.1,
- * §13.6.7), so its listings carry an attribution link in addition to the
- * "Apply on The Muse" link to the posting itself.
+ * Display metadata per `job_descriptions.source`.
+ *
+ * Greenhouse and Lever listings are the employer's own postings, fetched from
+ * the company's public job board (docs/ARCHITECTURE.md §7.7.9). Neither
+ * provider publishes attribution terms, so they're framed as "Employer
+ * posting" with no attribution link; the "Opens {host}" line on the detail
+ * page shows where the apply link actually goes.
+ *
+ * `themuse` is legacy (source dropped 2026-11-20, §7.7.8) but kept because
+ * older rows still appear via existing matches. The Muse's API terms require
+ * linking back to The Muse (§7.1, §13.6.7), so those rows keep their
+ * attribution link.
  */
 export function getJobSourceInfo(source: string): JobSourceInfo {
   switch (source) {
@@ -365,6 +374,22 @@ export function getJobSourceInfo(source: string): JobSourceInfo {
         description: "Listing from The Muse",
         attribution: { text: "The Muse", href: "https://www.themuse.com" },
         applyLabel: "Apply on The Muse",
+      };
+    case "greenhouse":
+      return {
+        label: "Employer posting",
+        kind: "external",
+        description: "From the company's careers site (via Greenhouse)",
+        attribution: null,
+        applyLabel: "Apply on company site",
+      };
+    case "lever":
+      return {
+        label: "Employer posting",
+        kind: "external",
+        description: "From the company's careers site (via Lever)",
+        attribution: null,
+        applyLabel: "Apply on company site",
       };
     default:
       return {

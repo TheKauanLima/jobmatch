@@ -129,7 +129,8 @@ export type JobDescriptionRow =
  * (below) is the boolean the frontend actually needs, per §10.4.
  *
  * `source`/`level`/`location`/`posted_at` were added per docs/ARCHITECTURE.md
- * §7 for externally-ingested listings (The Muse). `external_id` is dropped
+ * §7 for externally-ingested listings (The Muse, now Greenhouse/Lever, §7.7).
+ * `external_id` is dropped
  * (internal dedup detail with no client use, same reasoning as
  * `submitted_by`).
  *

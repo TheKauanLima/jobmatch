@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { JobDescriptionCard } from "@/components/jobs/JobDescriptionCard";
 import { JobDescriptionList } from "@/components/jobs/JobDescriptionList";
-import { JobsResults } from "@/components/jobs/JobsBoard";
+import { JobsBoardLayout, JobsResults } from "@/components/jobs/JobsBoard";
 import {
   JobsEmptyState,
   JobsErrorState,
@@ -103,6 +103,19 @@ describe("JobDescriptionCard", () => {
     expect(html).not.toContain("The Muse");
     // Falls back to created_at (2 days before NOW).
     expect(html).toContain("Posted 2 days ago");
+  });
+
+  it.each([
+    ["greenhouse", "Greenhouse", "https://job-boards.greenhouse.io/northwindlabs/jobs/4012345"],
+    ["lever", "Lever", "https://jobs.lever.co/northwindlabs/0b1c2d3e-aaaa-bbbb-cccc-1234567890ab"],
+  ] as const)("labels %s listings as an employer posting", (source, provider, sourceUrl) => {
+    const html = renderToStaticMarkup(
+      <JobDescriptionCard jobDescription={job({ source, source_url: sourceUrl })} now={NOW} />,
+    );
+    expect(html).toContain("Employer posting");
+    expect(html).toContain(`title="From the company&#x27;s careers site (via ${provider})"`);
+    expect(html).not.toContain("The Muse");
+    expect(html).not.toContain("Community");
   });
 
   it("omits optional rows when company, location and date are missing", () => {
@@ -226,6 +239,19 @@ describe("board states", () => {
     expect(html).toContain('aria-busy="true"');
     expect(html).toContain('role="status"');
     expect(html).toContain("Loading jobs");
+  });
+});
+
+describe("JobsBoardLayout", () => {
+  it("intro names company career sites, not The Muse", () => {
+    const html = renderToStaticMarkup(
+      <JobsBoardLayout query={{ q: null, level: null }} submitForm={<p>FORM-SLOT</p>}>
+        <p>RESULTS-SLOT</p>
+      </JobsBoardLayout>,
+    );
+    expect(html).toContain("Internship and entry-level roles from company career sites");
+    expect(html).not.toContain("The Muse");
+    expect(html).toContain("RESULTS-SLOT");
   });
 });
 
