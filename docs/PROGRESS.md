@@ -1,0 +1,295 @@
+# Kalify v2 — Progress Log
+
+Running log of what's been done, what's in flight, and what's next. Design lives in
+`docs/ARCHITECTURE.md` §13; milestone definitions live in `docs/ROADMAP.md`. Update
+this file at the end of every work session.
+
+---
+
+## Session 2026-11-04
+
+### Done
+- **Renamed the product to Kalify** (user-facing strings, docs, agent definitions).
+  Internal identifiers (package name, Supabase project id, repo URL,
+  `jobmatch-theme` storage key, applied migrations) intentionally unchanged.
+  Committed in `0a4a5b7`.
+- **Live database caught up:** migrations 0004–0006 had never been applied to the
+  live Supabase project (`xpubgotqrsosvpiwlpyh`). Applied all three. Job search,
+  level filters and editing/soft-deleting own listings now work against the live DB.
+- **Job board populated:** ran The Muse sync once → 205 listings (100 Internship,
+  100 Entry Level, 5 user-submitted).
+- **v2 design written** by the architect: `docs/ARCHITECTURE.md` §13 and
+  `docs/ROADMAP.md` (5 phases, ~35 milestones). CLAUDE.md updated with the revised
+  privacy model (private custom listings) and AI stack (embeddings, background work).
+  Committed in `0a4a5b7`; later §13/ROADMAP edits from this session are below.
+- **M1.4a — Self-serve account deletion (backend): DONE, reviewer APPROVED WITH NITS,
+  all nits fixed.** `DELETE /api/account` (`app/api/account/route.ts`,
+  `lib/account/**`, schema in `lib/validation/schemas.ts`). 91 tests.
+  §13.13.7 / §13.14 updated to record the implementation details the review flagged.
+- **M1.1 — Claude layer v2: IMPLEMENTED, review NOT finished.** `lib/claude/**`
+  rewritten for `claude-opus-5-5` with structured outputs (`beta.messages.create` +
+  `output_config.format` + server-side refusal fallbacks), typed error
+  classification, usage/cost accounting with an injectable sink, extended
+  prompt-injection escaping, semantic validation. Repair/retry machinery
+  (`repairListField`, `MAX_MATCH_ATTEMPTS`, forced tool use) deleted. v1 analyze and
+  match routes adapted with unchanged response shapes; verified end-to-end with real
+  API calls (~$0.02–0.03 per call). "Verified" note added to §13.5.2.
+  **Note:** the live site's analyze/match now call `claude-opus-5-5` once deployed.
+- **Rate limit for account-deletion password checks** designed (`account_reauth`,
+  10/user/day) and added to §13.3.1/§13.13.7 and to migration 0007.
+
+### In progress — stopped mid-way at the user's request
+- **M1.2 — Background task infrastructure: PARTIAL, NOT reviewed, NOT applied.**
+  Written: `supabase/migrations/0007_background_infra.sql` (incl. `account_reauth`),
+  `0008_worker_schedule.sql`, `lib/tasks/**` (types, registry, enqueue, kick, budget,
+  errors, usageSink, workerAuth, worker, maintenance.noop handler),
+  `app/api/worker/{tick,status}/route.ts`, `lib/supabase/queries/{tasks,usage}.ts`,
+  `types/database.ts`, `.env.local.example`.
+  Missing: the worker-loop test (`lib/tasks/worker.test.ts`) the agent was writing
+  when stopped; final self-check; report of ops steps.
+  **Do NOT apply 0007/0008 to the live database until M1.2 is finished and reviewed.**
+  Deploying this code is safe: the worker route fails closed without
+  `WORKER_SECRET`, and nothing schedules it until 0008 is applied.
+- **M1.1 review:** reviewer was stopped right at the start; must be re-run.
+- **`enum` decision (architect):** the SDK's `zodOutputFormat` strips `enum` from the
+  wire schema; architect was asked to decide whether `callStructured` re-injects it.
+  Stopped before answering; re-ask.
+
+### Next steps (in order)
+1. Resume M1.2: finish `lib/tasks/worker.test.ts`, run full checks, produce ops notes.
+2. Wire the usage sink: register `setUsageSink(recordAiUsageEvent)` (from
+   `lib/tasks/usageSink.ts`) in a module imported by every server entry point that
+   calls Claude, including the two v1 routes.
+3. Reviewer: M1.1 and M1.2.
+4. Apply 0007 + 0008 to the live DB; create Vault secrets `kalify_worker_url` and
+   `kalify_worker_secret`; set `WORKER_SECRET` and `APP_BASE_URL` in Vercel
+   (production only); check Deployment Protection doesn't block `/api/worker/tick`.
+5. Architect: `enum` decision (above).
+6. M1.4c (re-auth rate limit wiring, cancel-tasks gate flip, `GET /api/account/limits`,
+   move test fake to `/tests/fakes/`), then M1.3 QA, then M1.4b settings UI.
+7. Consider setting `maxDuration` on the v1 analyze/match routes (Claude task
+   timeout 160s + one retry) — flagged by M1.1, pending review.
+
+### Open decisions for the user (ARCHITECTURE.md §13.19)
+1. Embeddings provider — recommended Voyage AI (`voyage-4-lite`); blocks M2.4.
+2. Cheaper model for bulk job extraction — recommended: stay on Opus with a 300/day
+   cap until the M2.5 eval, then switch if quality holds.
+3. Budget caps — $15/day global AI, $5/day ingestion, per-user daily limits.
+4. Job sources — USAJOBS (user gets a free key), curated Greenhouse/Lever boards;
+   defer Adzuna.
+5. URL-import deny-list (LinkedIn, Indeed, Glassdoor, Handshake).
+6. Email provider — Resend; blocks Phase 5.
+7. Custom listing visibility — explicit choice, Private pre-highlighted.
+
+---
+
+## Sessions 2026-11-05 and 2026-11-09
+
+### Done
+- **M1.1 — Claude layer v2: APPROVED** (review → CHANGES REQUIRED → fixed → re-review
+  APPROVED WITH NITS, doc nits applied). Fixes: v1 analyze/match routes export
+  `maxDuration = 300` with a hard 270s deadline (`callStructured` races the SDK
+  promise against the signal because the SDK's retry sleep ignores it; 120s
+  per-attempt timeout) so a resume can never be left `processing`; price table adds
+  claude-opus-5 / sonnet-5 / opus-4-8 with an explicit $5/$25 unknown-model ceiling and
+  strict id matching; escaping hardened (NFKC, `\p{Default_Ignorable_Code_Point}`,
+  repeated slashes).
+- **M1.1b added to roadmap:** restore `enum` constraints on the wire schema for small
+  closed enums (after a 25-call enforcement probe); taxonomy values stay free text.
+  Must land before M2.2/M2.3.
+- **M1.2 — Background task infrastructure: APPROVED** (review → APPROVED WITH NITS →
+  fix pass → re-review APPROVED WITH NITS, "safe to apply" → final nits fixed and
+  verified by the orchestrator). Additions from review: dead-task hook outbox
+  (`claim_dead_task_hooks` / `complete_dead_task_hook` / `release_dead_task_hook`,
+  swept every tick + fast path), stale-lease sweep (`dead_letter_stale_tasks`, cron
+  `kalify-stale-leases`), over-budget deferral without claiming
+  (`defer_queued_tasks`), preview deployments refuse to act as the worker (403),
+  two-key advisory locks, DB call timeouts, alertable `[ALERT][...]` log lines.
+  Usage sink wired into the worker and both v1 routes. 919 tests; SQL validated on
+  PGlite (123 checks). All 19 functions explicitly revoke PUBLIC execute (verified).
+- §13 kept in sync with every review outcome; ROADMAP gained M1.1b, M1.4c, and quote
+  display tasks in M3.2/M3.6 (show original text, not NFKC-normalized quotes).
+
+- **0007 + 0008 APPLIED to the live database** (2026-11-09, via the Supabase
+  connector, files sent verbatim). Verified: 4 active `kalify-*` cron jobs owned by
+  postgres; all 19 functions owned by postgres with `search_path=""`;
+  anon/authenticated cannot execute any service function; `invoke_worker_tick` not
+  executable by service_role; no USAGE on `private` for anon/authenticated; RLS on
+  all 4 new tables, only `rate_limit_events` selectable by authenticated; rate-limit
+  seed rows present. Smoke test in a rolled-back transaction passed (dedupe, claim,
+  fencing, retry→dead, hook outbox, tick skips without Vault secrets). Advisors:
+  expected "RLS enabled, no policy" INFO on `background_tasks`, `ai_usage_events`,
+  `private.rate_limits`; WARN "authenticated can execute SECURITY DEFINER" on
+  `get_my_rate_limits` / `consume_account_reauth_attempt` — intended (both no-arg,
+  scoped to `auth.uid()`); leaked-password protection still off (user to-do).
+- **Generated types diffed against `types/database.ts`:** no drift; only deliberate
+  narrowings (recorded in the file header).
+- **M1.4c — Account hardening: APPROVED** (review → APPROVED WITH NITS → nits fixed,
+  checks re-run by the orchestrator: 953 tests, tsc and eslint clean).
+  `lib/rateLimit.ts` (v2 rate-limit module); `DELETE /api/account` charges an
+  `account_reauth` attempt before any GoTrue call (false → 429, RPC error → 500,
+  23503/42501 → 401 for the concurrent-delete race); one shared 500 copy;
+  `CANCEL_TASKS_FOR_USER_ENABLED` gate and `lib/account/cancelUserTasks.ts` deleted,
+  deletion always calls `queries/tasks.ts#cancelQueuedTasksForUser` first;
+  `GET /api/account/limits`; test fake moved to `tests/fakes/supabaseStorage.ts`,
+  `no-restricted-imports` lint rule keeps `lib/`/`app/` off `tests/**`.
+  Live check (rolled back): 10 attempts allowed, 11th refused. pgTAP criterion
+  handed off to M1.3 (recorded in ROADMAP). §13.9.3 / §13.13.7 / §13.14 synced.
+
+- **Production was pointed at the wrong database (fixed).** A Vercel Marketplace
+  Supabase resource, `supabase-bole-bell` (project `scvkmuiajdizsoxlepgo`, Free plan,
+  owned by the Vercel team, not in the user's Supabase org), was connected to the
+  `jobmatch` Vercel project and had replaced the Supabase env vars in Production and
+  Preview. Disconnected it; set `NEXT_PUBLIC_SUPABASE_URL` / `_ANON_KEY` (JobMatch,
+  verified by key `ref`) and `SUPABASE_SERVICE_ROLE_KEY` (sensitive) on Production +
+  Preview; redeployed. The resource still exists. Delete it only after the user
+  confirms nothing needs it. Any sign-ups made while it was connected live there,
+  not in JobMatch.
+- **Worker secrets:** `WORKER_SECRET`, `APP_BASE_URL` (Vercel Production) and Vault
+  `kalify_worker_url` / `kalify_worker_secret` are set; ticks return 202.
+- **M1.2 production acceptance: PASSED** (2026-11-09 23:45 UTC, after the env fix).
+  A plain `maintenance.noop` succeeded on attempt 1; a `force_fail` noop
+  (max_attempts 2) retried with backoff, went `dead` after 2 attempts, and its onDead
+  hook was handled within the same tick. The two `acceptance:*` rows are left for the
+  daily purge to remove.
+
+- **M1.3 — QA: unit half APPROVED; DB half written, NOT run.** Added worker
+  time-budget, self-kick and registry tests, adversarial `escapeUntrusted` tests and
+  U+0085 tests (1,050 vitest tests). Review → APPROVED WITH NITS twice; every nit fixed.
+  Two real bugs found and **fixed**: **B1**: prompt escaping (and
+  `semanticValidation.ts`) used JS `\s`, which misses U+0085 NEXT LINE; now
+  `\p{White_Space}`. **B2**: the worker's time-budget fit went stale across awaited DB
+  calls. The fix is the architect's decision (§13.4.2): one `fitsInTick` predicate with a
+  15 s `WORKER_CLAIM_MARGIN_MS`, re-checked with a fresh clock before every claim.
+  Registry invariant is now `maxDurationMs < 270 000`. Also added a hard-budget guard for
+  `onBudgetDelayed` (`budgetHooksSkipped`). Its remaining gaps (no timeout or signal,
+  unbounded deferral loop) are recorded as ROADMAP M3.1 task 4.
+  DB half: 6 pgTAP files in `supabase/tests/database/`,
+  `scripts/db-concurrency-check.mjs` (local-only host and port guard),
+  `supabase/tests/README.md`; devDeps `supabase` 3.1.0, `pg` 8.23.1,
+  `pg-connection-string` 2.14.1. Reviewer checked plan counts and expectations
+  statically. Accept only after they run green. Blocker: Docker Desktop now works (after enabling Virtual
+  Machine Platform + `hypervisorlaunchtype auto`), but `supabase start` (CLI 3.1.0)
+  hangs at "Starting database..." without ever creating the db container, also with
+  `-x` for non-essential services. Not diagnosed further (time-boxed). Next try: the
+  CLI's `--debug` output with an unbuffered run of `node_modules/.bin/supabase` (the
+  npx wrapper may buffer), or an older CLI version.
+
+### Next steps (in order)
+1. ~~Apply 0007 → 0008 and verify~~ — done.
+2. ~~Regenerate/diff types~~ — done.
+3. ~~Worker secrets + M1.2 production acceptance~~ — done (passed 2026-11-09).
+4. ~~M1.4c~~ — done.
+5. ~~M1.3 unit half~~ — committed (`1b39c87`). Still open: run the pgTAP files and
+   the concurrency script once local Supabase starts.
+6. ~~M1.1b + M1.1c~~ — **APPROVED 2026-11-12** (review → CHANGES REQUIRED → fixed →
+   re-review APPROVED). Step 0 found `@anthropic-ai/sdk` 1.7.0 fixed `enum`
+   stripping, so the architect chose to pin 1.8.0 exactly (crosses the breaking 1.0.0;
+   `anthropic-version: 2026-10-21`; licence is now Apache-2.0) instead of our own enum
+   helper. `buildOutputFormat` is a pass-through seam and the only `zodOutputFormat`
+   importer.
+   - **Probe:** enum enforced, 25/25 (20 sync + 5 batch).
+   - **Contract check:** `scripts/evals/sdk-contract-check.ts` items (i)–(x) all
+     passed. Re-run it on every SDK bump.
+   - **Live checks:** v1 analyze and match run end-to-end at the lib level.
+   - **Live spend:** about $0.14 in total.
+   - **Telemetry and logging (M1.1c):** the client is built with
+     `openTelemetry: false` and `logLevel: "warn"`, so `ANTHROPIC_LOG=debug` can no
+     longer log resume text into Vercel logs (a pre-existing gap the review found).
+     A guard rejects the OTel content-capture env var. Import-level guards allow SDK
+     value imports only in `lib/claude/client.ts`, `lib/claude/outputFormat.ts` and
+     `scripts/evals/*`, and no `instrumentation.*` file.
+   - **Tests:** 1,113.
+   - **Design decisions recorded for M2.2:** batches can't use server-side refusal
+     fallbacks, so a refused item gets one sync re-run (capped at 10 per batch).
+     Capped items return to the stale pool as one strike; only `ai_refused` is final
+     per content hash.
+7. ~~M1.4b settings + delete-account UI~~ — **APPROVED WITH NITS 2026-11-12, all nits
+   fixed.**
+   - **Page:** `/settings` (signed-in only; also added to `PROTECTED_PATHS`) with a
+     Nav link.
+   - **`DeleteAccountForm`:** responses mapped per §13.13.7.
+     - 204 → `/?account=deleted`.
+     - 401 → `/?account=signed_out`, a non-error notice. It doesn't claim
+       "deleted", because a 401 can also mean the session simply ended.
+     - 500 with `internal_error` → "still exists".
+     - Platform 500s, 5xx and network errors → "couldn't confirm"; retrying is
+       safe.
+   - **Navigation:** full navigation drops the cached private pages, after a
+     best-effort local sign-out.
+   - **Banner:** `AccountStatusNotice` strips `?account=` after the first read.
+   - **`UsageLimits` panel:** reads `/api/account/limits`.
+   - **Code layout:** pure helpers in `lib/client/`; 1,181 tests.
+   - **Carried to M1.8:** jsdom/Testing Library tests for click-driven behaviour,
+     and the Next 16 `middleware.ts` → `proxy.ts` rename.
+8. **M1.5 job ingestion v2: IN PROGRESS, stopped mid-way 2026-11-16 (user shutdown).**
+   - **Where it is:** partial, unreviewed work on branch `wip/m1.5-ingestion` (commit
+     15e9ab6). It was accidentally committed and pushed to main on 2026-11-16, then
+     taken off main with a revert commit on 2026-11-18. To resume, check out the
+     branch, or revert the revert. Contents: migration 0009, source adapters (`lib/jobs/sources/`, html, normalize,
+     studentFilter), generic `sync.ts`, ingest/backfill handlers, routes switched to
+     the RPCs, `vercel.json` cron removed, hand-edited `types/database.ts`.
+   - **Last step in progress:** the handler tests. Tests/tsc/eslint were NOT run at
+     the stop point.
+   - **Never merge or deploy this before 0009 is reviewed and applied:** the routes
+     depend on RPCs that don't exist on the live DB yet.
+   - **To resume:**
+     1. Check out the branch.
+     2. Have backend-dev finish (handler tests, pgTAP files marked UNRUN, full
+        checks, ops notes).
+     3. Reviewer pass.
+     4. Smoke-test 0009 on the live DB in a rolled-back transaction.
+     5. Apply with the user's OK.
+     6. Merge.
+9. **Direction change 2026-11-17: visible-first.** The user wants demoable improvements
+   ahead of backend roadmap work, so the roadmap order is now subordinate to visible
+   payoff.
+10. ~~V1 Resume critique (visible-first)~~ — **DONE 2026-11-18.**
+    - **Design:** §13.20 (architect).
+    - **V1.1 backend:** review → APPROVED WITH NITS, all 10 applied. Race losers are
+      not refunded (budget guard). The same-owner trigger fires only on the ownership
+      columns.
+    - **Migration 0010:** smoke-tested in a rolled-back transaction on the live DB,
+      then **applied** (user approved). It was applied ahead of the parked 0009, per
+      the §13.3.0 exception.
+    - **Live latency/cost:** ~40 s and ~$0.09 per critique (3 synthetic resumes,
+      effort high). The wait copy now says "under a minute".
+    - **V1.2 frontend:** critique card on `/resumes/[id]` (score ring, top 3
+      priorities, 5 dimension cards, line-by-line rewrites with copy, ATS issues,
+      mobile and dark mode). The frontend got no separate reviewer pass (low-risk
+      UI; plain-text rendering is test-enforced).
+    - **`types/database.ts`:** keep the hand edits; check only the 0010 entries
+      against the live schema.
+    - **Not yet verified:** a real end-to-end critique on the deployed site with a
+      real account.
+11. **Visible-first UI round, done 2026-11-18** (frontend only; no backend, migrations or
+    Claude calls; screenshots checked by the orchestrator; no separate reviewer pass
+    for these low-risk UI changes).
+    - **Landing page:** a sample critique showcase (`ee1e22a`), and the hero/footer
+      copy now leads with the critique.
+    - **Dashboard overhaul** (`app/dashboard`, `components/dashboard`,
+      `lib/client/dashboard.ts`):
+      - a "next best step" card;
+      - resumes with critique scores;
+      - top matches (best 3 of the last 20);
+      - today's critique allowance;
+      - a first-run welcome.
+      - One new read query, `listLatestCritiqueSummaries` (session client,
+        user-filtered, scores only).
+      - The "Latest job listings" teaser was removed.
+    - **Jobs board polish** (`app/jobs`, `components/jobs`, `lib/client/jobsBoard.ts`):
+      - cards with level and source badges, relative dates and text snippets;
+      - URL-state search and level pills, empty, error and loading states;
+      - a detail page with key facts, The Muse attribution, safe "Apply" links and
+        "Check my fit".
+      - Uses only main's current API (M1.5 stays parked).
+    - 1,555 tests.
+12. Housekeeping: one-time line-ending renormalization commit (M1.4a files and
+   `.gitignore` are CRLF) plus a `.gitattributes` with `* text=auto eol=lf`.
+
+### User to-dos (not blocking current work)
+- Enable leaked-password protection in Supabase Auth settings.
+- Decide whether to delete the disconnected Vercel resource `supabase-bole-bell`.
+- Disk space: C: had ~5 GB free on 2026-11-12, and one write hit ENOSPC. Docker's
+  `docker_data.vhdx` is 13 GB on C:. Consider moving it to D: (Docker Desktop →
+  Settings → Resources → Advanced → Disk image location).

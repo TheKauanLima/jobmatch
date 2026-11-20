@@ -488,7 +488,7 @@ function chunk<T>(items: T[], size: number): T[][] {
  * `supabase/migrations/0004_external_job_listings.sql`. Re-running a sync
  * for a listing already ingested updates that row in place (title/
  * description/location can change between syncs) rather than creating a
- * duplicate. `submitted_by` is left `null` — these rows have no JobMatch
+ * duplicate. `submitted_by` is left `null` — these rows have no Kalify
  * user as their submitter.
  *
  * Callers MUST pass a service-role client (`lib/supabase/admin.ts`): there

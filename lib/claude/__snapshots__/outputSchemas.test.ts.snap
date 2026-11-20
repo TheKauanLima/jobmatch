@@ -1,0 +1,444 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`wire-schema snapshots (review snapshot updates like code) > analyzeResume 1`] = `
+{
+  "schema": {
+    "$defs": {
+      "__schema0": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "description": "One to two sentences of specific detail from the resume that supports the label.",
+            "type": "string",
+          },
+          "label": {
+            "description": "Short label for this strength or weakness, e.g. 'Strong backend experience'.",
+            "type": "string",
+          },
+        },
+        "required": [
+          "label",
+          "detail",
+        ],
+        "type": "object",
+      },
+      "__schema1": {
+        "type": "string",
+      },
+    },
+    "additionalProperties": false,
+    "description": "{$schema: "https://json-schema.org/draft/2020-12/schema"}",
+    "properties": {
+      "strengths": {
+        "description": "Notable strengths found in the resume.",
+        "items": {
+          "$ref": "#/$defs/__schema0",
+        },
+        "type": "array",
+      },
+      "suggested_roles": {
+        "description": "Realistic job titles this candidate appears well suited for.",
+        "items": {
+          "$ref": "#/$defs/__schema1",
+        },
+        "type": "array",
+      },
+      "summary": {
+        "description": "A short (2-4 sentence) overview of the candidate.",
+        "type": "string",
+      },
+      "weaknesses": {
+        "description": "Notable weaknesses or gaps found in the resume.",
+        "items": {
+          "$ref": "#/$defs/__schema0",
+        },
+        "type": "array",
+      },
+    },
+    "required": [
+      "strengths",
+      "weaknesses",
+      "summary",
+      "suggested_roles",
+    ],
+    "type": "object",
+  },
+  "type": "json_schema",
+}
+`;
+
+exports[`wire-schema snapshots (review snapshot updates like code) > critiqueResume 1`] = `
+{
+  "schema": {
+    "$defs": {
+      "__schema0": {
+        "additionalProperties": false,
+        "properties": {
+          "dimension": {
+            "enum": [
+              "impact",
+              "clarity",
+              "relevance",
+              "structure",
+              "ats_readability",
+            ],
+          },
+          "rationale": {
+            "description": "One sentence explaining the score.",
+            "type": "string",
+          },
+          "score": {
+            "description": "Integer score from 0 to 100, per the rubric bands.
+
+{minimum: 0, maximum: 100}",
+            "type": "integer",
+          },
+          "top_fix": {
+            "description": "The single most valuable concrete change for this dimension.",
+            "type": "string",
+          },
+        },
+        "required": [
+          "dimension",
+          "score",
+          "rationale",
+          "top_fix",
+        ],
+        "type": "object",
+      },
+      "__schema1": {
+        "additionalProperties": false,
+        "properties": {
+          "feedback": {
+            "description": "What is wrong with this line and why it matters, 1-2 sentences.",
+            "type": "string",
+          },
+          "issue_types": {
+            "items": {
+              "enum": [
+                "no_metric",
+                "weak_verb",
+                "vague",
+                "too_long",
+                "passive_voice",
+                "jargon",
+                "typo_grammar",
+                "formatting",
+                "irrelevant",
+              ],
+            },
+            "type": "array",
+          },
+          "needs_user_input": {
+            "description": "True when the rewrite contains a [bracketed placeholder] the student must fill in.",
+            "type": "boolean",
+          },
+          "original_text": {
+            "description": "One line or bullet copied verbatim from the resume, without its bullet glyph.",
+            "type": "string",
+          },
+          "section": {
+            "enum": [
+              "experience",
+              "projects",
+              "education",
+              "leadership",
+              "skills",
+              "summary",
+              "other",
+            ],
+          },
+          "suggested_rewrite": {
+            "description": "Improved line using only facts from the original line; [bracketed placeholders] for missing metrics.",
+            "type": "string",
+          },
+        },
+        "required": [
+          "section",
+          "original_text",
+          "issue_types",
+          "feedback",
+          "suggested_rewrite",
+          "needs_user_input",
+        ],
+        "type": "object",
+      },
+      "__schema2": {
+        "type": "string",
+      },
+    },
+    "additionalProperties": false,
+    "description": "{$schema: "https://json-schema.org/draft/2020-12/schema"}",
+    "properties": {
+      "ats_issues": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "fix": {
+              "type": "string",
+            },
+            "issue": {
+              "type": "string",
+            },
+          },
+          "required": [
+            "issue",
+            "fix",
+          ],
+          "type": "object",
+        },
+        "type": "array",
+      },
+      "dimensions": {
+        "description": "Exactly one entry per dimension: impact, clarity, relevance, structure, ats_readability.
+
+{maxItems: 5, minItems: 5}",
+        "items": {
+          "$ref": "#/$defs/__schema0",
+        },
+        "type": "array",
+      },
+      "line_feedback": {
+        "description": "Line-by-line feedback, most impactful first, one item per line. At most 25 items.",
+        "items": {
+          "$ref": "#/$defs/__schema1",
+        },
+        "type": "array",
+      },
+      "missing_sections": {
+        "description": "Standard sections that are missing and would help this candidate. Empty if none.",
+        "items": {
+          "$ref": "#/$defs/__schema2",
+        },
+        "type": "array",
+      },
+      "section_feedback": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "feedback": {
+              "type": "string",
+            },
+            "section": {
+              "description": "Section heading as it appears in the resume.",
+              "type": "string",
+            },
+          },
+          "required": [
+            "section",
+            "feedback",
+          ],
+          "type": "object",
+        },
+        "type": "array",
+      },
+      "student_context": {
+        "additionalProperties": false,
+        "properties": {
+          "note": {
+            "description": "One sentence on how the critique accounts for that stage.",
+            "type": "string",
+          },
+          "stage": {
+            "description": "The candidate's career stage, inferred from the resume.",
+            "enum": [
+              "early_student",
+              "late_student",
+              "new_grad",
+              "experienced",
+            ],
+          },
+        },
+        "required": [
+          "stage",
+          "note",
+        ],
+        "type": "object",
+      },
+      "summary": {
+        "description": "2-4 sentence overall assessment of the resume, addressed to the student.",
+        "type": "string",
+      },
+    },
+    "required": [
+      "summary",
+      "student_context",
+      "dimensions",
+      "line_feedback",
+      "section_feedback",
+      "ats_issues",
+      "missing_sections",
+    ],
+    "type": "object",
+  },
+  "type": "json_schema",
+}
+`;
+
+exports[`wire-schema snapshots (review snapshot updates like code) > fixture 1`] = `
+{
+  "schema": {
+    "$defs": {
+      "__schema0": {
+        "enum": [
+          "a",
+          "b",
+          "c",
+        ],
+      },
+      "__schema1": {
+        "enum": [
+          "intern",
+          "junior",
+          "mid",
+          "senior",
+        ],
+      },
+      "__schema2": {
+        "type": "string",
+      },
+    },
+    "additionalProperties": false,
+    "description": "{$schema: "https://json-schema.org/draft/2020-12/schema"}",
+    "properties": {
+      "label": {
+        "description": "{minLength: 1, maxLength: 80}",
+        "type": "string",
+      },
+      "list": {
+        "items": {
+          "enum": [
+            "x",
+            "y",
+          ],
+        },
+        "type": "array",
+      },
+      "nullable": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/__schema0",
+          },
+          {
+            "type": "null",
+          },
+        ],
+        "description": "A nullable enum.",
+      },
+      "plain": {
+        "enum": [
+          "red",
+          "green",
+        ],
+      },
+      "reusedOne": {
+        "$ref": "#/$defs/__schema1",
+      },
+      "reusedTwo": {
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/__schema1",
+              },
+              {
+                "type": "null",
+              },
+            ],
+          },
+        },
+        "required": [
+          "level",
+        ],
+        "type": "object",
+      },
+      "score": {
+        "description": "{minimum: 0, maximum: 100}",
+        "type": "integer",
+      },
+      "slug": {
+        "anyOf": [
+          {
+            "type": "string",
+          },
+          {
+            "type": "null",
+          },
+        ],
+      },
+      "tags": {
+        "description": "{maxItems: 5}",
+        "items": {
+          "$ref": "#/$defs/__schema2",
+        },
+        "type": "array",
+      },
+    },
+    "required": [
+      "plain",
+      "nullable",
+      "list",
+      "reusedOne",
+      "reusedTwo",
+      "score",
+      "label",
+      "tags",
+      "slug",
+    ],
+    "type": "object",
+  },
+  "type": "json_schema",
+}
+`;
+
+exports[`wire-schema snapshots (review snapshot updates like code) > matchResumeToJob 1`] = `
+{
+  "schema": {
+    "$defs": {
+      "__schema0": {
+        "type": "string",
+      },
+      "__schema1": {
+        "type": "string",
+      },
+    },
+    "additionalProperties": false,
+    "description": "{$schema: "https://json-schema.org/draft/2020-12/schema"}",
+    "properties": {
+      "gaps": {
+        "description": "One short plain-text point per area where the resume falls short of the job. Empty array if none.",
+        "items": {
+          "$ref": "#/$defs/__schema1",
+        },
+        "type": "array",
+      },
+      "matched_strengths": {
+        "description": "One short plain-text point per resume strength that is relevant to this job. Empty array if none.",
+        "items": {
+          "$ref": "#/$defs/__schema0",
+        },
+        "type": "array",
+      },
+      "rationale": {
+        "description": "A short (2-4 sentence) explanation of the score, specific to this resume and job.",
+        "type": "string",
+      },
+      "score": {
+        "description": "Overall fit as an integer from 0 (no meaningful alignment) to 100 (excellent alignment).
+
+{minimum: -9007199254740991, maximum: 9007199254740991}",
+        "type": "integer",
+      },
+    },
+    "required": [
+      "score",
+      "rationale",
+      "matched_strengths",
+      "gaps",
+    ],
+    "type": "object",
+  },
+  "type": "json_schema",
+}
+`;

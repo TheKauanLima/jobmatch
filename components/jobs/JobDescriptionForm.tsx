@@ -59,7 +59,16 @@ function CharCount({ value, max }: { value: string; max: number }) {
  * to inherit, so offering an open text field here would just fragment the
  * filter with near-duplicate values ("Intern" vs "Internship", etc.).
  */
-export function JobDescriptionForm() {
+interface JobDescriptionFormProps {
+  /**
+   * Render without the card border and heading, for use inside a container
+   * that already provides them (the collapsible "Share a job posting" panel
+   * on `/jobs`). The shared-data notice is kept either way.
+   */
+  embedded?: boolean;
+}
+
+export function JobDescriptionForm({ embedded = false }: JobDescriptionFormProps = {}) {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [company, setCompany] = useState("");
@@ -145,13 +154,20 @@ export function JobDescriptionForm() {
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
+      aria-label={embedded ? "Share a job posting" : undefined}
+      className={
+        embedded
+          ? "flex flex-col gap-3"
+          : "flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
+      }
     >
       <div>
-        <h2 className="text-base font-semibold text-fg">
-          Submit a job description
-        </h2>
-        <p className="mt-1 text-sm text-fg-muted">
+        {!embedded && (
+          <h2 className="text-base font-semibold text-fg">
+            Submit a job description
+          </h2>
+        )}
+        <p className={embedded ? "text-sm text-fg-muted" : "mt-1 text-sm text-fg-muted"}>
           Job descriptions are shared data — visible to every signed-in user
           and usable for matching across the app, unlike your private
           resumes.

@@ -7,6 +7,8 @@ interface DeleteJobDescriptionButtonProps {
   jobDescriptionId: string;
   title: string;
   className?: string;
+  /** Which edge the button and its error message align to (default `end`). */
+  align?: "start" | "end";
 }
 
 /**
@@ -29,6 +31,7 @@ export function DeleteJobDescriptionButton({
   jobDescriptionId,
   title,
   className = "",
+  align = "end",
 }: DeleteJobDescriptionButtonProps) {
   const router = useRouter();
   const [deleting, setDeleting] = useState(false);
@@ -68,7 +71,9 @@ export function DeleteJobDescriptionButton({
   }
 
   return (
-    <div className={`flex flex-col items-end gap-1 ${className}`}>
+    <div
+      className={`flex flex-col gap-1 ${align === "start" ? "items-start" : "items-end"} ${className}`}
+    >
       <button
         type="button"
         onClick={handleDelete}
@@ -77,7 +82,14 @@ export function DeleteJobDescriptionButton({
       >
         {deleting ? "Removing…" : "Remove posting"}
       </button>
-      {error && <p className="max-w-[16rem] text-right text-xs text-danger-fg">{error}</p>}
+      {error && (
+        <p
+          role="alert"
+          className={`max-w-[16rem] text-xs text-danger-fg ${align === "start" ? "text-left" : "text-right"}`}
+        >
+          {error}
+        </p>
+      )}
     </div>
   );
 }

@@ -264,3 +264,176 @@ export function toRecentMatch(
 ): RecentMatch {
   return { ...toMatch(row, jobDescription), resume };
 }
+
+// ---------------------------------------------------------------------
+// Resume critiques — GET/POST /api/resumes/:id/critique (V1, §13.20.4);
+// the same object is the `critique` of a report (§13.13.2, M3.6).
+// ---------------------------------------------------------------------
+
+export type ResumeCritiqueRow =
+  Database["public"]["Tables"]["resume_critiques"]["Row"];
+
+/**
+ * The five critique dimensions in their fixed display/storage order
+ * (§13.20.3: `dimension_scores` is stored in this order; §13.20.1 decision 6:
+ * priority ties are broken by it).
+ */
+export const CRITIQUE_DIMENSION_ORDER = [
+  "impact",
+  "clarity",
+  "relevance",
+  "structure",
+  "ats_readability",
+] as const;
+export type CritiqueDimensionKey = (typeof CRITIQUE_DIMENSION_ORDER)[number];
+
+/** `line_feedback[].section` values (§13.5.4 (3)). */
+export const CRITIQUE_SECTIONS = [
+  "experience",
+  "projects",
+  "education",
+  "leadership",
+  "skills",
+  "summary",
+  "other",
+] as const;
+export type CritiqueSection = (typeof CRITIQUE_SECTIONS)[number];
+
+/** `line_feedback[].issue_types[]` values (§13.5.4 (3)). */
+export const CRITIQUE_ISSUE_TYPES = [
+  "no_metric",
+  "weak_verb",
+  "vague",
+  "too_long",
+  "passive_voice",
+  "jargon",
+  "typo_grammar",
+  "formatting",
+  "irrelevant",
+] as const;
+export type CritiqueIssueType = (typeof CRITIQUE_ISSUE_TYPES)[number];
+
+/** `student_context.stage` values (§13.5.4 (3)). */
+export const CRITIQUE_STUDENT_STAGES = [
+  "early_student",
+  "late_student",
+  "new_grad",
+  "experienced",
+] as const;
+export type CritiqueStudentStage = (typeof CRITIQUE_STUDENT_STAGES)[number];
+
+export type CritiqueStudentContext = { stage: CritiqueStudentStage; note: string };
+
+/** One dimension score; `resume_critiques.dimension_scores` holds 5 of these. */
+export type CritiqueDimension = {
+  dimension: CritiqueDimensionKey;
+  score: number;
+  rationale: string;
+  top_fix: string;
+};
+
+/** A derived "top priority": the `top_fix` of one of the 3 lowest-scoring dimensions. */
+export type CritiquePriority = {
+  dimension: CritiqueDimensionKey;
+  score: number;
+  top_fix: string;
+};
+
+/**
+ * A line-feedback item as stored in `resume_critiques.line_feedback`.
+ * `original_text` is the user's exact characters, sliced from the stored
+ * `resumes.extracted_text` (§13.13.2), never Claude's NFKC quote.
+ */
+export type StoredLineFeedback = {
+  section: CritiqueSection;
+  original_text: string;
+  issue_types: CritiqueIssueType[];
+  feedback: string;
+  suggested_rewrite: string;
+  needs_user_input: boolean;
+};
+
+/** A line-feedback item in the API response: the stored item plus an `lf_<n>` id. */
+export type LineFeedback = StoredLineFeedback & { id: string };
+
+export type CritiqueSectionFeedback = { section: string; feedback: string };
+export type CritiqueAtsIssue = { issue: string; fix: string };
+
+/** Public shape of a critique (§13.20.4, §13.13.2). */
+export type Critique = {
+  id: string;
+  resume_id: string;
+  created_at: string;
+  model: string;
+  prompt_version: string;
+  /** False when a newer prompt version exists (a re-run would give a new critique). */
+  is_current: boolean;
+  overall_score: number;
+  summary: string;
+  student_context: CritiqueStudentContext;
+  /** Always 5, in `CRITIQUE_DIMENSION_ORDER`. */
+  dimensions: CritiqueDimension[];
+  /** 3 items, ascending score, ties by `CRITIQUE_DIMENSION_ORDER`. */
+  priorities: CritiquePriority[];
+  line_feedback: LineFeedback[];
+  section_feedback: CritiqueSectionFeedback[];
+  ats_issues: CritiqueAtsIssue[];
+  missing_sections: string[];
+};
+
+const PRIORITY_COUNT = 3;
+
+function dimensionRank(dimension: string): number {
+  const index = (CRITIQUE_DIMENSION_ORDER as readonly string[]).indexOf(dimension);
+  return index === -1 ? CRITIQUE_DIMENSION_ORDER.length : index;
+}
+
+/**
+ * The `top_fix` of the 3 lowest-scoring dimensions, lowest first; ties go
+ * by `CRITIQUE_DIMENSION_ORDER` (§13.20.1 decision 6). Derived, never stored.
+ */
+export function deriveCritiquePriorities(
+  dimensions: readonly CritiqueDimension[],
+): CritiquePriority[] {
+  return [...dimensions]
+    .sort(
+      (a, b) =>
+        a.score - b.score || dimensionRank(a.dimension) - dimensionRank(b.dimension),
+    )
+    .slice(0, PRIORITY_COUNT)
+    .map(({ dimension, score, top_fix }) => ({ dimension, score, top_fix }));
+}
+
+/**
+ * Shapes a `resume_critiques` row into the public `Critique`. Shared by the
+ * V1 critique route and (M3.6) the report route. Rows are only inserted by
+ * `lib/supabase/queries/critiques.ts#insertResumeCritique` from a
+ * `validateCritiqueResume`-checked result, so the jsonb casts are safe.
+ * `user_id`, `report_id`, `profile_id` and `dropped_items` stay internal.
+ */
+export function toCritique(
+  row: ResumeCritiqueRow,
+  currentPromptVersion: string,
+): Critique {
+  const dimensions = [...((row.dimension_scores as CritiqueDimension[] | null) ?? [])].sort(
+    (a, b) => dimensionRank(a.dimension) - dimensionRank(b.dimension),
+  );
+  const lineFeedback = (row.line_feedback as StoredLineFeedback[] | null) ?? [];
+  return {
+    id: row.id,
+    resume_id: row.resume_id,
+    created_at: row.created_at,
+    model: row.model,
+    prompt_version: row.prompt_version,
+    is_current: row.prompt_version === currentPromptVersion,
+    overall_score: row.overall_score,
+    summary: row.summary,
+    student_context: row.student_context as CritiqueStudentContext,
+    dimensions,
+    priorities: deriveCritiquePriorities(dimensions),
+    line_feedback: lineFeedback.map((item, index) => ({ id: `lf_${index}`, ...item })),
+    section_feedback: (row.section_feedback as CritiqueSectionFeedback[] | null) ?? [],
+    ats_issues: (row.ats_issues as CritiqueAtsIssue[] | null) ?? [],
+    missing_sections: (row.missing_sections as string[] | null) ?? [],
+  };
+}

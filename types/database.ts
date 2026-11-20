@@ -21,6 +21,32 @@
  *
  * Updated by hand for supabase/migrations/0006_job_description_mutability.sql
  * (adds job_descriptions.deleted_at).
+ *
+ * Updated by hand for supabase/migrations/0007_background_infra.sql (adds
+ * background_tasks, ai_usage_events, rate_limit_events and the task /
+ * rate-limit / worker-helper functions) and 0008_worker_schedule.sql (adds
+ * nothing to the `public` API surface: its one function lives in the
+ * unexposed `private` schema). docs/ARCHITECTURE.md §13.3.0 says this file
+ * must be regenerated with `supabase gen types typescript --project-id
+ * xpubgotqrsosvpiwlpyh` after each migration; these two were hand-authored
+ * only because they were written before being applied (M1.2).
+ *
+ * Verified 2026-11-09 after applying 0007/0008 to the live project: the
+ * generated types were compared against this file entry by entry (same
+ * tables, columns, functions and argument optionality; every hand type is
+ * assignable to the generated one). The only differences are deliberate
+ * narrowings kept here: string-literal unions for status/kind/provider
+ * columns, `search_vector` omitted from job_descriptions Insert/Update (a
+ * generated column), `fail_task` returning `... | null` (NULL when fenced
+ * out, which the generator cannot express), and `Record<string, never>` for
+ * no-argument RPCs. Keep narrowing on regeneration.
+ *
+ * Updated by hand for supabase/migrations/0010_resume_critiques.sql (V1,
+ * §13.20.2): resume_critiques and the request_resume_critique RPC. 0010 was
+ * applied to the live DB on 2026-11-18, ahead of the parked 0009 (§13.3.0).
+ * 0009's (M1.5) entries live on branch `wip/m1.5-ingestion` and come back
+ * when 0009 lands. No new narrowings for 0010: its jsonb columns stay `Json`
+ * (shaped by types/domain.ts#toCritique).
  */
 
 export type Json =
@@ -33,6 +59,27 @@ export type Json =
 
 export type ResumeStatus = "uploaded" | "processing" | "analyzed" | "failed";
 export type JobDescriptionSource = "user" | "themuse";
+
+/** `background_tasks.status` check constraint (0007). */
+export type BackgroundTaskStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "dead"
+  | "cancelled";
+/** `background_tasks.task_class` check constraint (0007). */
+export type BackgroundTaskClass = "user" | "background";
+/** `ai_usage_events.provider` check constraint (0007). */
+export type AiUsageProvider = "anthropic" | "voyage";
+/** `rate_limit_events.kind` check constraint (0007). */
+export type RateLimitKind =
+  | "resume_report"
+  | "refresh_matches"
+  | "fit_check"
+  | "url_import"
+  | "job_listing_create"
+  | "job_listing_update"
+  | "account_reauth";
 
 export interface Database {
   public: {
@@ -175,6 +222,203 @@ export interface Database {
         Update: Partial<Database["public"]["Tables"]["matches"]["Insert"]>;
         Relationships: [];
       };
+      /**
+       * Server-only task queue (0007, docs/ARCHITECTURE.md §13.3.1). RLS on,
+       * no policies: only service_role can read or write it. `payload` holds
+       * ids/small enums only, never resume/job text or PII.
+       */
+      background_tasks: {
+        Row: {
+          id: string;
+          kind: string;
+          status: BackgroundTaskStatus;
+          priority: number;
+          task_class: BackgroundTaskClass;
+          user_id: string | null;
+          correlation_id: string | null;
+          parent_task_id: string | null;
+          payload: Json;
+          dedupe_key: string | null;
+          attempts: number;
+          max_attempts: number;
+          run_after: string;
+          lease_seconds: number;
+          locked_by: string | null;
+          locked_until: string | null;
+          started_at: string | null;
+          finished_at: string | null;
+          last_error_code: string | null;
+          last_error_message: string | null;
+          result: Json | null;
+          /** Dead-task hook outbox (§13.4.5). */
+          on_dead_handled_at: string | null;
+          on_dead_attempts: number;
+          on_dead_locked_by: string | null;
+          on_dead_locked_until: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          kind: string;
+          status?: BackgroundTaskStatus;
+          priority?: number;
+          task_class: BackgroundTaskClass;
+          user_id?: string | null;
+          correlation_id?: string | null;
+          parent_task_id?: string | null;
+          payload?: Json;
+          dedupe_key?: string | null;
+          attempts?: number;
+          max_attempts: number;
+          run_after?: string;
+          lease_seconds: number;
+          locked_by?: string | null;
+          locked_until?: string | null;
+          started_at?: string | null;
+          finished_at?: string | null;
+          last_error_code?: string | null;
+          last_error_message?: string | null;
+          result?: Json | null;
+          on_dead_handled_at?: string | null;
+          on_dead_attempts?: number;
+          on_dead_locked_by?: string | null;
+          on_dead_locked_until?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<
+          Database["public"]["Tables"]["background_tasks"]["Insert"]
+        >;
+        Relationships: [];
+      };
+      /**
+       * Server-only AI spend ledger (0007, §13.3.1/§13.9.4). One row per
+       * external AI call actually made. Never holds prompt/response content.
+       */
+      ai_usage_events: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          task_id: string | null;
+          task_attempt: number | null;
+          provider: AiUsageProvider;
+          operation: string;
+          model: string;
+          is_batch: boolean;
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          /** `numeric(12,6)`; PostgREST serializes it as a JSON number. */
+          cost_usd: number;
+          stop_reason: string | null;
+          request_id: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id?: string | null;
+          task_id?: string | null;
+          task_attempt?: number | null;
+          provider: AiUsageProvider;
+          operation: string;
+          model: string;
+          is_batch?: boolean;
+          input_tokens?: number;
+          output_tokens?: number;
+          cache_read_tokens?: number;
+          cache_write_tokens?: number;
+          cost_usd: number;
+          stop_reason?: string | null;
+          request_id?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<
+          Database["public"]["Tables"]["ai_usage_events"]["Insert"]
+        >;
+        Relationships: [];
+      };
+      /**
+       * Per-user daily rate-limit ledger (0007, §13.3.1/§13.9.3).
+       * Owner-select only for `authenticated`; inserted only through
+       * `private.consume_rate_limit` (via security-definer RPCs), refunded
+       * by the worker (service_role).
+       */
+      rate_limit_events: {
+        Row: {
+          id: string;
+          user_id: string;
+          kind: RateLimitKind;
+          ref_id: string | null;
+          refunded_at: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id: string;
+          kind: RateLimitKind;
+          ref_id?: string | null;
+          refunded_at?: string | null;
+          created_at?: string;
+        };
+        Update: Partial<
+          Database["public"]["Tables"]["rate_limit_events"]["Insert"]
+        >;
+        Relationships: [];
+      };
+      /**
+       * Resume critiques (0010, §13.3.8, §13.20.2). Owner-select only for
+       * `authenticated`; inserted only by the service role
+       * (lib/supabase/queries/critiques.ts#insertResumeCritique). A
+       * BEFORE INSERT OR UPDATE OF resume_id, user_id trigger raises `validation_owner_mismatch`
+       * unless the resume belongs to `user_id`. `report_id` / `profile_id`
+       * get their FKs in 0016.
+       */
+      resume_critiques: {
+        Row: {
+          id: string;
+          report_id: string | null;
+          resume_id: string;
+          user_id: string;
+          profile_id: string | null;
+          prompt_version: string;
+          model: string;
+          overall_score: number;
+          summary: string;
+          student_context: Json;
+          dimension_scores: Json;
+          line_feedback: Json;
+          section_feedback: Json;
+          ats_issues: Json;
+          missing_sections: Json;
+          dropped_items: number;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          report_id?: string | null;
+          resume_id: string;
+          user_id: string;
+          profile_id?: string | null;
+          prompt_version: string;
+          model: string;
+          overall_score: number;
+          summary: string;
+          student_context: Json;
+          dimension_scores: Json;
+          line_feedback?: Json;
+          section_feedback?: Json;
+          ats_issues?: Json;
+          missing_sections?: Json;
+          dropped_items?: number;
+          created_at?: string;
+        };
+        Update: Partial<
+          Database["public"]["Tables"]["resume_critiques"]["Insert"]
+        >;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -192,6 +436,170 @@ export interface Database {
           offset_count?: number;
         };
         Returns: Database["public"]["Tables"]["job_descriptions"]["Row"][];
+      };
+      // --- 0007: task queue functions (service_role only) ---------------
+      enqueue_task: {
+        Args: {
+          p_kind: string;
+          p_task_class: BackgroundTaskClass;
+          p_payload?: Json;
+          p_user_id?: string | null;
+          p_dedupe_key?: string | null;
+          p_priority?: number;
+          p_max_attempts?: number;
+          p_lease_seconds?: number;
+          p_run_after?: string | null;
+          p_correlation_id?: string | null;
+          p_parent_task_id?: string | null;
+        };
+        /** The new task id, or the existing live task's id on dedupe. */
+        Returns: string;
+      };
+      claim_tasks: {
+        Args: {
+          p_worker_id: string;
+          p_task_class: BackgroundTaskClass;
+          p_kinds: string[];
+          p_max_running: number;
+          p_limit: number;
+        };
+        Returns: Database["public"]["Tables"]["background_tasks"]["Row"][];
+      };
+      complete_task: {
+        Args: { p_id: string; p_worker_id: string; p_result?: Json | null };
+        /** false = fenced out (this worker no longer holds the task). */
+        Returns: boolean;
+      };
+      fail_task: {
+        Args: {
+          p_id: string;
+          p_worker_id: string;
+          p_error_code: string;
+          p_error_message: string | null;
+          p_retryable: boolean;
+          p_retry_delay_seconds: number;
+        };
+        /** New status ('queued' | 'dead'), or null when fenced out. */
+        Returns: "queued" | "dead" | null;
+      };
+      snooze_task: {
+        Args: {
+          p_id: string;
+          p_worker_id: string;
+          p_seconds: number;
+          p_reason: string;
+        };
+        /** false = fenced out. */
+        Returns: boolean;
+      };
+      extend_task_lease: {
+        Args: { p_id: string; p_worker_id: string; p_seconds: number };
+        /** false = fenced out. */
+        Returns: boolean;
+      };
+      cancel_tasks_for_user: {
+        Args: { p_user_id: string };
+        /** Number of queued tasks cancelled. */
+        Returns: number;
+      };
+      purge_finished_tasks: {
+        Args: Record<string, never>;
+        /** Rows deleted (dead rows only once their onDead hook is handled). */
+        Returns: number;
+      };
+      /**
+       * Stale-lease sweep: dead-letters running tasks of any kind whose
+       * lease expired more than `p_older_than` ago (Postgres interval text,
+       * default '6 hours'), code `lease_expired`. Returns the count.
+       */
+      dead_letter_stale_tasks: {
+        Args: { p_older_than?: string };
+        Returns: number;
+      };
+      /** Dead-task hook outbox: lock pending hooks of known kinds (§13.4.5). */
+      claim_dead_task_hooks: {
+        Args: {
+          p_worker_id: string;
+          p_kinds: string[];
+          p_limit: number;
+          p_task_id?: string | null;
+        };
+        Returns: Database["public"]["Tables"]["background_tasks"]["Row"][];
+      };
+      /** Mark a hook handled (fenced). false = fenced out / already handled. */
+      complete_dead_task_hook: {
+        Args: { p_id: string; p_worker_id: string; p_gave_up?: boolean };
+        Returns: boolean;
+      };
+      /**
+       * Release a claimed-but-unrun hook: clears the lock and refunds the
+       * attempt (fenced). false = fenced out / already handled.
+       */
+      release_dead_task_hook: {
+        Args: { p_id: string; p_worker_id: string };
+        Returns: boolean;
+      };
+      /**
+       * Global-budget deferral: moves claimable queued tasks of `p_kinds`
+       * to `p_until` + jitter without claiming them. Returns deferred rows.
+       */
+      defer_queued_tasks: {
+        Args: {
+          p_task_class: BackgroundTaskClass;
+          p_kinds: string[];
+          p_until: string;
+          p_max_jitter_seconds?: number;
+          p_limit?: number;
+        };
+        Returns: Database["public"]["Tables"]["background_tasks"]["Row"][];
+      };
+      // --- 0007: worker read helpers (service_role only) ----------------
+      ai_spend_summary: {
+        Args: { p_since: string };
+        Returns: {
+          provider: AiUsageProvider;
+          operation: string;
+          cost_usd: number;
+          calls: number;
+        }[];
+      };
+      background_task_counts: {
+        Args: Record<string, never>;
+        Returns: {
+          kind: string;
+          status: BackgroundTaskStatus;
+          n: number;
+        }[];
+      };
+      // --- 0007: user RPC (authenticated) -------------------------------
+      get_my_rate_limits: {
+        Args: Record<string, never>;
+        Returns: {
+          kind: RateLimitKind;
+          daily_limit: number;
+          used_today: number;
+          resets_at: string;
+        }[];
+      };
+      /**
+       * Charges one `account_reauth` attempt to the caller (§13.3.1,
+       * §13.13.7). true = recorded; false = at the daily limit (does not
+       * raise). Raises `unauthenticated` without a session.
+       */
+      consume_account_reauth_attempt: {
+        Args: Record<string, never>;
+        Returns: boolean;
+      };
+      // --- 0010: user RPC (authenticated) -------------------------------
+      /**
+       * Charges one `resume_report` unit to the caller for a critique of
+       * the caller's own resume and returns the future critique id (also
+       * the ledger `ref_id`). Raises `unauthenticated` (42501),
+       * `not_found`, or `rate_limited:resume_report` (P0001). §13.20.2.
+       */
+      request_resume_critique: {
+        Args: { p_resume_id: string };
+        Returns: string;
       };
     };
     Enums: Record<string, never>;

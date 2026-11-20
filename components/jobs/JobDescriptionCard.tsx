@@ -1,65 +1,103 @@
 import Link from "next/link";
 import type { JobDescription } from "@/types/domain";
-
-const PREVIEW_LENGTH = 180;
-
-function previewText(description: string): string {
-  const trimmed = description.trim();
-  if (trimmed.length <= PREVIEW_LENGTH) return trimmed;
-  return `${trimmed.slice(0, PREVIEW_LENGTH).trimEnd()}…`;
-}
+import {
+  formatAbsoluteDate,
+  formatRelativeDays,
+  jobPostedAt,
+  makeSnippet,
+} from "@/lib/client/jobsBoard";
+import {
+  JobLevelBadge,
+  JobSourceBadge,
+  OwnPostingBadge,
+} from "@/components/jobs/JobBadges";
+import { BuildingIcon, ClockIcon, MapPinIcon } from "@/components/jobs/icons";
 
 interface JobDescriptionCardProps {
   jobDescription: JobDescription;
+  /** Reference time for the relative date; injectable for tests. */
+  now?: number;
+  /** Heading level for the title, so the card fits the page outline it sits in. */
+  headingLevel?: "h2" | "h3";
 }
 
 /**
- * Compact display of one job description: title, company, level/location
- * tags, preview, date. `level` and `location` (added per
- * docs/ARCHITECTURE.md §7) are only populated for externally-ingested
- * listings in v1 — rendered conditionally so user-submitted rows (which
- * never set either) look exactly as before.
+ * One listing on the jobs board (also reused by the dashboard's "Latest job
+ * listings" panel): title, company and location, a plain-text description
+ * snippet, level and source tags, and a relative "posted" date.
+ *
+ * The whole card is clickable via a stretched link on the title (the link's
+ * `::after` covers the card), so screen readers hear just the job title as
+ * the link name instead of the entire card's text, and keyboard focus shows
+ * as an outline around the whole card.
+ *
+ * The description is untrusted text: it goes through `makeSnippet` (strips
+ * any markup, flattens whitespace) and is rendered as a text node.
  */
-export function JobDescriptionCard({ jobDescription }: JobDescriptionCardProps) {
-  return (
-    <Link
-      href={`/jobs/${jobDescription.id}`}
-      className="block rounded-lg border border-border bg-surface p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:border-border-strong hover:bg-surface-hover hover:shadow-md"
-    >
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h3 className="truncate text-sm font-medium text-fg">
-            {jobDescription.title}
-          </h3>
-          {jobDescription.company && (
-            <p className="mt-0.5 truncate text-sm text-fg-muted">
-              {jobDescription.company}
-            </p>
-          )}
-        </div>
-        <span className="shrink-0 text-xs text-fg-subtle">
-          {new Date(jobDescription.created_at).toLocaleDateString()}
-        </span>
-      </div>
+export function JobDescriptionCard({
+  jobDescription,
+  now,
+  headingLevel = "h3",
+}: JobDescriptionCardProps) {
+  const Heading = headingLevel;
+  const postedAt = jobPostedAt(jobDescription);
+  const relative = formatRelativeDays(postedAt, now);
+  const absolute = formatAbsoluteDate(postedAt);
+  const snippet = makeSnippet(jobDescription.description, 200);
 
-      {(jobDescription.level || jobDescription.location) && (
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          {jobDescription.level && (
-            <span className="rounded-full bg-neutral-bg px-2 py-0.5 text-xs font-medium text-neutral-fg">
-              {jobDescription.level}
+  return (
+    <article className="relative flex h-full flex-col rounded-lg border border-border bg-surface p-4 shadow-sm transition-colors focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-accent hover:border-border-strong hover:bg-surface-hover sm:p-5">
+      <Heading className="text-base font-semibold leading-snug text-fg">
+        <Link
+          href={`/jobs/${jobDescription.id}`}
+          className="break-words after:absolute after:inset-0 after:rounded-lg after:content-[''] focus-visible:outline-none"
+        >
+          {jobDescription.title}
+        </Link>
+      </Heading>
+
+      {(jobDescription.company || jobDescription.location) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-fg-muted">
+          {jobDescription.company && (
+            <span className="inline-flex min-w-0 items-center gap-1.5">
+              <BuildingIcon className="h-4 w-4 text-fg-subtle" />
+              <span className="sr-only">Company: </span>
+              <span className="truncate">{jobDescription.company}</span>
             </span>
           )}
           {jobDescription.location && (
-            <span className="text-xs text-fg-subtle">
-              {jobDescription.location}
+            <span className="inline-flex min-w-0 items-center gap-1.5">
+              <MapPinIcon className="h-4 w-4 text-fg-subtle" />
+              <span className="sr-only">Location: </span>
+              <span className="truncate">{jobDescription.location}</span>
             </span>
           )}
         </div>
       )}
 
-      <p className="mt-2 text-sm text-fg-muted">
-        {previewText(jobDescription.description)}
-      </p>
-    </Link>
+      {snippet && (
+        <p className="mt-3 line-clamp-2 text-sm leading-6 text-fg-subtle">
+          {snippet}
+        </p>
+      )}
+
+      <div className="mt-auto flex flex-wrap items-center gap-2 pt-4">
+        {jobDescription.level && <JobLevelBadge level={jobDescription.level} />}
+        <JobSourceBadge source={jobDescription.source} />
+        {jobDescription.is_own && <OwnPostingBadge />}
+        {relative && (
+          <span className="ml-auto inline-flex items-center gap-1 whitespace-nowrap text-xs text-fg-subtle">
+            <ClockIcon className="h-3.5 w-3.5" />
+            <time
+              dateTime={postedAt}
+              title={absolute ?? undefined}
+              suppressHydrationWarning
+            >
+              Posted {relative}
+            </time>
+          </span>
+        )}
+      </div>
+    </article>
   );
 }

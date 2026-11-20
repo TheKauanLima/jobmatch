@@ -7,6 +7,13 @@ import { AnalyzeResumeButton } from "@/components/resumes/AnalyzeResumeButton";
 import { AnalysisPanel } from "@/components/resumes/AnalysisPanel";
 import { RunMatchForm } from "@/components/matches/RunMatchForm";
 import { MatchList } from "@/components/matches/MatchList";
+import { CritiqueSection } from "@/components/reports/CritiqueSection";
+import { RunCritiqueButton } from "@/components/resumes/RunCritiqueButton";
+import {
+  CRITIQUE_COPY,
+  interpretCritiqueLoad,
+  type CritiqueLoadResult,
+} from "@/lib/client/critique";
 import type {
   JobDescription,
   Match,
@@ -102,6 +109,20 @@ async function getAnalysis(id: string): Promise<GetAnalysisResult> {
   }
 }
 
+/**
+ * Fetches the latest critique via `GET /api/resumes/:id/critique`
+ * (docs/ARCHITECTURE.md §13.20.4). Read-only: opening the page never runs
+ * (or charges for) a critique. `404 no_critique` is the empty state.
+ */
+async function getCritique(id: string): Promise<CritiqueLoadResult> {
+  try {
+    const response = await serverFetch(`/api/resumes/${id}/critique`);
+    return await interpretCritiqueLoad(response);
+  } catch {
+    return { kind: "error" };
+  }
+}
+
 type GetMatchesResult =
   | { kind: "ok"; matches: Match[] }
   | { kind: "error" };
@@ -176,9 +197,10 @@ export default async function ResumeDetailPage({
   }
 
   const { id } = await params;
-  const [result, analysisResult, matchesResult, jobDescriptionsResult] =
+  const [result, critiqueResult, analysisResult, matchesResult, jobDescriptionsResult] =
     await Promise.all([
       getResume(id),
+      getCritique(id),
       getAnalysis(id),
       getMatches(id),
       getJobDescriptionsForMatching(),
@@ -234,7 +256,24 @@ export default async function ResumeDetailPage({
         />
       </div>
 
-      <section className="mt-8 rounded-lg border border-border bg-surface shadow-sm p-6">
+      <section
+        aria-labelledby="resume-critique-heading"
+        className="mt-8 rounded-lg border border-border bg-surface p-4 shadow-sm sm:p-6"
+      >
+        <div className="flex flex-col gap-1">
+          <h2 id="resume-critique-heading" className="text-base font-semibold text-fg">
+            Resume critique
+          </h2>
+          <p className="text-sm text-fg-subtle">
+            A detailed AI review of this resume. Only you can see it.
+          </p>
+        </div>
+        <div className="mt-5">
+          <CritiqueCard resumeId={resume.id} result={critiqueResult} />
+        </div>
+      </section>
+
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
         <h2 className="text-base font-semibold text-fg">
           File details
         </h2>
@@ -344,5 +383,58 @@ export default async function ResumeDetailPage({
         </div>
       </section>
     </div>
+  );
+}
+
+/** Body of the "Resume critique" card for each load state (§13.20.6). */
+function CritiqueCard({
+  resumeId,
+  result,
+}: {
+  resumeId: string;
+  result: CritiqueLoadResult;
+}) {
+  if (result.kind === "error") {
+    return (
+      <p
+        role="alert"
+        className="rounded-md border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-fg"
+      >
+        Couldn&apos;t load this resume&apos;s critique. Please refresh the page.
+      </p>
+    );
+  }
+
+  if (result.kind === "none") {
+    return (
+      <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border-strong bg-bg p-4 sm:p-5">
+        <div className="flex flex-col gap-2">
+          <h3 className="text-sm font-semibold text-fg">Run your first critique</h3>
+          <p className="text-sm leading-relaxed text-fg-muted">
+            {CRITIQUE_COPY.emptyDescription}
+          </p>
+          <p className="text-sm text-fg-subtle">
+            {CRITIQUE_COPY.emptyQuota}{" "}
+            <Link href="/settings" className="underline underline-offset-2 hover:text-fg-muted">
+              See your usage
+            </Link>
+          </p>
+        </div>
+        <RunCritiqueButton resumeId={resumeId} />
+      </div>
+    );
+  }
+
+  return (
+    <CritiqueSection
+      critique={result.critique}
+      staleAction={
+        <RunCritiqueButton
+          resumeId={resumeId}
+          label={CRITIQUE_COPY.rerunLabel}
+          variant="secondary"
+        />
+      }
+    />
   );
 }

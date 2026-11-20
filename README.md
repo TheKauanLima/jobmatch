@@ -1,4 +1,4 @@
-# JobMatch
+# Kalify
 
 An AI job-finder for students. Upload a resume and get an AI-generated
 strengths/weaknesses breakdown, then match it against a shared board of job
