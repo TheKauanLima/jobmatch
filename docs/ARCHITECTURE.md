@@ -1507,8 +1507,10 @@ export function parseLocationFacets(
 ```
 `US_STATES` (code → name, the 50 states plus `DC`) and `type UsStateCode` live in
 **`lib/jobs/usStates.ts`**. That file is a constant with no imports, so the client can
-import it for dropdown labels. `lib/jobs/studentFilter.ts` keeps its own list for now
-(qa-tester is editing it). Switching it to `usStates.ts` is a later cleanup.
+import it for dropdown labels. `location.ts` imports `isStateCodeUsedAsCountry` and
+`isStateNameUsedAsCountry` from `lib/jobs/studentFilter.ts`, so both modules use the same
+country disambiguation (§7.7.3). `studentFilter.ts` still has its own state code and name
+lists; switching those to `usStates.ts` is a later cleanup.
 
 Rules (the output is deduped and sorted by code):
 1. **DC first:** `Washington,? D\.?C\.?`, `District of Columbia`, or a standalone `D.C.`
@@ -1516,19 +1518,32 @@ Rules (the output is deduped and sorted by code):
    not also add `WA`.
 2. **Two-letter codes, case-sensitive and uppercase only.** A code counts when it comes
    right after `, `, ` - `, `(`, or the start of a `;`-separated segment, and is followed
-   by `,`, `;`, `)`, ` - `, a ZIP code, ` US`/` USA`, or the end of the text.
+   by `,`, `;`, `)`, `/`, ` - `, a ZIP code, ` US`/` USA`, ` or`, ` and`, or the end of
+   the text.
+   - Before this rule runs, bullets (`•`), pipes (`|`), and newlines are turned into
+     `;` separators.
+   - A code that is really a country in context ("Toronto, CA") is skipped, using
+     `isStateCodeUsedAsCountry`.
    - Examples that work: "San Francisco, CA", "Remote - ME", "New York, NY; Pittsburgh, PA".
    - `US` is not a state.
    - Case sensitivity avoids "in"/"or"/"me" false positives.
    - "Remote - CA" is read as California, because the §7.7.3 US filter has already run.
 3. **Full state names**, case-insensitive on word boundaries ("New York" → NY,
-   "Texas" → TX).
+   "Texas" → TX). A name that is really a country in context ("Tbilisi, Georgia") is
+   skipped, using `isStateNameUsedAsCountry`.
 4. **City and metro aliases.** This is a small hard-coded table of unambiguous names,
-   about 30: San Francisco, Bay Area, Silicon Valley, Palo Alto, Mountain View, Menlo
-   Park, Sunnyvale, San Jose, Los Angeles, San Diego, Irvine → CA; NYC, New York City,
-   Brooklyn, Manhattan → NY; Seattle, Bellevue, Redmond → WA; Austin, Dallas, Houston →
-   TX; Chicago → IL; Boston → MA; Denver, Boulder → CO; Atlanta → GA; Pittsburgh,
-   Philadelphia → PA; Miami → FL; Phoenix → AZ.
+   about 34: San Francisco, Bay Area, Silicon Valley, Palo Alto, Mountain View, Menlo
+   Park, Sunnyvale, San Jose, San Mateo, Foster City, Los Angeles, San Diego, Irvine →
+   CA; NYC, New York City, Brooklyn, Manhattan → NY; Seattle, Bellevue, Redmond → WA;
+   Austin, Dallas, Houston → TX; Chicago → IL; Boston → MA; Denver, Boulder → CO;
+   Atlanta → GA; Pittsburgh, Philadelphia → PA; Miami → FL; Phoenix → AZ; Nashville →
+   TN; Salt Lake City → UT. `lib/jobs/location.ts` is the reference for the exact list.
+   - **Town exception (applies to rules 3 and 4):** if a state name or city alias is
+     followed, in the same location part, by a *different* bare state code (optionally
+     with a ZIP), it names a town, not that state, and is skipped. Examples:
+     "Delaware, OH", "Michigan City, IN", "Brooklyn Park, MN", "Austin, MN", "Kansas
+     City, MO". A following state *name* doesn't trigger this, because that's usually
+     the next location in a list.
    - Ambiguous names stay out: Portland, Cambridge, Columbus, Washington (on its own,
      "Washington" means the state, via rule 3).
    - This rule matters because Greenhouse often stores just "San Francisco Bay Area" or
@@ -1614,6 +1629,25 @@ constraint in 7.8.5) and a change to §13.3.4.
    | 13 | software | software, developer, `swe`, frontend/backend/full stack, web, mobile, ios, android, devops, site reliability, `sre`, platform, infrastructure, cloud, programmer | |
    | 14 | business-ops | operations, `ops`, strategy, consult\*, business analyst, program manag\*, project manag\*, supply chain, logistics, procurement, sourcing, customer support/service/experience, trust & safety, chief of staff, executive assistant, administrative | |
 
+   **Exceptions and terms added in the built rules (2026-11-26).** The table above
+   shows intent. **The exact regexes live in `lib/jobs/classifyCategory.ts`, and the
+   golden test `lib/jobs/classifyCategory.test.ts` is the source of truth for
+   expected behavior.** Changing a rule means changing the fixture first. Notable
+   additions:
+   - **people-hr and legal** yield to engineering titles: `unless` engineer, developer
+     (people-hr only), or software. "Forward Deployed Engineer (HR Technology)" and
+     "Privacy & Civil Liberties Engineer" are engineering roles.
+   - **it-security** also matches "(technical) support engineer", so a support engineer
+     is IT & Security. It yields to software, developer, dev, marketing, and sales.
+   - **sales-marketing** also matches retail and store associate titles. Pre-sales
+     titles (sales engineer, solutions engineer, solutions consultant) are sales even
+     though they contain "engineer".
+   - **hardware** also matches non-software engineering titles, such as commissioning,
+     project, field, manufacturing, process, and quality engineer, unless a software,
+     data, AI, ML, or cloud signal is present.
+   - Design and the other rules carry extra `unless` terms (for example design yields
+     to electrical, mechanical, circuit, PCB, structural, and civil). See the code.
+
    **Tier C (generic, title only):**
    - `engineer`/`engineering` → software, because the board is mostly software. Hardware
      titles are caught earlier by rule 11.
@@ -1663,12 +1697,15 @@ This is the only entry point that write paths call:
     `is_remote`. Every daily sync recomputes these for every row still on a board.
 - **`POST /api/job-descriptions`:** compute from `title` and `location`, then pass to
   `createJobDescription` (3 new params).
-- **`PATCH /api/job-descriptions/:id`:**
-  - If `title` is in the patch, set `job_category = classifyJobCategory({ title })`.
-  - If `location` is in the patch (including `null`), set `location_states` and
-    `is_remote` from `parseLocationFacets(location)`.
-  - The two are independent (the classifier ignores location and the parser ignores
-    the title), so there's no need to read the row first.
+- **`PATCH /api/job-descriptions/:id`:** whenever `title` or `location` (including an
+  explicit `null`) is in the patch, recompute **all three** facets with
+  `deriveJobFacets`, using the merged values: the patch value if present, otherwise
+  the existing row's value.
+  - The existing row comes from the read the route already does for its 404/403
+    check, so there's no extra query.
+  - For a row that already has facets, this gives the same result as recomputing only
+    what changed. It also keeps the invariant that all three are written together, so
+    a pre-0012 row that hasn't been backfilled gets all three at once.
 - **Users can't set these fields.** None of the three are accepted in a request body.
   The RLS update policy technically lets a submitter write them on their own row
   through direct PostgREST. The check constraints bound the damage to mislabeling their
@@ -1685,8 +1722,11 @@ and has no supabase import. It's called by `app/api/cron/sync-jobs/route.ts` **a
 - It stops starting new updates once `deadlineMs` has passed. The route passes run
   start + 50 s.
 - The route's JSON gains `facetBackfill: { updated: number; remaining: boolean }`.
-  `remaining` is true when the update count reached `limit`. A failure there is logged
-  and reported as `207`, the same as one company erroring.
+  `remaining` is true when the update count reached `limit`, or when the deadline
+  stopped the run before every selected row was updated.
+- On failure (the select fails, or any row update fails), the error is logged and the
+  route returns `207`, the same as one company erroring. The response then reports
+  `remaining: true` with `updated` set to the rows already updated.
 - **Invariant:** `job_category is null` means "facets not computed yet". Every write
   path above sets all three facets together.
 - The first sync after deploy recomputes the external rows that are still on boards,
@@ -1874,8 +1914,13 @@ in `lib/client/jobsBoard.ts`.
     one listing, sorted by name;
   - with `q` only, a **Sort** select: "Best match" or "Most recent";
   - "Clear all", shown when any filter or `q` is active.
-- **Without `q`**, there's no sort control. The results summary line reads
-  "… · Newest first", so the order is always visible.
+- **Without `q`**, there's no sort control. The results summary line ends with
+  "· Newest first" whenever the order is by date, which is with no `q` or with `q` and
+  `sort=recent`, so the order is always visible.
+- **Search input:** the client component `components/jobs/JobsSearchInput.tsx`, inside
+  the `next/form`. It is controlled, and it re-syncs to the URL's `q` when that changes
+  ("Clear all", a chip, back/forward) by adjusting state during render rather than
+  remounting, so focus and the caret stay put.
 - **Selects:**
   - They are native `<select>`s with visible `<label>`s, in a small client component
     `JobsFilterSelect`.
@@ -1891,7 +1936,8 @@ in `lib/client/jobsBoard.ts`.
     (from a deep link) is still shown, so the select reflects the URL.
   - Fields with zero listings stay in the list, disabled, with the label suffix
     " (no listings yet)". The list stays stable, and the user can see that the field
-    exists but the board doesn't cover it yet.
+    exists but the board doesn't cover it yet. The **currently selected** field is
+    never disabled, even with zero listings, so a deep link still shows and works.
   - If the facets request fails, the board shows all fields enabled and **no** state
     options, only "Any location" and "Remote". Filtering still works.
 - **Mobile (< sm):** the search is on its own row. The level pills wrap. Field and
@@ -1917,6 +1963,21 @@ in `lib/client/jobsBoard.ts`.
 - Claude-based classification. That's superseded by M2.2's role-family extraction
   anyway.
 - `employment_type` and salary filters (§13.3.3).
+
+**Follow-ups recorded at review (2026-11-26):**
+- **Private listings and facets (M1.5).** `job_description_facets()` counts every
+  active row the caller can see. Today that is the same for everyone. Once 0009 adds
+  private listings, it would include the caller's own private rows in their counts.
+  0009 should add `visibility = 'shared'` to the function (binding rule (c) in
+  §13.3.0) if the facets must stay global.
+- **Client bundle hygiene.** `lib/validation/schemas.ts` imports
+  `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH`, `JOB_DESCRIPTIONS_DEFAULT_LIMIT`, and
+  `JOB_DESCRIPTIONS_MAX_LIMIT` from `lib/supabase/queries/jobDescriptions.ts`. Since
+  client code imports `schemas.ts`, that pulls the query module into the client
+  bundle. Move the three constants to a client-safe, import-free constants file
+  (e.g. `lib/jobs/listLimits.ts`), import them from there in both modules, and keep
+  the existing sync test with `JOBS_SEARCH_MAX_LENGTH`. This supersedes §9.1's choice
+  of where those constants live.
 
 ---
 
@@ -2980,7 +3041,9 @@ application-order exception below applies again. **Binding rules for the parked 
 - (b) The browse index `job_descriptions_active_shared_idx` is defined on
   `(listed_at desc, id desc)`, not `created_at`.
 - (c) If 0009 is rebased after 0012 is applied, its "active" predicate is added to
-  `job_description_facets()` as well.
+  `job_description_facets()` as well. So is `visibility = 'shared'`, if the global
+  counts must exclude the caller's own private listings. With 0009's RLS, a
+  `security invoker` function would otherwise count them for their owner (§7.8.8).
 
 **Renumbered again 2026-11-20 (§7.7).** `0011_job_sources_greenhouse_lever.sql` takes
 the next free number, and every *planned* migration from taxonomy onward moves up by
@@ -6143,6 +6206,7 @@ the same semantics for RFC 8058 one-click.
               RoleCard, RoleMarketFit, RecommendedJobList, RetryReportButton, NewMatchesBanner
   /fitcheck/  FitCheckStatus, RequirementTable, TailoringSuggestions
   /jobs/      (+) VisibilityChoice, ImportUrlForm, ListingImportStatus, ClosedBadge, SourceAttribution
+              (§7.8, already on main: JobsSearchInput, JobsFilterSelect)
   /settings/  DeleteAccountForm, UsageLimits, AccountStatusNotice (the `?account=` banner on /),
               NotificationPrefs
 /lib

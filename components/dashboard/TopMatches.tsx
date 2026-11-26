@@ -58,6 +58,7 @@ export function TopMatches({ matches }: TopMatchesProps) {
                     <div className="flex min-w-0 items-center gap-2">
                       <Link
                         href={jobHref(job.id)}
+                        title={job.title}
                         className="truncate rounded-sm text-sm font-medium text-fg hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                       >
                         {job.title}
@@ -72,7 +73,7 @@ export function TopMatches({ matches }: TopMatchesProps) {
                   <p className="mt-2 line-clamp-2 text-sm leading-relaxed text-fg-muted">{match.rationale}</p>
                 )}
                 <p className="mt-2 flex flex-wrap items-center gap-x-2 text-xs text-fg-subtle">
-                  <span className="min-w-0 truncate">
+                  <span className="min-w-0 truncate" title={match.resume.file_name}>
                     Resume:{" "}
                     <Link
                       href={`/resumes/${encodeURIComponent(match.resume.id)}`}

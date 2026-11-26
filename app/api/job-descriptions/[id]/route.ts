@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { requireSession, UnauthorizedError } from "@/lib/auth/session";
+import { deriveJobFacets } from "@/lib/jobs/facets";
 import { createClient } from "@/lib/supabase/server";
 import {
   getJobDescriptionById,
@@ -115,6 +116,25 @@ export async function PATCH(request: Request, { params }: RouteContext) {
     return NextResponse.json({ error: "Forbidden." }, { status: 403 });
   }
 
+  // Board facets (§7.8.4) are recomputed server-side, never taken from the
+  // body. When the title or the location (including an explicit null) is in
+  // the patch, all three are recomputed from the merged values: the field
+  // depends only on the title and the location facets only on the location,
+  // so for an already-faceted row this equals "recompute only what changed",
+  // and it keeps the invariant that the three are always written together
+  // (a pre-0012 row not yet backfilled gets all three, not just one).
+  const facetsChanged =
+    parsed.data.title !== undefined || parsed.data.location !== undefined;
+  const facets = facetsChanged
+    ? deriveJobFacets({
+        title: parsed.data.title ?? existing.title,
+        location:
+          parsed.data.location !== undefined
+            ? parsed.data.location
+            : existing.location,
+      })
+    : null;
+
   try {
     const updated = await updateJobDescription(supabase, {
       id,
@@ -126,6 +146,9 @@ export async function PATCH(request: Request, { params }: RouteContext) {
         sourceUrl: parsed.data.source_url,
         location: parsed.data.location,
         level: parsed.data.level,
+        jobCategory: facets?.jobCategory,
+        locationStates: facets?.locationStates,
+        isRemote: facets?.isRemote,
       },
     });
 

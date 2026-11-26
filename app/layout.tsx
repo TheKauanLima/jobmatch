@@ -3,7 +3,6 @@ import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
 import { Nav } from "@/components/Nav";
-import { FadeInSection } from "@/components/FadeInSection";
 import { getSession } from "@/lib/auth/session";
 
 const geistSans = Geist({
@@ -49,7 +48,7 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
       </head>
       <body className="min-h-full flex flex-col bg-bg text-fg">
         <header className="border-b border-border bg-surface">
-          <nav className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
+          <nav className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3 sm:px-6 sm:py-4">
             <Link href="/" className="text-lg font-semibold tracking-tight text-fg">
               Kalify
             </Link>
@@ -57,9 +56,9 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
           </nav>
         </header>
         <main className="flex flex-1 flex-col">{children}</main>
-        <FadeInSection>
-          <SiteFooter userEmail={userEmail} />
-        </FadeInSection>
+        {/* Not wrapped in FadeInSection: the footer stayed invisible (opacity 0) until
+            scrolled into view, which left a blank band at the bottom of long pages. */}
+        <SiteFooter userEmail={userEmail} />
       </body>
     </html>
   );
@@ -97,7 +96,7 @@ function SiteFooter({ userEmail }: { userEmail: string | null }) {
 
   return (
     <footer className="border-t border-border bg-surface py-10">
-      <div className="mx-auto flex max-w-5xl flex-col gap-6 px-6 sm:flex-row sm:items-start sm:justify-between">
+      <div className="mx-auto flex max-w-5xl flex-col gap-6 px-4 sm:flex-row sm:px-6 sm:items-start sm:justify-between">
         <div className="max-w-sm">
           <p className="text-base font-semibold tracking-tight text-fg">
             Kalify
@@ -109,24 +108,24 @@ function SiteFooter({ userEmail }: { userEmail: string | null }) {
           </p>
         </div>
 
-        <div className="flex flex-col gap-3 text-sm sm:flex-row sm:gap-10">
-          <div className="flex flex-col gap-2">
+        <div className="flex flex-col text-sm sm:flex-row sm:gap-10">
+          <div className="flex flex-col sm:gap-2">
             {links.map((link) => (
               <Link
                 key={link.href}
                 href={link.href}
-                className="text-fg-muted transition-colors hover:text-fg"
+                className="inline-flex min-h-11 items-center text-fg-muted transition-colors hover:text-fg sm:min-h-0"
               >
                 {link.label}
               </Link>
             ))}
           </div>
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col sm:gap-2">
             <a
               href="https://github.com/TheKauanLima/jobmatch"
               target="_blank"
               rel="noreferrer noopener"
-              className="text-fg-muted transition-colors hover:text-fg"
+              className="inline-flex min-h-11 items-center text-fg-muted transition-colors hover:text-fg sm:min-h-0"
             >
               GitHub
             </a>
@@ -134,7 +133,7 @@ function SiteFooter({ userEmail }: { userEmail: string | null }) {
         </div>
       </div>
 
-      <div className="mx-auto mt-8 max-w-5xl px-6">
+      <div className="mx-auto mt-8 max-w-5xl px-4 sm:px-6">
         <p className="text-xs text-fg-subtle">
           &copy; {year} Kalify. An open student project.
         </p>

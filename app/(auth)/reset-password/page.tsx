@@ -115,7 +115,7 @@ export default function ResetPasswordPage() {
 
   if (sessionStatus === "checking") {
     return (
-      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
+      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-4 py-12 sm:px-6 sm:py-24">
         <p className="text-sm text-fg-muted">Verifying your reset link…</p>
       </div>
     );
@@ -123,7 +123,7 @@ export default function ResetPasswordPage() {
 
   if (sessionStatus === "invalid") {
     return (
-      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
+      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-4 py-12 sm:px-6 sm:py-24">
         <h1 className="text-2xl font-semibold tracking-tight text-fg">
           Link expired or invalid
         </h1>
@@ -133,7 +133,7 @@ export default function ResetPasswordPage() {
         </p>
         <Link
           href="/forgot-password"
-          className="mt-6 text-sm font-medium text-fg underline underline-offset-2"
+          className="mt-6 inline-flex min-h-11 items-center self-start text-sm font-medium text-fg underline underline-offset-2 sm:min-h-0"
         >
           Request a new link
         </Link>
@@ -142,7 +142,7 @@ export default function ResetPasswordPage() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
+    <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-4 py-12 sm:px-6 sm:py-24">
       <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Set a new password
       </h1>

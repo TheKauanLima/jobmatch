@@ -5,9 +5,10 @@ import type {
   SyncExternalJobsResult,
 } from "@/lib/jobs/sync";
 
-const { mockCreateAdminClient, mockSyncExternalJobs } = vi.hoisted(() => ({
+const { mockCreateAdminClient, mockSyncExternalJobs, mockBackfillJobFacets } = vi.hoisted(() => ({
   mockCreateAdminClient: vi.fn(),
   mockSyncExternalJobs: vi.fn(),
+  mockBackfillJobFacets: vi.fn(),
 }));
 
 vi.mock("@/lib/supabase/admin", () => ({
@@ -17,6 +18,15 @@ vi.mock("@/lib/supabase/admin", () => ({
 vi.mock("@/lib/jobs/sync", () => ({
   syncExternalJobs: mockSyncExternalJobs,
 }));
+
+vi.mock("@/lib/jobs/backfillFacets", async () => ({
+  ...(await vi.importActual<typeof import("@/lib/jobs/backfillFacets")>(
+    "@/lib/jobs/backfillFacets",
+  )),
+  backfillJobFacets: mockBackfillJobFacets,
+}));
+
+const FACET_BACKFILL_OK = { updated: 3, remaining: false };
 
 const route = await import("@/app/api/cron/sync-jobs/route");
 const { GET } = route;
@@ -60,6 +70,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   process.env.CRON_SECRET = "test-secret";
   mockCreateAdminClient.mockReturnValue(adminClient);
+  mockBackfillJobFacets.mockResolvedValue(FACET_BACKFILL_OK);
   consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -111,9 +122,27 @@ describe("GET /api/cron/sync-jobs", () => {
     const res = await GET(makeRequest({ authorization: "Bearer test-secret" }));
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual(result);
+    expect(await res.json()).toEqual({ ...result, facetBackfill: FACET_BACKFILL_OK });
     expect(mockSyncExternalJobs).toHaveBeenCalledTimes(1);
     expect(mockSyncExternalJobs).toHaveBeenCalledWith(adminClient);
+    expect(mockBackfillJobFacets).toHaveBeenCalledWith(adminClient, {
+      deadlineMs: expect.any(Number),
+    });
+  });
+
+  it("returns 207 with facetBackfill when the facet backfill fails (§7.8.4)", async () => {
+    const { FacetBackfillError } = await import("@/lib/jobs/backfillFacets");
+    const result = syncResult([company("a", "ok")]);
+    mockSyncExternalJobs.mockResolvedValue(result);
+    mockBackfillJobFacets.mockRejectedValue(new FacetBackfillError("1 failed", 7));
+
+    const res = await GET(makeRequest({ authorization: "Bearer test-secret" }));
+
+    expect(res.status).toBe(207);
+    expect(await res.json()).toEqual({
+      ...result,
+      facetBackfill: { updated: 7, remaining: true },
+    });
   });
 
   it.each([
@@ -129,7 +158,7 @@ describe("GET /api/cron/sync-jobs", () => {
       const res = await GET(makeRequest({ authorization: "Bearer test-secret" }));
 
       expect(res.status).toBe(207);
-      expect(await res.json()).toEqual(result);
+      expect(await res.json()).toEqual({ ...result, facetBackfill: FACET_BACKFILL_OK });
     },
   );
 

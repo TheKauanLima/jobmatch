@@ -191,26 +191,51 @@ function isNonUsPart(part: string): boolean {
  */
 function hasUsStateCode(text: string): boolean {
   for (const match of text.matchAll(US_STATE_CODE_PATTERN_GLOBAL)) {
-    const code = match[1];
-    const before = partBefore(text, match.index);
-    if (/^[A-Z]{2,3}$/.test(before) && !(US_STATE_CODES as readonly string[]).includes(before)) {
-      continue;
-    }
-    if (AMBIGUOUS_STATE_CODES.has(code) && isNonUsPart(before)) continue;
+    if (isStateCodeUsedAsCountry(text, match.index, match[1])) continue;
     return true;
   }
   return false;
 }
 
+/**
+ * True when the two-letter `code` found at `index` in `text` is a country
+ * code in context, not a US state: it sits in the country slot of
+ * "City, Region, CC" ("Toronto, ON, CA"), or it is an ambiguous code right
+ * after a non-US place ("Toronto, CA", "Mumbai, IN"). Shared with the
+ * board's location facets (`lib/jobs/location.ts`, §7.8.2). `index` may
+ * point at the code itself or at the separator before it.
+ */
+export function isStateCodeUsedAsCountry(
+  text: string,
+  index: number,
+  code: string,
+): boolean {
+  const before = partBefore(text, index);
+  if (/^[A-Z]{2,3}$/.test(before) && !(US_STATE_CODES as readonly string[]).includes(before)) {
+    return true;
+  }
+  return AMBIGUOUS_STATE_CODES.has(code) && isNonUsPart(before);
+}
+
+/**
+ * True when the state name found at `index` is a country in context
+ * ("Tbilisi, Georgia"). Only "Georgia" is ambiguous today.
+ */
+export function isStateNameUsedAsCountry(
+  text: string,
+  index: number,
+  name: string,
+): boolean {
+  return (
+    AMBIGUOUS_STATE_NAMES.has(name.toLowerCase().replace(/\s+/g, " ")) &&
+    isNonUsPart(partBefore(text, index))
+  );
+}
+
 /** Same idea for full state names: "Tbilisi, Georgia" is the country. */
 function hasUsStateName(text: string): boolean {
   for (const match of text.matchAll(US_STATE_NAME_PATTERN_GLOBAL)) {
-    if (
-      AMBIGUOUS_STATE_NAMES.has(match[1].toLowerCase()) &&
-      isNonUsPart(partBefore(text, match.index))
-    ) {
-      continue;
-    }
+    if (isStateNameUsedAsCountry(text, match.index, match[1])) continue;
     return true;
   }
   return false;

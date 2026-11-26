@@ -58,3 +58,18 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
+
+/*
+ * Mobile: iOS Safari zooms the page when a text field, select or textarea
+ * with a font size under 16px gets focus. Below the `sm` breakpoint, form
+ * controls render at 16px; from `sm` up the components' own `text-sm` applies
+ * unchanged. Deliberately unlayered so it wins over Tailwind's utilities layer.
+ */
+@media (max-width: 39.999rem) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="hidden"]),
+  input::file-selector-button,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}

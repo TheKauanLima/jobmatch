@@ -86,7 +86,7 @@ function makeRow(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 describe("listJobDescriptions", () => {
-  it("orders by created_at desc and requests limit + 1 rows (no user_id filter — shared data)", async () => {
+  it("orders by listed_at desc and requests limit + 1 rows (no user_id filter — shared data)", async () => {
     const { builder, calls } = makeQueryBuilder({ data: [], error: null });
     const client = makeClient(builder);
 
@@ -97,7 +97,7 @@ describe("listJobDescriptions", () => {
     expect(calls.some((c) => c.method === "eq")).toBe(false);
   });
 
-  it("applies a compound `(created_at, id) < (cursor)` filter via .or() when a cursor is given", async () => {
+  it("applies a compound `(listed_at, id) < (cursor)` filter via .or() when a cursor is given", async () => {
     const { builder, calls } = makeQueryBuilder({ data: [], error: null });
     const client = makeClient(builder);
 
@@ -109,7 +109,7 @@ describe("listJobDescriptions", () => {
     const orCall = calls.find((c) => c.method === "or");
     expect(orCall).toBeDefined();
     expect(orCall?.args[0]).toBe(
-      `created_at.lt.2026-01-01T00:00:00.000Z,and(created_at.eq.2026-01-01T00:00:00.000Z,id.lt.${TEST_UUID})`,
+      `listed_at.lt.2026-01-01T00:00:00.000Z,and(listed_at.eq.2026-01-01T00:00:00.000Z,id.lt.${TEST_UUID})`,
     );
     // The old strict single-column filter must not be used any more — it's
     // exactly the filter that made tied rows permanently unreachable.
@@ -227,7 +227,7 @@ describe("listJobDescriptions", () => {
   // `created_at < cursor` filter. This unit test can only assert what's
   // actually sent to Postgrest, not real DB tie-breaking, but it documents
   // that both sort keys are requested.
-  it("orders by created_at desc THEN id desc (secondary tiebreaker for ties)", async () => {
+  it("orders by listed_at desc THEN id desc (secondary tiebreaker for ties)", async () => {
     const { builder, calls } = makeQueryBuilder({ data: [], error: null });
     const client = makeClient(builder);
 
@@ -237,7 +237,7 @@ describe("listJobDescriptions", () => {
     expect(orderCalls).toHaveLength(2);
     expect(orderCalls[0]).toEqual({
       method: "order",
-      args: ["created_at", { ascending: false }],
+      args: ["listed_at", { ascending: false }],
     });
     expect(orderCalls[1]).toEqual({
       method: "order",
@@ -247,13 +247,13 @@ describe("listJobDescriptions", () => {
 });
 
 describe("encodeJobDescriptionCursor / decodeJobDescriptionCursor", () => {
-  it("round-trips a (created_at, id) pair", () => {
+  it("round-trips a (listed_at, id) pair", () => {
     const encoded = encodeJobDescriptionCursor({
-      created_at: "2026-01-01T00:00:00.000Z",
+      listed_at: "2026-01-01T00:00:00.000Z",
       id: TEST_UUID,
     });
     expect(decodeJobDescriptionCursor(encoded)).toEqual({
-      createdAt: "2026-01-01T00:00:00.000Z",
+      listedAt: "2026-01-01T00:00:00.000Z",
       id: TEST_UUID,
     });
   });
@@ -299,6 +299,10 @@ describe("searchJobDescriptions", () => {
     expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
       search_query: "engineer",
       level_filter: "Internship",
+      category_filter: null,
+      state_filter: null,
+      remote_only: false,
+      sort_mode: "relevance",
       limit_count: 21,
       offset_count: 40,
     });
@@ -312,6 +316,10 @@ describe("searchJobDescriptions", () => {
     expect(rpc).toHaveBeenCalledWith("search_job_descriptions", {
       search_query: "engineer",
       level_filter: null,
+      category_filter: null,
+      state_filter: null,
+      remote_only: false,
+      sort_mode: "relevance",
       limit_count: JOB_DESCRIPTIONS_DEFAULT_LIMIT + 1,
       offset_count: 0,
     });
@@ -442,7 +450,7 @@ describe("encodeJobDescriptionOffsetCursor / decodeJobDescriptionOffsetCursor", 
   // docs/ARCHITECTURE.md §9.2.
   it("returns null for a keyset cursor replayed in offset mode", () => {
     const keysetCursor = encodeJobDescriptionCursor({
-      created_at: "2026-01-01T00:00:00.000Z",
+      listed_at: "2026-01-01T00:00:00.000Z",
       id: TEST_UUID,
     });
     expect(decodeJobDescriptionOffsetCursor(keysetCursor)).toBeNull();
@@ -564,6 +572,9 @@ describe("createJobDescription", () => {
       title: "Software Engineer",
       company: "Acme",
       description: "Build things.",
+      jobCategory: "software",
+      locationStates: [],
+      isRemote: false,
     });
 
     expect(result).toEqual(row);
@@ -582,6 +593,9 @@ describe("createJobDescription", () => {
       submittedBy: "user-1",
       title: "Software Engineer",
       description: "Build things.",
+      jobCategory: "software",
+      locationStates: [],
+      isRemote: false,
     });
 
     const insertCall = calls.find((c) => c.method === "insert");
@@ -608,6 +622,9 @@ describe("createJobDescription", () => {
       description: "Build things.",
       location: "Remote",
       level: "Entry Level",
+      jobCategory: "software",
+      locationStates: [],
+      isRemote: true,
     });
 
     const insertCall = calls.find((c) => c.method === "insert");
@@ -628,6 +645,9 @@ describe("createJobDescription", () => {
         submittedBy: "user-1",
         title: "Software Engineer",
         description: "Build things.",
+        jobCategory: "software",
+        locationStates: [],
+        isRemote: false,
       }),
     ).rejects.toThrow(JobDescriptionQueryError);
   });
@@ -644,6 +664,9 @@ describe("upsertExternalJobDescriptions", () => {
       level: "Internship",
       location: "New York, NY",
       postedAt: "2026-01-01T00:00:00.000Z",
+      jobCategory: "software" as const,
+      locationStates: ["NY" as const],
+      isRemote: false,
       ...overrides,
     };
   }

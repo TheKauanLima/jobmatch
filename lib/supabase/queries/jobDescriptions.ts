@@ -17,6 +17,8 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { Database, JobDescriptionSource } from "@/types/database";
+import type { JobCategory } from "@/lib/jobs/categories";
+import type { UsStateCode } from "@/lib/jobs/usStates";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -41,33 +43,35 @@ export const JOB_DESCRIPTIONS_MAX_LIMIT = 100;
  * query-param bound, same category as `JOB_DESCRIPTIONS_DEFAULT_LIMIT`/
  * `JOB_DESCRIPTIONS_MAX_LIMIT` above, not a POST-body field — so it lives
  * here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
- * `lib/validation/schemas.ts`, matching §3's existing rule that `?level=`/
- * `?limit=` are validated inline in the route handler, not via a `zod`
- * schema.
+ * `lib/validation/schemas.ts`. Since §7.8.6 the route validates its query
+ * params with `jobDescriptionListQuerySchema`, which imports this and the
+ * limit constants from here.
  */
 export const JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH = 200;
 
 /**
- * A decoded pagination cursor: the `(created_at, id)` position of the last
- * row returned on the previous page.
+ * A decoded pagination cursor: the `(listed_at, id)` position of the last
+ * row returned on the previous page (§7.8.6; was `created_at` before 0012).
  */
-export type JobDescriptionCursor = { createdAt: string; id: string };
+export type JobDescriptionCursor = { listedAt: string; id: string };
 
 /**
- * Encodes a `(created_at, id)` pair into the opaque cursor string returned
- * as `next_cursor` (per docs/ARCHITECTURE.md §2). `id` is included as a
- * tiebreaker: ordering by `created_at` alone gives Postgres no guarantee
- * among rows with an identical `created_at` (plausible with bulk/seeded
- * inserts, or two inserts landing in the same instant), and a strict
- * `created_at < cursor` filter would let a tied row that wasn't returned on
- * an earlier page fall through every later page since it's never `<` the
- * cursor. Joining with `_` is safe because neither an ISO-8601 timestamp
- * nor a uuid can contain that character.
+ * Encodes a `(listed_at, id)` pair into the opaque cursor string returned
+ * as `next_cursor` (per docs/ARCHITECTURE.md §2/§7.8.6). `listed_at` is
+ * the generated `coalesce(posted_at, created_at)`. `id` is included as a
+ * tiebreaker: ordering by `listed_at` alone gives Postgres no guarantee
+ * among rows with an identical value (common: one sync run inserts hundreds
+ * of rows at once), and a strict `listed_at < cursor` filter would let a
+ * tied row that wasn't returned on an earlier page fall through every later
+ * page. Joining with `_` is safe because neither an ISO-8601 timestamp nor
+ * a uuid can contain that character. Same string shape as the pre-0012
+ * `<created_at>_<id>` cursor, which therefore still decodes (read as
+ * `listed_at`; at worst one page seam is off, once).
  */
 export function encodeJobDescriptionCursor(
-  row: Pick<JobDescriptionRow, "created_at" | "id">,
+  row: Pick<JobDescriptionRow, "listed_at" | "id">,
 ): string {
-  return `${row.created_at}_${row.id}`;
+  return `${row.listed_at}_${row.id}`;
 }
 
 /**
@@ -78,7 +82,7 @@ export function encodeJobDescriptionCursor(
  * listing.
  */
 // Both halves are validated against a strict shape before being interpolated
-// into a PostgREST `.or()` filter string below — `created_at`/`id` never
+// into a PostgREST `.or()` filter string below — `listed_at`/`id` never
 // come from a trusted source (the cursor is a client-supplied query param),
 // so a value containing filter-syntax characters (`,`, `(`, `)`, etc.) must
 // never reach that string unchecked.
@@ -95,23 +99,38 @@ export function decodeJobDescriptionCursor(
     return null;
   }
 
-  const createdAt = raw.slice(0, separatorIndex);
+  const listedAt = raw.slice(0, separatorIndex);
   const id = raw.slice(separatorIndex + 1);
-  if (!ISO_TIMESTAMP_PATTERN.test(createdAt) || !UUID_PATTERN.test(id)) {
+  if (!ISO_TIMESTAMP_PATTERN.test(listedAt) || !UUID_PATTERN.test(id)) {
     return null;
   }
 
-  return { createdAt, id };
+  return { listedAt, id };
 }
 
 /**
+ * Board filters shared by `listJobDescriptions` and `searchJobDescriptions`
+ * (§7.8.6). All combine with AND; null/undefined means "no filter".
+ * `location` is `"remote"` (→ `is_remote`) or one US state/DC code
+ * (→ `location_states @> {code}`); a state does not include US-wide remote
+ * jobs.
+ */
+export type JobDescriptionFilters = {
+  level?: string | null;
+  category?: JobCategory | null;
+  location?: "remote" | UsStateCode | null;
+};
+
+/**
  * Lists job descriptions across all users (shared data), ordered by
- * `created_at desc, id desc` — `id` is a secondary sort key purely to make
- * the ordering deterministic when two rows share a `created_at`, which in
- * turn makes keyset pagination correct (see `encodeJobDescriptionCursor`).
+ * `listed_at desc, id desc` ("Most recent", §7.8.1) — `id` is a secondary
+ * sort key purely to make the ordering deterministic when two rows share a
+ * `listed_at`, which in turn makes keyset pagination correct (see
+ * `encodeJobDescriptionCursor`). Optional board filters per
+ * `JobDescriptionFilters`.
  * Cursor pagination: pass the opaque cursor from the previous page's
  * `next_cursor` to fetch the next page, filtered as
- * `(created_at, id) < (cursor.createdAt, cursor.id)` in row-value order
+ * `(listed_at, id) < (cursor.listedAt, cursor.id)` in row-value order
  * (expressed via `.or()` since supabase-js has no direct tuple-comparison
  * builder method). Fetches `limit + 1` rows so the caller can tell whether
  * another page exists without a separate count query; `hasMore` is true
@@ -119,7 +138,7 @@ export function decodeJobDescriptionCursor(
  */
 export async function listJobDescriptions(
   supabase: Client,
-  params: { limit?: number; cursor?: string | null; level?: string | null },
+  params: { limit?: number; cursor?: string | null } & JobDescriptionFilters,
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
     Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
@@ -130,19 +149,27 @@ export async function listJobDescriptions(
     .from("job_descriptions")
     .select("*")
     .is("deleted_at", null)
-    .order("created_at", { ascending: false })
+    .order("listed_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(limit + 1);
 
   if (params.level) {
     query = query.eq("level", params.level);
   }
+  if (params.category) {
+    query = query.eq("job_category", params.category);
+  }
+  if (params.location === "remote") {
+    query = query.eq("is_remote", true);
+  } else if (params.location) {
+    query = query.contains("location_states", [params.location]);
+  }
 
   if (params.cursor) {
     const decoded = decodeJobDescriptionCursor(params.cursor);
     if (decoded) {
       query = query.or(
-        `created_at.lt.${decoded.createdAt},and(created_at.eq.${decoded.createdAt},id.lt.${decoded.id})`,
+        `listed_at.lt.${decoded.listedAt},and(listed_at.eq.${decoded.listedAt},id.lt.${decoded.id})`,
       );
     }
   }
@@ -214,8 +241,9 @@ export async function searchJobDescriptions(
     query: string;
     limit?: number;
     offset?: number;
-    level?: string | null;
-  },
+    /** `relevance` (default) or `recent` (`listed_at desc`), §7.8.6. */
+    sort?: "relevance" | "recent";
+  } & JobDescriptionFilters,
 ): Promise<{ items: JobDescriptionRow[]; hasMore: boolean }> {
   const limit = Math.min(
     Math.max(1, params.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT),
@@ -234,6 +262,11 @@ export async function searchJobDescriptions(
     // `level = ''`) instead of skipping the filter as documented in
     // docs/ARCHITECTURE.md §2/§9.3 ("omitted/empty means no filter").
     level_filter: params.level || null,
+    category_filter: params.category || null,
+    state_filter:
+      params.location && params.location !== "remote" ? params.location : null,
+    remote_only: params.location === "remote",
+    sort_mode: params.sort ?? "relevance",
     limit_count: limit + 1,
     offset_count: offset,
   });
@@ -249,6 +282,47 @@ export async function searchJobDescriptions(
   const hasMore = rows.length > limit;
 
   return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
+}
+
+/** Global board-filter counts (§7.8.6). Zero-count values are absent. */
+export type JobDescriptionFacets = {
+  categories: Partial<Record<JobCategory, number>>;
+  states: Partial<Record<UsStateCode, number>>;
+  remote: number;
+};
+
+/**
+ * Global counts for the board filters, via the `job_description_facets()`
+ * RPC (0012). Runs over all active rows and ignores every other filter
+ * (§7.8.1 decision 5: used only to hide dead-end states and mark empty
+ * fields). Call with the session client: the RPC is granted to
+ * `authenticated` only and is `security invoker`.
+ */
+export async function getJobDescriptionFacets(
+  supabase: Client,
+): Promise<JobDescriptionFacets> {
+  const { data, error } = await supabase.rpc("job_description_facets");
+
+  if (error) {
+    throw new JobDescriptionQueryError(
+      `Failed to load job description facets: ${error.message}`,
+      error,
+    );
+  }
+
+  const facets: JobDescriptionFacets = { categories: {}, states: {}, remote: 0 };
+  for (const row of data ?? []) {
+    const count = Number(row.listing_count);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    if (row.facet === "category") {
+      facets.categories[row.value as JobCategory] = count;
+    } else if (row.facet === "state") {
+      facets.states[row.value as UsStateCode] = count;
+    } else if (row.facet === "remote") {
+      facets.remote = count;
+    }
+  }
+  return facets;
 }
 
 /**
@@ -328,6 +402,10 @@ export async function createJobDescription(
     sourceUrl?: string | null;
     location?: string | null;
     level?: string | null;
+    /** Derived by `deriveJobFacets` (lib/jobs/facets.ts), never from the request body. */
+    jobCategory: JobCategory;
+    locationStates: UsStateCode[];
+    isRemote: boolean;
   },
 ): Promise<JobDescriptionRow> {
   const { data, error } = await supabase
@@ -340,6 +418,9 @@ export async function createJobDescription(
       source_url: params.sourceUrl ?? null,
       location: params.location ?? null,
       level: params.level ?? null,
+      job_category: params.jobCategory,
+      location_states: params.locationStates,
+      is_remote: params.isRemote,
     })
     .select("*")
     .single();
@@ -391,6 +472,11 @@ export async function updateJobDescription(
       sourceUrl?: string | null;
       location?: string | null;
       level?: string | null;
+      /** Recomputed by the route when `title` is in the patch (§7.8.4). */
+      jobCategory?: JobCategory;
+      /** Recomputed by the route when `location` is in the patch, including null. */
+      locationStates?: UsStateCode[];
+      isRemote?: boolean;
     };
   },
 ): Promise<JobDescriptionRow | null> {
@@ -401,6 +487,9 @@ export async function updateJobDescription(
   if (params.patch.sourceUrl !== undefined) update.source_url = params.patch.sourceUrl;
   if (params.patch.location !== undefined) update.location = params.patch.location;
   if (params.patch.level !== undefined) update.level = params.patch.level;
+  if (params.patch.jobCategory !== undefined) update.job_category = params.patch.jobCategory;
+  if (params.patch.locationStates !== undefined) update.location_states = params.patch.locationStates;
+  if (params.patch.isRemote !== undefined) update.is_remote = params.patch.isRemote;
 
   const { data, error } = await supabase
     .from("job_descriptions")
@@ -468,6 +557,10 @@ export type ExternalJobDescriptionUpsert = {
   level: string | null;
   location: string | null;
   postedAt: string | null;
+  /** Board facets from `deriveJobFacets` (§7.8.4), recomputed on every sync. */
+  jobCategory: JobCategory;
+  locationStates: UsStateCode[];
+  isRemote: boolean;
 };
 
 /** Batch size for `upsertExternalJobDescriptions` — keeps individual requests small. */
@@ -527,6 +620,9 @@ export async function upsertExternalJobDescriptions(
           level: row.level,
           location: row.location,
           posted_at: row.postedAt,
+          job_category: row.jobCategory,
+          location_states: row.locationStates,
+          is_remote: row.isRemote,
           submitted_by: null,
           deleted_at: null,
         })),

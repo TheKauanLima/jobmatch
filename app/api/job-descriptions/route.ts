@@ -1,40 +1,40 @@
 import { NextResponse } from "next/server";
 
 import { requireSession, UnauthorizedError } from "@/lib/auth/session";
+import { deriveJobFacets } from "@/lib/jobs/facets";
 import { createClient } from "@/lib/supabase/server";
 import {
   createJobDescription,
   decodeJobDescriptionOffsetCursor,
   encodeJobDescriptionCursor,
   encodeJobDescriptionOffsetCursor,
-  JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
-  JOB_DESCRIPTIONS_DEFAULT_LIMIT,
-  JOB_DESCRIPTIONS_MAX_LIMIT,
   JobDescriptionQueryError,
   listJobDescriptions,
   searchJobDescriptions,
 } from "@/lib/supabase/queries/jobDescriptions";
-import { jobDescriptionCreateSchema } from "@/lib/validation/schemas";
+import {
+  jobDescriptionCreateSchema,
+  jobDescriptionListQuerySchema,
+} from "@/lib/validation/schemas";
 import { toJobDescription } from "@/types/domain";
 
 /**
  * GET /api/job-descriptions — list shared job descriptions. Query params per
- * docs/ARCHITECTURE.md §2/§9.3: `?limit=20`, `?level=<level>` (added per §7
- * for external-listing ingestion — e.g. `Internship`/`Entry Level`; omitted/
- * empty means no filter, combinable with `?q=`), `?q=<term>` (added per §9,
- * full-text search over `title`/`company`/`description`/`location` — see
- * `lib/supabase/queries/jobDescriptions.ts#searchJobDescriptions`; omitted,
- * or empty/whitespace-only after trimming, means no search filter and falls
- * back to the plain listing below; capped at
- * `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` characters, `400` if exceeded),
- * and `?cursor=<opaque token>` whose meaning depends on whether `q` is
- * present on the same request (§9.2): without `q`, keyset pagination
- * ordered `created_at desc, id desc` exactly as before (`id` tiebreaker
- * keeps pagination correct when rows share a `created_at`); with `q`,
- * offset pagination ordered by relevance. A cursor from the other mode's
- * encoding — or any other malformed cursor — is treated as "no cursor"
- * (first page). Auth required (any authenticated user — shared data, not
- * owner-scoped).
+ * docs/ARCHITECTURE.md §2/§9.3/§7.8.6, validated by
+ * `jobDescriptionListQuerySchema` (400 `{ error }` with the first issue's
+ * message on failure; an empty string means the param is absent):
+ * `q` (full-text search, ≤ 200 chars), `level`, `category` (field slug),
+ * `location` (`remote` or a US state/DC code), `sort` (`relevance` |
+ * `recent`; relevance requires `q`), `limit` (capped at 100), and
+ * `cursor`. All filters combine with AND, with or without `q`.
+ *
+ * Cursor meaning depends on whether `q` is present (§9.2): without `q`,
+ * keyset pagination ordered `listed_at desc, id desc` (`listed_at =
+ * coalesce(posted_at, created_at)`); with `q`, offset pagination (ordered
+ * by relevance or, with `sort=recent`, by `listed_at`). A cursor from the
+ * other mode's encoding, or any other malformed cursor, is treated as "no
+ * cursor" (first page). Auth required (any authenticated user — shared
+ * data, not owner-scoped).
  */
 export async function GET(request: Request) {
   try {
@@ -42,43 +42,27 @@ export async function GET(request: Request) {
     const supabase = await createClient();
 
     const url = new URL(request.url);
-    const limitParam = url.searchParams.get("limit");
-    const cursorParam = url.searchParams.get("cursor");
-    const levelParam = url.searchParams.get("level");
-    const qParam = url.searchParams.get("q");
-
-    let limit = JOB_DESCRIPTIONS_DEFAULT_LIMIT;
-    if (limitParam !== null) {
-      const parsed = Number(limitParam);
-      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
-        return NextResponse.json(
-          { error: "limit must be a positive integer." },
-          { status: 400 },
-        );
-      }
-      limit = Math.min(parsed, JOB_DESCRIPTIONS_MAX_LIMIT);
-    }
-
-    const trimmedQuery = qParam?.trim() ?? "";
-    if (trimmedQuery.length > JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH) {
+    const parsedQuery = jobDescriptionListQuerySchema.safeParse(
+      Object.fromEntries(url.searchParams),
+    );
+    if (!parsedQuery.success) {
       return NextResponse.json(
-        {
-          error: `q must be at most ${JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH} characters.`,
-        },
+        { error: parsedQuery.error.issues[0]?.message ?? "Invalid query parameters." },
         { status: 400 },
       );
     }
+    const { q, level, category, location, sort, limit, cursor } = parsedQuery.data;
+    const filters = { level, category, location };
 
-    if (trimmedQuery.length > 0) {
-      const offset = cursorParam
-        ? (decodeJobDescriptionOffsetCursor(cursorParam) ?? 0)
-        : 0;
+    if (q !== null) {
+      const offset = cursor ? (decodeJobDescriptionOffsetCursor(cursor) ?? 0) : 0;
 
       const { items, hasMore } = await searchJobDescriptions(supabase, {
-        query: trimmedQuery,
+        query: q,
         limit,
         offset,
-        level: levelParam,
+        sort,
+        ...filters,
       });
 
       const next_cursor = hasMore
@@ -93,8 +77,8 @@ export async function GET(request: Request) {
 
     const { items, hasMore } = await listJobDescriptions(supabase, {
       limit,
-      cursor: cursorParam,
-      level: levelParam,
+      cursor,
+      ...filters,
     });
 
     const lastItem = items[items.length - 1];
@@ -158,6 +142,11 @@ export async function POST(request: Request) {
 
   try {
     const supabase = await createClient();
+    // Facets are always derived server-side (§7.8.4); the body can't set them.
+    const facets = deriveJobFacets({
+      title: parsed.data.title,
+      location: parsed.data.location ?? null,
+    });
     const jobDescription = await createJobDescription(supabase, {
       submittedBy: user.id,
       title: parsed.data.title,
@@ -166,6 +155,7 @@ export async function POST(request: Request) {
       sourceUrl: parsed.data.source_url,
       location: parsed.data.location,
       level: parsed.data.level,
+      ...facets,
     });
 
     return NextResponse.json(

@@ -13,8 +13,10 @@ import { JobsResultsSkeleton } from "@/components/jobs/JobsBoardStates";
 import {
   buildJobsApiPath,
   jobsQueryKey,
+  parseJobsFacets,
   parseJobsSearchParams,
   type JobsBoardQuery,
+  type JobsFacets,
 } from "@/lib/client/jobsBoard";
 
 export const metadata: Metadata = {
@@ -38,10 +40,30 @@ async function getFirstPage(query: JobsBoardQuery): Promise<JobsFirstPage> {
   }
 }
 
-/** Fetches and renders one query's results; streamed in under Suspense. */
-async function JobsResultsLoader({ query }: { query: JobsBoardQuery }) {
-  const firstPage = await getFirstPage(query);
-  return <JobsResults query={query} firstPage={firstPage} />;
+/**
+ * Global filter counts (docs/ARCHITECTURE.md §7.8.6). Never throws: any
+ * failure (or an unexpected body) is `null`, which the filter bar handles by
+ * enabling every field and offering only "Any location" / "Remote".
+ */
+async function getFacets(): Promise<JobsFacets | null> {
+  try {
+    const response = await serverFetch("/api/job-descriptions/facets");
+    if (!response.ok) return null;
+    return parseJobsFacets(await response.json());
+  } catch {
+    return null;
+  }
+}
+
+/** Awaits one query's first page and renders it; streamed in under Suspense. */
+async function JobsResultsLoader({
+  query,
+  firstPage,
+}: {
+  query: JobsBoardQuery;
+  firstPage: Promise<JobsFirstPage>;
+}) {
+  return <JobsResults query={query} firstPage={await firstPage} />;
 }
 
 interface JobsPageProps {
@@ -49,10 +71,15 @@ interface JobsPageProps {
 }
 
 /**
- * `/jobs` — the shared jobs board (docs/ARCHITECTURE.md §2, §7, §9). Search
- * and level filter live in the URL. The page chrome renders immediately; the
- * results stream in under a Suspense boundary keyed on the query, so a new
- * search shows the results skeleton straight away instead of a frozen page.
+ * `/jobs` — the shared jobs board (docs/ARCHITECTURE.md §2, §7, §7.8, §9).
+ * Search, filters and sort live in the URL.
+ *
+ * The first results page and the filter facets are requested in parallel.
+ * The facets are awaited here, outside the results Suspense boundary, so the
+ * filter bar renders with its final options; the results stream in under a
+ * Suspense boundary keyed on the query, so a new search shows the results
+ * skeleton straight away instead of a frozen page. `getFirstPage` never
+ * rejects, so starting it before awaiting the facets is safe.
  */
 export default async function JobsPage({ searchParams }: JobsPageProps) {
   const session = await getSession();
@@ -61,11 +88,17 @@ export default async function JobsPage({ searchParams }: JobsPageProps) {
   }
 
   const query = parseJobsSearchParams(await searchParams);
+  const firstPage = getFirstPage(query);
+  const facets = await getFacets();
 
   return (
-    <JobsBoardLayout query={query} submitForm={<JobDescriptionForm embedded />}>
+    <JobsBoardLayout
+      query={query}
+      facets={facets}
+      submitForm={<JobDescriptionForm embedded />}
+    >
       <Suspense key={jobsQueryKey(query)} fallback={<JobsResultsSkeleton />}>
-        <JobsResultsLoader query={query} />
+        <JobsResultsLoader query={query} firstPage={firstPage} />
       </Suspense>
     </JobsBoardLayout>
   );

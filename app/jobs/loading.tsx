@@ -15,10 +15,17 @@ export default function JobsLoading() {
         <Skeleton className="h-10 flex-1" />
         <Skeleton className="h-10 w-full sm:w-24" />
       </div>
-      <div className="mt-4 flex gap-2">
-        <Skeleton className="h-8 w-24 rounded-full" />
-        <Skeleton className="h-8 w-24 rounded-full" />
-        <Skeleton className="h-8 w-28 rounded-full" />
+      {/* Mirrors the filter bar: level pills, then Field + Location selects. */}
+      <div className="mt-5 flex flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-end sm:gap-x-5">
+        <div className="flex gap-2">
+          <Skeleton className="h-8 w-24 rounded-full" />
+          <Skeleton className="h-8 w-24 rounded-full" />
+          <Skeleton className="h-8 w-28 rounded-full" />
+        </div>
+        <div className="grid grid-cols-2 gap-3 sm:contents">
+          <Skeleton className="h-9 sm:w-52 lg:w-60" />
+          <Skeleton className="h-9 sm:w-44 lg:w-48" />
+        </div>
       </div>
 
       <div className="mt-6">

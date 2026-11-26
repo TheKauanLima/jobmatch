@@ -7,6 +7,14 @@
 
 import { z } from "zod";
 
+import { JOB_CATEGORY_SLUGS, type JobCategory } from "@/lib/jobs/categories";
+import { isUsStateCode, type UsStateCode } from "@/lib/jobs/usStates";
+import {
+  JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
+  JOB_DESCRIPTIONS_DEFAULT_LIMIT,
+  JOB_DESCRIPTIONS_MAX_LIMIT,
+} from "@/lib/supabase/queries/jobDescriptions";
+
 // ---------------------------------------------------------------------
 // Resumes — POST /api/resumes
 // ---------------------------------------------------------------------
@@ -246,6 +254,110 @@ export const jobDescriptionUpdateSchema = z
 export type JobDescriptionUpdateInput = z.infer<
   typeof jobDescriptionUpdateSchema
 >;
+
+// ---------------------------------------------------------------------
+// Job descriptions — GET /api/job-descriptions query params (§7.8.6)
+// ---------------------------------------------------------------------
+
+/** Query-param strings: an empty string means the param is absent (§7.8.6). */
+function optionalParam<T extends z.ZodTypeAny>(schema: T) {
+  return z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    schema.optional(),
+  );
+}
+
+export type JobDescriptionLocationFilter = "remote" | UsStateCode;
+export type JobDescriptionSort = "relevance" | "recent";
+
+/**
+ * Query params for `GET /api/job-descriptions` (docs/ARCHITECTURE.md
+ * §7.8.6; supersedes §3/§9.1's inline validation for this route). Parse
+ * `Object.fromEntries(url.searchParams)`. Unknown params are ignored.
+ * - `q`: trimmed, at most `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH`;
+ *   whitespace-only means absent.
+ * - `level`: one of `JOB_DESCRIPTION_LEVELS` (unknown → 400).
+ * - `category`: one of `JOB_CATEGORY_SLUGS`.
+ * - `location`: `remote` or a US state/DC code, case-insensitive,
+ *   normalized to `"remote"` / uppercase.
+ * - `sort`: `relevance` | `recent`; defaults to relevance with `q` and
+ *   recent without. `relevance` without `q` → 400.
+ * - `limit`: integer ≥ 1, capped at `JOB_DESCRIPTIONS_MAX_LIMIT`.
+ * - `cursor`: opaque, passed through (a malformed one means "first page").
+ */
+export const jobDescriptionListQuerySchema = z
+  .object({
+    q: z.preprocess(
+      (value) => {
+        if (typeof value !== "string") return value;
+        const trimmed = value.trim();
+        return trimmed === "" ? undefined : trimmed;
+      },
+      z
+        .string()
+        .max(
+          JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
+          `q must be at most ${JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH} characters.`,
+        )
+        .optional(),
+    ),
+    level: optionalParam(
+      z.enum(JOB_DESCRIPTION_LEVELS, {
+        error: `level must be one of: ${JOB_DESCRIPTION_LEVELS.join(", ")}.`,
+      }),
+    ),
+    category: optionalParam(
+      z.enum(JOB_CATEGORY_SLUGS as [JobCategory, ...JobCategory[]], {
+        error: "category must be a known field.",
+      }),
+    ),
+    location: optionalParam(
+      z
+        .string()
+        .transform((value) => {
+          const trimmed = value.trim();
+          if (trimmed.toLowerCase() === "remote") return "remote" as const;
+          const upper = trimmed.toUpperCase();
+          return isUsStateCode(upper) ? upper : null;
+        })
+        .refine((value) => value !== null, {
+          message: 'location must be "remote" or a US state code.',
+        })
+        .transform((value) => value as JobDescriptionLocationFilter),
+    ),
+    sort: optionalParam(
+      z.enum(["relevance", "recent"], {
+        error: 'sort must be "relevance" or "recent".',
+      }),
+    ),
+    limit: optionalParam(
+      z
+        .string()
+        // Same acceptance rule as the pre-§7.8 inline check: Number(value)
+        // must be a finite integer ≥ 1.
+        .transform(Number)
+        .refine((value) => Number.isInteger(value) && value >= 1, {
+          message: "limit must be a positive integer.",
+        })
+        .transform((value) => Math.min(value, JOB_DESCRIPTIONS_MAX_LIMIT)),
+    ),
+    cursor: optionalParam(z.string()),
+  })
+  .refine((data) => !(data.sort === "relevance" && data.q === undefined), {
+    message: 'sort "relevance" requires q.',
+    path: ["sort"],
+  })
+  .transform((data) => ({
+    q: data.q ?? null,
+    level: data.level ?? null,
+    category: data.category ?? null,
+    location: data.location ?? null,
+    sort: (data.sort ?? (data.q !== undefined ? "relevance" : "recent")) as JobDescriptionSort,
+    limit: data.limit ?? JOB_DESCRIPTIONS_DEFAULT_LIMIT,
+    cursor: data.cursor ?? null,
+  }));
+
+export type JobDescriptionListQuery = z.output<typeof jobDescriptionListQuerySchema>;
 
 // ---------------------------------------------------------------------
 // Matches — POST /api/matches

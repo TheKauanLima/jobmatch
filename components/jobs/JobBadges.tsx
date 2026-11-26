@@ -1,5 +1,6 @@
 import { Badge } from "@/components/ui/Badge";
 import { getJobSourceInfo } from "@/lib/client/jobsBoard";
+import { jobCategoryLabel } from "@/lib/jobs/categories";
 
 /**
  * Level tag (e.g. "Internship"), using the shared `Badge`. Text label, so the
@@ -10,6 +11,23 @@ export function JobLevelBadge({ level }: { level: string }) {
     <Badge>
       <span className="sr-only">Level: </span>
       {level}
+    </Badge>
+  );
+}
+
+/**
+ * Field tag (e.g. "Data & AI"; docs/ARCHITECTURE.md §7.8.7), neutral like the
+ * level tag. Renders nothing while the field isn't computed yet (`null`) or
+ * for the "Other" fallback, which wouldn't tell the reader anything.
+ */
+export function JobFieldBadge({ category }: { category: string | null }) {
+  if (category === "other") return null;
+  const label = jobCategoryLabel(category);
+  if (!label) return null;
+  return (
+    <Badge>
+      <span className="sr-only">Field: </span>
+      {label}
     </Badge>
   );
 }

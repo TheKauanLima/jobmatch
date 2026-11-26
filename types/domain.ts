@@ -10,8 +10,9 @@ import type {
   JobDescriptionSource,
   ResumeStatus,
 } from "@/types/database";
+import type { JobCategory } from "@/lib/jobs/categories";
 
-export type { JobDescriptionSource, ResumeStatus };
+export type { JobCategory, JobDescriptionSource, ResumeStatus };
 
 export type ResumeRow = Database["public"]["Tables"]["resumes"]["Row"];
 
@@ -139,6 +140,10 @@ export type JobDescriptionRow =
  * `deleted_at` (genuinely client-facing now, unlike `submitted_by`/
  * `external_id`/`search_vector`) lets the UI render a "This posting was
  * removed" state per §10.5.
+ *
+ * `job_category` was added per §7.8.6 (the board's "Field"; null until the
+ * facets are computed). `location_states`/`is_remote`/`listed_at` are
+ * deliberately not exposed: they only drive server-side filtering/ordering.
  */
 export type JobDescription = {
   id: string;
@@ -154,6 +159,7 @@ export type JobDescription = {
   posted_at: string | null;
   is_own: boolean;
   deleted_at: string | null;
+  job_category: JobCategory | null;
 };
 
 /**
@@ -181,6 +187,7 @@ export function toJobDescription(
     posted_at: row.posted_at,
     is_own: row.submitted_by === callerId,
     deleted_at: row.deleted_at,
+    job_category: row.job_category,
   };
 }
 

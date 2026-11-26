@@ -17,6 +17,7 @@ import {
   JOB_DESCRIPTION_TITLE_MAX_LENGTH,
 } from "@/lib/validation/schemas";
 import type { ExternalJobDescriptionUpsert } from "@/lib/supabase/queries/jobDescriptions";
+import { deriveJobFacets } from "@/lib/jobs/facets";
 import { decodeHtmlEntities, stripHtml } from "@/lib/jobs/html";
 import {
   classifyStudentLevel,
@@ -51,7 +52,24 @@ export type RawGreenhouseJob = {
   first_published?: unknown;
   /** e.g. `{ name: "Los Angeles, CA", location: "Los Angeles, California, United States" }`. */
   offices?: unknown;
+  /** e.g. `[{ name: "Engineering" }]`; feeds the field classifier only (§7.8.3). */
+  departments?: unknown;
 };
+
+/** `departments[].name` joined with " / " (§7.8.3), or null. */
+function greenhouseDepartment(raw: RawGreenhouseJob): string | null {
+  if (!Array.isArray(raw.departments)) return null;
+  const names = raw.departments
+    .map((department) =>
+      department !== null && typeof department === "object"
+        ? (department as { name?: unknown }).name
+        : null,
+    )
+    .filter((name): name is string => typeof name === "string")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return names.length > 0 ? names.join(" / ") : null;
+}
 
 /**
  * US check for a Greenhouse job (§7.7.3, amended 2026-11-20):
@@ -124,6 +142,7 @@ export function greenhouseExternalId(
  * filter rejects it (§7.7.3; US = `location.name` or any office, see
  * `isGreenhouseJobUs`). The stored `location` is still `location.name`.
  * `company` comes from `displayName`, never the payload. All fields are clamped to `JOB_DESCRIPTION_*_MAX_LENGTH`.
+ * Board facets (§7.8.4) come from the title, `departments[]`, and `location.name`.
  */
 export function mapGreenhouseJob(
   raw: RawGreenhouseJob,
@@ -161,5 +180,10 @@ export function mapGreenhouseJob(
     level,
     location,
     postedAt: isoDateOrNull(raw.first_published),
+    ...deriveJobFacets({
+      title,
+      location,
+      department: greenhouseDepartment(raw),
+    }),
   };
 }

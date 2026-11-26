@@ -18,6 +18,7 @@ import {
   JOB_DESCRIPTION_TITLE_MAX_LENGTH,
 } from "@/lib/validation/schemas";
 import type { ExternalJobDescriptionUpsert } from "@/lib/supabase/queries/jobDescriptions";
+import { deriveJobFacets } from "@/lib/jobs/facets";
 import { stripHtml } from "@/lib/jobs/html";
 import { classifyStudentLevel, isUsLocation } from "@/lib/jobs/studentFilter";
 import type { JobBoardCompany } from "@/lib/jobs/sources/companies";
@@ -40,7 +41,15 @@ const LEVER_API_BASE = "https://api.lever.co/v0/postings";
 export type RawLeverPosting = {
   id?: unknown;
   text?: unknown;
-  categories?: { location?: unknown; allLocations?: unknown } | null;
+  categories?: {
+    location?: unknown;
+    allLocations?: unknown;
+    /** Feed the field classifier only (§7.8.3). */
+    department?: unknown;
+    team?: unknown;
+  } | null;
+  /** "onsite" | "hybrid" | "remote" | "unspecified"; "remote" is a remote hint (§7.8.4). */
+  workplaceType?: unknown;
   country?: unknown;
   descriptionPlain?: unknown;
   lists?: unknown;
@@ -120,12 +129,22 @@ function leverDescription(raw: RawLeverPosting): string | null {
   return clampText(parts.join("\n\n"), JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH);
 }
 
+/** `categories.department` and `categories.team` joined with " / " (§7.8.3), or null. */
+function leverDepartment(raw: RawLeverPosting): string | null {
+  const parts = [raw.categories?.department, raw.categories?.team]
+    .filter((part): part is string => typeof part === "string")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : null;
+}
+
 /**
  * Maps one Lever posting to the upsert shape, or `null` when it has no id,
  * title, description, or http(s) posting URL, or when the student or US
  * filter rejects it (§7.7.3; Lever's `country`, when present, decides the
  * US check on its own). `company` comes from `displayName`. All fields are
- * clamped to `JOB_DESCRIPTION_*_MAX_LENGTH`.
+ * clamped to `JOB_DESCRIPTION_*_MAX_LENGTH`. Board facets (§7.8.4) come from
+ * the title, department/team, location, and `workplaceType === "remote"`.
  */
 export function mapLeverJob(
   raw: RawLeverPosting,
@@ -156,5 +175,11 @@ export function mapLeverJob(
     location,
     postedAt:
       typeof raw.createdAt === "number" ? isoDateOrNull(raw.createdAt) : null,
+    ...deriveJobFacets({
+      title,
+      location,
+      department: leverDepartment(raw),
+      remoteHint: raw.workplaceType === "remote",
+    }),
   };
 }

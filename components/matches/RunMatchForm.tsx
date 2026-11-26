@@ -211,7 +211,7 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
       />
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-        <div className="flex flex-1 flex-col gap-1.5">
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
           <label
             htmlFor="match-job-description"
             className="text-sm font-medium text-fg-muted"
@@ -234,7 +234,7 @@ export function RunMatchForm({ resumeId, jobDescriptions }: RunMatchFormProps) {
               value={effectiveJobDescriptionId}
               onChange={(event) => setJobDescriptionId(event.target.value)}
               disabled={matching}
-              className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
+              className="w-full min-w-0 rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg focus:border-fg-subtle focus:outline-none focus:ring-1 focus:ring-fg-subtle disabled:bg-surface-hover disabled:text-fg-subtle"
             >
               {visibleJobDescriptions.map((jobDescription) => (
                 <option key={jobDescription.id} value={jobDescription.id}>

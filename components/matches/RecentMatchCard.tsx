@@ -25,7 +25,7 @@ export function RecentMatchCard({ match }: RecentMatchCardProps) {
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
-            <p className="truncate text-sm font-medium text-fg">
+            <p title={match.job_description.title} className="truncate text-sm font-medium text-fg">
               {match.job_description.title}
             </p>
             {match.job_description.deleted_at && <Badge>Removed</Badge>}
@@ -38,7 +38,7 @@ export function RecentMatchCard({ match }: RecentMatchCardProps) {
         </div>
         <MatchScoreBadge score={match.score} className="shrink-0" />
       </div>
-      <p className="mt-2 truncate text-xs text-fg-subtle">
+      <p title={match.resume.file_name} className="mt-2 truncate text-xs text-fg-subtle">
         {match.resume.file_name}
       </p>
     </Link>

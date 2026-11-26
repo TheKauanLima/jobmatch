@@ -136,7 +136,7 @@ export function AccountStatusNoticeView({
   }, []);
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 pt-8">
+    <div className="mx-auto w-full max-w-5xl px-4 pt-6 sm:px-6 sm:pt-8">
       <div
         ref={ref}
         role="status"
@@ -162,7 +162,7 @@ export function AccountStatusNoticeView({
         <button
           type="button"
           onClick={onDismiss}
-          className="shrink-0 self-start rounded-md px-2 py-1 font-medium underline underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          className="inline-flex min-h-11 shrink-0 items-center self-start rounded-md px-2 py-1 font-medium underline sm:min-h-0 underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           Dismiss
         </button>

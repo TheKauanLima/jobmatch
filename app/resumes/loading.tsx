@@ -3,7 +3,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 /** Route-level loading UI for `/resumes` — see `components/ui/Skeleton.tsx`. */
 export default function ResumesLoading() {
   return (
-    <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
+    <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
       <Skeleton className="h-8 w-48" />
       <Skeleton className="mt-3 h-4 w-80 max-w-full" />
 

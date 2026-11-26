@@ -39,7 +39,7 @@ export default async function ResumesPage() {
   const { resumes, error } = await getResumes();
 
   return (
-    <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
+    <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
       <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Your resumes
       </h1>

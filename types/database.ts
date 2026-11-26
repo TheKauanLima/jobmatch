@@ -47,7 +47,17 @@
  * 0009's (M1.5) entries live on branch `wip/m1.5-ingestion` and come back
  * when 0009 lands. No new narrowings for 0010: its jsonb columns stay `Json`
  * (shaped by types/domain.ts#toCritique).
+ *
+ * Updated by hand for supabase/migrations/0012_job_board_filters.sql
+ * (§7.8.5): job_descriptions.job_category / location_states / is_remote /
+ * listed_at, the 8-argument search_job_descriptions, and
+ * job_description_facets(). Narrowings: job_category is `JobCategory` and
+ * location_states is `UsStateCode[]` (both enforced by check constraints);
+ * listed_at is generated, so it is in Row only.
  */
+
+import type { JobCategory } from "@/lib/jobs/categories";
+import type { UsStateCode } from "@/lib/jobs/usStates";
 
 export type Json =
   | string
@@ -172,6 +182,21 @@ export interface Database {
            * See docs/ARCHITECTURE.md §10.
            */
           deleted_at: string | null;
+          /**
+           * 0012 (§7.8.3): the board's "Field". Null = facets not computed
+           * yet (the sync cron backfills). Written only by server code via
+           * lib/jobs/facets.ts, always together with location_states/is_remote.
+           */
+          job_category: JobCategory | null;
+          /** 0012 (§7.8.2): USPS codes parsed from `location`. */
+          location_states: UsStateCode[];
+          /** 0012 (§7.8.2): explicit remote signal. */
+          is_remote: boolean;
+          /**
+           * 0012 (§7.8.1): generated, coalesce(posted_at, created_at). "Most
+           * recent" order and the keyset cursor. Not in Insert/Update.
+           */
+          listed_at: string;
         };
         Insert: {
           id?: string;
@@ -188,6 +213,9 @@ export interface Database {
           location?: string | null;
           posted_at?: string | null;
           deleted_at?: string | null;
+          job_category?: JobCategory | null;
+          location_states?: UsStateCode[];
+          is_remote?: boolean;
         };
         Update: Partial<
           Database["public"]["Tables"]["job_descriptions"]["Insert"]
@@ -426,16 +454,34 @@ export interface Database {
        * Ranked full-text search over `job_descriptions`, added by
        * supabase/migrations/0005_job_description_search.sql — see
        * `lib/supabase/queries/jobDescriptions.ts#searchJobDescriptions` and
-       * docs/ARCHITECTURE.md §9.
+       * docs/ARCHITECTURE.md §9. Filter/sort params added by 0012 (§7.8.5).
        */
       search_job_descriptions: {
         Args: {
           search_query: string;
           level_filter?: string | null;
+          category_filter?: string | null;
+          state_filter?: string | null;
+          remote_only?: boolean;
+          /** 'relevance' (default) | 'recent'. */
+          sort_mode?: string;
           limit_count?: number;
           offset_count?: number;
         };
         Returns: Database["public"]["Tables"]["job_descriptions"]["Row"][];
+      };
+      /**
+       * Global board-filter counts over active rows (0012, §7.8.6).
+       * authenticated + service_role only.
+       */
+      job_description_facets: {
+        Args: Record<string, never>;
+        Returns: {
+          /** 'category' | 'state' | 'remote'. */
+          facet: string;
+          value: string;
+          listing_count: number;
+        }[];
       };
       // --- 0007: task queue functions (service_role only) ---------------
       enqueue_task: {

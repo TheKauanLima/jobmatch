@@ -212,8 +212,8 @@ export default async function ResumeDetailPage({
 
   if (result.kind === "error") {
     return (
-      <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-        <Link href="/resumes" className="text-sm text-fg-subtle hover:text-fg-muted">
+      <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
+        <Link href="/resumes" className="inline-flex min-h-11 items-center text-sm text-fg-subtle hover:text-fg-muted sm:min-h-0">
           &larr; All resumes
         </Link>
         <p
@@ -236,16 +236,19 @@ export default async function ResumeDetailPage({
   const jobDescriptionsLoadFailed = jobDescriptionsResult.kind === "error";
 
   return (
-    <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
-      <div className="flex items-start justify-between gap-4">
+    <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
         <div className="min-w-0">
           <Link
             href="/resumes"
-            className="text-sm text-fg-subtle hover:text-fg-muted"
+            className="inline-flex min-h-11 items-center text-sm text-fg-subtle hover:text-fg-muted sm:min-h-0"
           >
             &larr; All resumes
           </Link>
-          <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight text-fg">
+          <h1
+            title={resume.file_name}
+            className="mt-1 break-words text-2xl font-semibold tracking-tight text-fg sm:truncate"
+          >
             {resume.file_name}
           </h1>
         </div>
@@ -273,11 +276,11 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-4 sm:p-6">
         <h2 className="text-base font-semibold text-fg">
           File details
         </h2>
-        <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+        <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 text-sm min-[22rem]:grid-cols-2">
           <div>
             <dt className="text-fg-subtle">Status</dt>
             <dd className="font-medium text-fg">
@@ -286,7 +289,7 @@ export default async function ResumeDetailPage({
           </div>
           <div>
             <dt className="text-fg-subtle">Type</dt>
-            <dd className="font-medium text-fg">{resume.file_type}</dd>
+            <dd className="break-all font-medium text-fg">{resume.file_type}</dd>
           </div>
           <div>
             <dt className="text-fg-subtle">Size</dt>
@@ -296,19 +299,19 @@ export default async function ResumeDetailPage({
           </div>
           <div>
             <dt className="text-fg-subtle">Uploaded</dt>
-            <dd className="font-medium text-fg">
+            <dd className="break-words font-medium text-fg">
               {new Date(resume.created_at).toLocaleString()}
             </dd>
           </div>
         </dl>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-4 sm:p-6">
         <h2 className="text-base font-semibold text-fg">Resume content</h2>
         <div className="mt-4">
           {resume.extracted_text ? (
-            <div className="max-h-[32rem] overflow-y-auto rounded-md border border-border bg-bg p-4">
-              <p className="whitespace-pre-wrap text-sm leading-relaxed text-fg-muted">
+            <div className="max-h-[32rem] overflow-y-auto rounded-md border border-border bg-bg p-3 sm:p-4">
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-fg-muted">
                 {resume.extracted_text}
               </p>
             </div>
@@ -320,8 +323,8 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
-        <div className="flex items-center justify-between gap-4">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-4 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
           <h2 className="text-base font-semibold text-fg">Analysis</h2>
           <AnalyzeResumeButton resumeId={resume.id} hasAnalysis={!!analysis} />
         </div>
@@ -340,7 +343,7 @@ export default async function ResumeDetailPage({
         </div>
       </section>
 
-      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-6">
+      <section className="mt-6 rounded-lg border border-border bg-surface shadow-sm p-4 sm:p-6">
         <h2 className="text-base font-semibold text-fg">Matches</h2>
         <div className="mt-4">
           {!analysis ? (
@@ -415,7 +418,10 @@ function CritiqueCard({
           </p>
           <p className="text-sm text-fg-subtle">
             {CRITIQUE_COPY.emptyQuota}{" "}
-            <Link href="/settings" className="underline underline-offset-2 hover:text-fg-muted">
+            <Link
+              href="/settings"
+              className="inline-flex min-h-11 items-center underline underline-offset-2 hover:text-fg-muted sm:min-h-0"
+            >
               See your usage
             </Link>
           </p>

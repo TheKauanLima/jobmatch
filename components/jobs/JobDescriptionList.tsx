@@ -8,23 +8,21 @@ import { Button } from "@/components/ui/Button";
 import {
   buildJobsApiPath,
   formatResultSummary,
-  type JobLevelFilter,
+  type JobsBoardQuery,
 } from "@/lib/client/jobsBoard";
 
 interface JobDescriptionListProps {
   initialJobDescriptions: JobDescription[];
   initialNextCursor: string | null;
   /**
-   * Level filter currently applied (docs/ARCHITECTURE.md §7), or `null`.
-   * Only used to keep "Load more" fetches on the same filter as the first
+   * Search and filters currently applied (docs/ARCHITECTURE.md §7.8.7).
+   * Only used to keep "Load more" fetches on the same query as the first
    * page and to word the result count/empty state. The filter UI itself is
    * plain navigation (`JobsSearchControls`); the page remounts this
-   * component via a `key` whenever the query changes, so loaded pages never
-   * leak from one search into another.
+   * component via a `key` (`jobsQueryKey`) whenever the query changes, so
+   * loaded pages never leak from one search into another.
    */
-  level: JobLevelFilter | null;
-  /** Search term currently applied (docs/ARCHITECTURE.md §9), or `null`. Same deal as `level`. */
-  q: string | null;
+  query: JobsBoardQuery;
   /** Reference time for relative dates; injectable for tests. */
   now?: number;
 }
@@ -45,8 +43,7 @@ interface JobDescriptionListProps {
 export function JobDescriptionList({
   initialJobDescriptions,
   initialNextCursor,
-  level,
-  q,
+  query,
   now,
 }: JobDescriptionListProps) {
   const [additionalJobDescriptions, setAdditionalJobDescriptions] = useState<
@@ -77,7 +74,7 @@ export function JobDescriptionList({
     setError(null);
     setLoadingMore(true);
     try {
-      const response = await fetch(buildJobsApiPath({ q, level }, nextCursor));
+      const response = await fetch(buildJobsApiPath(query, nextCursor));
 
       if (!response.ok) {
         setError("Couldn't load more jobs. Please try again.");
@@ -98,7 +95,7 @@ export function JobDescriptionList({
   }
 
   if (jobDescriptions.length === 0) {
-    return <JobsEmptyState query={{ q, level }} />;
+    return <JobsEmptyState query={query} />;
   }
 
   return (
@@ -113,8 +110,7 @@ export function JobDescriptionList({
         {formatResultSummary({
           count: jobDescriptions.length,
           hasMore: Boolean(nextCursor),
-          q,
-          level,
+          ...query,
         })}
       </p>
 

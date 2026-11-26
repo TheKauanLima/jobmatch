@@ -97,7 +97,7 @@ export function ResumeOverview({ resumes }: ResumeOverviewProps) {
                       href={resumeCritiqueHref(resume.id)}
                       className={
                         critique
-                          ? "col-start-2 justify-self-start rounded-sm sm:col-start-auto sm:justify-self-end text-sm font-medium text-fg-muted hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                          ? "col-start-2 inline-flex min-h-11 items-center justify-self-start rounded-sm sm:col-start-auto sm:min-h-0 sm:justify-self-end text-sm font-medium text-fg-muted hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                           : `${SECONDARY_LINK_BUTTON} col-start-2 justify-self-start px-3 py-1.5 sm:col-start-auto sm:justify-self-end`
                       }
                     >

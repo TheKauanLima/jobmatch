@@ -61,7 +61,7 @@ export function ThemeToggle() {
         aria-pressed={theme === "light"}
         onClick={() => applyTheme("light")}
         disabled={theme === null}
-        className={`rounded px-2 py-1 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+        className={`inline-flex min-h-11 items-center rounded px-2.5 py-1 transition-colors sm:min-h-0 sm:px-2 disabled:cursor-not-allowed disabled:opacity-60 ${
           theme === "light"
             ? "bg-accent text-accent-fg"
             : "text-fg-muted hover:bg-surface-hover"
@@ -75,7 +75,7 @@ export function ThemeToggle() {
         aria-pressed={theme === "dark"}
         onClick={() => applyTheme("dark")}
         disabled={theme === null}
-        className={`rounded px-2 py-1 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+        className={`inline-flex min-h-11 items-center rounded px-2.5 py-1 transition-colors sm:min-h-0 sm:px-2 disabled:cursor-not-allowed disabled:opacity-60 ${
           theme === "dark"
             ? "bg-accent text-accent-fg"
             : "text-fg-muted hover:bg-surface-hover"

@@ -77,7 +77,7 @@ export function NextStepCard({ steps }: NextStepCardProps) {
                   {followUp.cta && (
                     <Link
                       href={followUp.cta.href}
-                      className="shrink-0 rounded-sm text-sm font-medium text-fg underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                      className="inline-flex min-h-11 shrink-0 items-center self-start rounded-sm text-sm font-medium text-fg underline-offset-4 hover:underline sm:min-h-0 sm:self-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                     >
                       {followUp.cta.label} <span aria-hidden="true">&rarr;</span>
                     </Link>

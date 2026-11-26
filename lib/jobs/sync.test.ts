@@ -26,7 +26,11 @@ vi.mock("@/lib/jobs/sources/lever", async () => {
   return { ...actual, fetchLeverBoard: mockFetchLeverBoard };
 });
 
-vi.mock("@/lib/supabase/queries/jobDescriptions", () => ({
+vi.mock("@/lib/supabase/queries/jobDescriptions", async () => ({
+  // The real constants are needed: lib/validation/schemas.ts imports them (§7.8.6).
+  ...(await vi.importActual<typeof import("@/lib/supabase/queries/jobDescriptions")>(
+    "@/lib/supabase/queries/jobDescriptions",
+  )),
   upsertExternalJobDescriptions: mockUpsert,
   softDeleteMissingExternalJobDescriptions: mockSoftDelete,
 }));

@@ -52,7 +52,7 @@ export default function SignupPage() {
 
   if (confirmationSent) {
     return (
-      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
+      <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-4 py-12 sm:px-6 sm:py-24">
         <h1 className="text-2xl font-semibold tracking-tight text-fg">
           Check your email
         </h1>
@@ -62,7 +62,7 @@ export default function SignupPage() {
         </p>
         <Link
           href="/login"
-          className="mt-6 text-sm font-medium text-fg underline underline-offset-2"
+          className="mt-6 inline-flex min-h-11 items-center self-start text-sm font-medium text-fg underline underline-offset-2 sm:min-h-0"
         >
           Back to log in
         </Link>
@@ -71,7 +71,7 @@ export default function SignupPage() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-6 py-24">
+    <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center px-4 py-12 sm:px-6 sm:py-24">
       <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Sign up
       </h1>

@@ -33,6 +33,7 @@ function job(overrides: Partial<JobDescription> = {}): JobDescription {
     posted_at: "2026-11-04T00:00:00.000Z",
     is_own: false,
     deleted_at: null,
+    job_category: null,
     ...overrides,
   };
 }
@@ -194,6 +195,19 @@ describe("JobDetailView", () => {
     expect(html).toContain("stay private");
     expect(html).toContain("MATCH-SLOT");
     expect(html).not.toContain("Manage your posting");
+    // job_category null: no field tag.
+    expect(html).not.toContain("Field:");
+  });
+
+  it("shows the field tag in the header, except for 'other'", () => {
+    const withField = renderToStaticMarkup(
+      <JobDetailView job={job({ job_category: "data" })} canMatch={false} matchSection={null} now={NOW} />,
+    );
+    expect(withField).toContain("Field: </span>Data &amp; AI");
+    const other = renderToStaticMarkup(
+      <JobDetailView job={job({ job_category: "other" })} canMatch={false} matchSection={null} now={NOW} />,
+    );
+    expect(other).not.toContain("Field:");
   });
 
   it("removed posting: notice, no match section", () => {
