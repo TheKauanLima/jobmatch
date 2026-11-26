@@ -49,11 +49,11 @@ describe("buildCritiqueResumeRequest (prompt critique-v1)", () => {
     expect(req.schema).toBe(CritiqueResumeSchema);
   });
 
-  it("config: effort high, 20k tokens, 190 s, critique-v1, untrusted inputs = resume_text only", () => {
+  it("config: effort high, 20k tokens, 250 s, critique-v1, untrusted inputs = resume_text only", () => {
     expect(CLAUDE_TASKS.critiqueResume).toMatchObject({
       effort: "high",
       maxTokens: 20_000,
-      timeoutMs: 190_000,
+      timeoutMs: 250_000,
       promptVersion: "critique-v1",
       mode: "sync",
     });
@@ -466,7 +466,7 @@ describe("runCritiqueResume", () => {
     expect(streamCall).toHaveBeenCalledTimes(1);
     const [params, options] = streamCall.mock.calls[0];
     expect(params.model).toBe("claude-opus-5-5");
-    expect(options).toMatchObject({ timeout: 190_000 });
+    expect(options).toMatchObject({ timeout: 250_000 });
   });
 
   it("records usage with the user id and the critiqueResume operation", async () => {

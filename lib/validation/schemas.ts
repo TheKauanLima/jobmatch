@@ -9,11 +9,13 @@ import { z } from "zod";
 
 import { JOB_CATEGORY_SLUGS, type JobCategory } from "@/lib/jobs/categories";
 import { isUsStateCode, type UsStateCode } from "@/lib/jobs/usStates";
+// Client components import this file: import only from client-safe,
+// import-free modules (never a `lib/supabase/**` query module), §7.8.8.
 import {
   JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
   JOB_DESCRIPTIONS_DEFAULT_LIMIT,
   JOB_DESCRIPTIONS_MAX_LIMIT,
-} from "@/lib/supabase/queries/jobDescriptions";
+} from "@/lib/jobs/listLimits";
 
 // ---------------------------------------------------------------------
 // Resumes — POST /api/resumes
