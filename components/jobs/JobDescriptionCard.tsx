@@ -7,6 +7,7 @@ import {
   makeSnippet,
 } from "@/lib/client/jobsBoard";
 import {
+  JobFieldBadge,
   JobLevelBadge,
   JobSourceBadge,
   OwnPostingBadge,
@@ -83,6 +84,7 @@ export function JobDescriptionCard({
 
       <div className="mt-auto flex flex-wrap items-center gap-2 pt-4">
         {jobDescription.level && <JobLevelBadge level={jobDescription.level} />}
+        <JobFieldBadge category={jobDescription.job_category} />
         <JobSourceBadge source={jobDescription.source} />
         {jobDescription.is_own && <OwnPostingBadge />}
         {relative && (

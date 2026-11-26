@@ -99,6 +99,14 @@ export function PlusIcon(props: IconProps) {
   );
 }
 
+export function XIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5.5 5.5l9 9M14.5 5.5l-9 9" />
+    </Svg>
+  );
+}
+
 export function SparkIcon(props: IconProps) {
   return (
     <Svg {...props}>

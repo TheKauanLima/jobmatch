@@ -61,7 +61,7 @@ export default async function MatchesPage() {
   const { matches, nextCursor, error } = await getMatchHistory();
 
   return (
-    <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
+    <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
       <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Match history
       </h1>

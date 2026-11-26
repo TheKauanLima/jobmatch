@@ -4,7 +4,11 @@ import { JobDescriptionList } from "@/components/jobs/JobDescriptionList";
 import { JobsErrorState } from "@/components/jobs/JobsBoardStates";
 import { JobsSearchControls } from "@/components/jobs/JobsSearchControls";
 import { PlusIcon } from "@/components/jobs/icons";
-import { jobsQueryKey, type JobsBoardQuery } from "@/lib/client/jobsBoard";
+import {
+  jobsQueryKey,
+  type JobsBoardQuery,
+  type JobsFacets,
+} from "@/lib/client/jobsBoard";
 
 export type JobsFirstPage =
   | { kind: "ok"; jobDescriptions: JobDescription[]; nextCursor: string | null }
@@ -32,8 +36,7 @@ export function JobsResults({
       key={jobsQueryKey(query)}
       initialJobDescriptions={firstPage.jobDescriptions}
       initialNextCursor={firstPage.nextCursor}
-      q={query.q}
-      level={query.level}
+      query={query}
       now={now}
     />
   );
@@ -41,16 +44,19 @@ export function JobsResults({
 
 /**
  * Page chrome for `/jobs`: heading, intro, a collapsed "Share a job posting"
- * panel (`submitForm`, the existing `JobDescriptionForm`), search and level
+ * panel (`submitForm`, the existing `JobDescriptionForm`), search and filter
  * controls, then `children` (the results). Presentational only, so the page
  * can stream results under a Suspense boundary while this renders at once.
+ * `facets` (or `null` if that request failed) feeds the filter options.
  */
 export function JobsBoardLayout({
   query,
+  facets,
   submitForm,
   children,
 }: {
   query: JobsBoardQuery;
+  facets: JobsFacets | null;
   submitForm: ReactNode;
   children: ReactNode;
 }) {
@@ -61,9 +67,9 @@ export function JobsBoardLayout({
           Jobs
         </h1>
         <p className="max-w-2xl text-sm leading-6 text-fg-muted sm:text-base">
-          Internship and entry-level roles from The Muse, plus postings shared
-          by the Kalify community. Open a listing to read the full description
-          and check how your resume fits.
+          Internship and entry-level roles from company career sites, plus
+          postings shared by the Kalify community. Open a listing to read the
+          full description and check how your resume fits.
         </p>
       </header>
 
@@ -82,7 +88,7 @@ export function JobsBoardLayout({
       </details>
 
       <div className="mt-8">
-        <JobsSearchControls query={query} />
+        <JobsSearchControls query={query} facets={facets} />
       </div>
 
       <div className="mt-6">{children}</div>

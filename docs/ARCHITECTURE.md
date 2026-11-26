@@ -303,6 +303,12 @@ matches via cascade).
     unfiltered listing below). Capped at
     `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` (200) characters — longer
     values return `400`.
+  - `?category=`, `?location=`, `?sort=` (added per §7.8). **§7.8.6 is
+    authoritative** for these params, for the zod validation of every param
+    on this route (unknown `level` is now `400`), and for the ordering change
+    below: the keyset order is now `listed_at desc, id desc` (`listed_at =
+    coalesce(posted_at, created_at)`), and the cursor is `<listed_at>_<id>`.
+    Read "created_at" in the cursor bullet below as `listed_at`.
   - `?cursor=<opaque token>` — pagination cursor. **Its meaning depends on
     whether `q` is present on the same request** (see §9.2 for why): without
     `q`, keyset pagination ordered `created_at desc, id desc` exactly as
@@ -324,6 +330,9 @@ matches via cascade).
   (plain, `?level=`-filtered, and `?q=` search) — a soft-deleted posting never
   appears in a browse/search result, only via a direct link to its own `:id`
   (below).
+
+**`GET /api/job-descriptions/facets`** — global filter counts (added per
+§7.8.6; contract there).
 
 **`GET /api/job-descriptions/:id`** — single job description detail.
 - Auth: required.
@@ -348,7 +357,7 @@ Added per §10.
   field is optional and at least one must be present.
 - Response `200`: the updated row (same shape as `GET /:id`).
 - Errors: `400` validation failure or empty body, `401` unauthenticated,
-  `403` not the submitter or the row is a `source='themuse'` listing, `404`
+  `403` not the submitter or the row is an external listing (any `source <> 'user'`), `404`
   not found.
 
 **`DELETE /api/job-descriptions/:id`** — soft-delete (hide) a job description
@@ -915,6 +924,15 @@ flagging only so it isn't silently assumed to be account-level later.
 
 ## 7. External job ingestion (The Muse) — 2026-09-10
 
+> **Source replaced 2026-11-20 — see §7.7.** The Muse's public API now answers every
+> automated request with a Cloudflare bot challenge (HTTP 403), so it is dropped. We do
+> not try to get around the challenge. The live sources are now the **Greenhouse and
+> Lever public job-board APIs**, polled for a curated list of companies. §7.1–§7.6 are
+> kept as history. Where they disagree with §7.7, **§7.7 wins**. These parts are
+> unchanged and still binding: the cron route and its auth (§7.3), the admin-client
+> upsert (§7.3), the `level` filter and its two values (§7.4), and clamping field
+> lengths to `JOB_DESCRIPTION_*_MAX_LENGTH` (§7.3).
+
 ### Why
 v1 as shipped only populates `job_descriptions` from users manually pasting postings
 in. That's a cold-start problem specifically bad for this product's stated goal (a
@@ -1086,6 +1104,880 @@ live Supabase project exists, per that file's existing TODO.
 4. Optionally trigger `GET /api/cron/sync-jobs` once by hand (with the
    `Authorization: Bearer <CRON_SECRET>` header) after deploying, rather than
    waiting for the first scheduled run, so the board isn't empty on day one.
+
+### 7.7 Replacement source: Greenhouse + Lever job boards — 2026-11-20
+
+**Why.** The Muse's API returns a Cloudflare "Just a moment..." challenge (HTTP 403) to
+every automated request, so there have been no imports since the manual run on
+2026-11-04. The user chose the Greenhouse and Lever public job-board APIs: no key, and
+full descriptions. §13.6.1 had already chosen them for v2.
+
+**Scope rule: smallest change that fits current main.** The v2 ingestion work (M1.5:
+adapter registry, `job_sources`/`job_source_boards` tables, pg_cron, dedupe, expiry) is
+parked on branch `wip/m1.5-ingestion` and is **not** pulled in. This section keeps
+main's single-route, single-cron pipeline and swaps only the source. Its files use
+the §13.14 paths (`lib/jobs/sources/*`, `lib/jobs/html.ts`, `lib/jobs/studentFilter.ts`),
+so M1.5 can later refactor them in place instead of moving them (§13.6.2).
+
+#### 7.7.1 Endpoints (no auth)
+| Provider | Request | Fields used |
+|---|---|---|
+| Greenhouse | `GET https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true` | `jobs[].id`, `title`, `location.name`, `absolute_url`, `content` (**HTML that is entity-escaped**: `&lt;p&gt;…`), `first_published` (if present), `updated_at` (not used for dates, see 7.7.4) |
+| Lever | `GET https://api.lever.co/v0/postings/{token}?mode=json` | top-level array: `id`, `text`, `categories.location`, `categories.allLocations`, `country` (ISO alpha-2), `descriptionPlain`, `lists[].text`, `lists[].content` (HTML `<li>`s), `additionalPlain`, `hostedUrl`, `createdAt` (epoch ms) |
+
+Each call returns **all** of the company's open jobs: a snapshot. Neither provider
+documents a GET rate limit. Greenhouse only says requests "may be rate limited". No
+pagination is used. Lever supports `skip`/`limit`, but one company's full list is
+small. Lever companies hosted in the EU use `api.eu.lever.co`, but the starter list is
+US-only, so v1 does not support EU sites.
+
+**Not verified against the vendors' own docs (backend-dev checks with live responses
+and records fixtures):**
+- whether Greenhouse's *list* response includes `first_published`; its docs show it only
+  in the single-job example;
+- Lever's `createdAt`, which the Lever README doesn't list but which is widely
+  present;
+- the HTTP status either API returns for an unknown token (expected 404).
+
+The mappers below treat every one of these as optional.
+
+#### 7.7.2 Company list: `lib/jobs/sources/companies.ts` (checked in, reviewed)
+```ts
+export type JobBoardProvider = "greenhouse" | "lever";
+export type JobBoardCompany = { provider: JobBoardProvider; token: string; displayName: string };
+export const JOB_BOARD_COMPANIES: readonly JobBoardCompany[] = [ /* ... */ ];
+```
+- Rules, enforced by a unit test:
+  - `token` matches `^[a-z0-9][a-z0-9-]*$`;
+  - `(provider, token)` is unique;
+  - `displayName` is non-empty;
+  - the list has at most `MAX_COMPANIES_PER_RUN = 40` entries (see 7.7.5).
+- It's a code constant, not a DB table, on purpose: changing the list goes through
+  review, and M1.5 later seeds `job_source_boards` from this file.
+- **Company name comes from `displayName`**, never from the API payload. Lever doesn't
+  provide one, and Greenhouse's `company_name` isn't reliably in the list response.
+- Backend-dev must run a one-off check that every token returns 200 with at least one
+  job before committing. Tokens that fail are left out of the commit, not added
+  commented-out. At runtime, a token that returns 404 or errors is **skipped and
+  reported** in the run result (7.7.6). It never aborts the run.
+
+#### 7.7.3 Student filter and `level`: `lib/jobs/studentFilter.ts`
+These start from the §13.6.3 title patterns and are used here without
+`include_unlabeled_titles` (there's no board table in v1). **This section is the source of
+truth for the patterns**; §13.6.3 points here. All matching is case-insensitive. Every
+alternative is wrapped in "no letter or digit on either side" lookarounds rather than
+`\b`, because `\b` fails on terms that end in punctuation (`sr.`, `jr.`):
+- `SENIOR_TITLE_PATTERN`: `senior|sr\.?|staff|principal|lead|manager|director|head\s+of|vp|
+  vice\s+president|chief|architect|distinguished|counsel`. `counsel` was added
+  (2026-11-20, user decision) because "Associate General Counsel" / "Associate Commercial
+  Counsel" are practising-lawyer titles that the student term `associate` would otherwise
+  keep. The word lookarounds mean "counselor" is not matched.
+- `INTERN_TITLE_PATTERN`: `intern|interns|internship|internships|co-op|coop|student`.
+- `STUDENT_TITLE_PATTERN`: `intern|internship|co-op|coop|new[-\s]?grads?|
+  new[-\s]?graduates?|graduate\s+program|entry[-\s]+level|junior|jr\.?|associate|
+  apprentice|apprenticeships?|fellowship|early[-\s]+careers?|university|campus|student|
+  trainee|analyst\s+i|engineer\s+i|level\s+1`. This is wider than §13.6.3's
+  exact-spacing originals, to catch "New-Grad", "Newgrad", "New Grads",
+  "Early-Career", "Early Careers", "Apprenticeship", and "Entry  Level".
+
+```ts
+export function classifyStudentLevel(title: string): "Internship" | "Entry Level" | null
+```
+- SENIOR matches → `null` (drop), even if a student term also matches (e.g. "Senior
+  Associate", "Internship Program Manager").
+- Otherwise INTERN matches → `"Internship"`.
+- Otherwise STUDENT matches → `"Entry Level"`.
+- Otherwise → `null` (drop).
+
+The two values are exactly `JOB_LEVEL_FILTERS` (`lib/client/jobsBoard.ts`), so the
+existing board filter works unchanged. Required test cases:
+- "Internal Tools Engineer" and "International Sales" → null (`\bintern\b` must not
+  match them);
+- "Software Engineer I" → Entry Level;
+- "Software Engineer II" → null (`engineer i` must be followed by a word boundary that
+  excludes `II`);
+- "Jr. Data Analyst" → Entry Level.
+
+**US-location policy**, `isUsLocation(text: string | null, countryCode?: string | null): boolean`
+in the same file:
+- If a Lever `country` is present, the answer is `country === "US"`.
+- Otherwise keep the listing when the location text contains a US signal
+  (`hasUsSignal`):
+  - `United States`, `USA`, `U.S.`/`U.S.A.` (case-insensitive), or a bare `US`
+    (case-sensitive, so prose like "join us" can't match);
+  - a US state or DC two-letter code right after a comma (`, CA`; case-sensitive; the
+    code list is hard-coded);
+  - a full US state name.
+- **Disambiguating state codes and names that are also countries.** Many state codes
+  are also ISO 3166-1 alpha-2 country codes (CA Canada, IN India, DE Germany, IL
+  Israel, CO Colombia, GA Gabon, and others; the hard-coded set is
+  `AMBIGUOUS_STATE_CODES`). Georgia is also a country. A code or name only counts as a
+  US signal when its context doesn't make it a country:
+  - *"City, Region, CC" form:* a code right after another two- or three-letter code
+    that is **not** a US state code sits in the country slot ("Toronto, ON, CA",
+    "Bangalore, KA, IN"), so it is a country, not a state.
+  - *After a non-US place:* an ambiguous code, or the name "Georgia", directly after a
+    location part that has a non-US signal (see `hasNonUsSignal` below) means the
+    country ("Toronto, CA", "Mumbai, IN", "Tbilisi, Georgia").
+  - *US namesake exemption:* non-US city names that are also common US town names
+    paired with an ambiguous code ("Dublin, CA", "London, KY", "Paris, TN") are
+    ignored when deciding whether the preceding part is non-US, so those stay US. A
+    city is left off this exemption when its US namesakes never pair with an
+    ambiguous code (e.g. "Berlin, DE" is Germany).
+  - Without a non-US signal next to it, the code stays a US state: "San Francisco,
+    CA", "San Francisco, CA, US", "Remote, CA".
+- **Non-US signals (`hasNonUsSignal`)** are a non-exhaustive list of countries and
+  regions, Canadian provinces, and major non-US hiring cities seen on the polled boards.
+  They also include `UK`/`U.K.` (case-sensitive) and a Canadian province or territory
+  code after a comma (", ON", ", BC"). US look-alikes ("New Mexico", "New England",
+  "New London") are removed from the text before matching. City names that are mostly
+  US places are left out of the list. The exact lists live in
+  `lib/jobs/studentFilter.ts` and are tuned against live data; the code is the
+  reference for individual names.
+- Also keep when the text is empty, or is only `Remote` or `Anywhere` (with optional
+  punctuation). The listing may not be US-only, but students can check, and dropping it
+  would lose real remote roles.
+- Drop everything else. That includes non-US places that use two-letter province
+  codes (`Toronto, ON`, `Vancouver, BC`), because those codes aren't in the US list.
+- Multi-location text ("New York, NY; London") counts as US when any part is US.
+- *Amended 2026-11-20 (orchestrator-approved):* for Greenhouse, `offices[]` is
+  consulted only when `location.name` is placeless, i.e. it passes neither
+  `isUsLocation` nor `hasNonUsSignal` ("Hybrid", "In-Office", "San Francisco Bay
+  Area", a bare city such as "Austin"). Then the job counts as US when any
+  `offices[].location`/`name` has a positive US signal (`hasUsSignal`; blank or
+  "Remote"-only office values don't count). An explicit non-US `location.name`
+  ("Vancouver, BC", "Toronto", "Remote Canada") drops the job whatever the offices
+  say, because Greenhouse often attaches every company office to a posting.
+
+#### 7.7.4 Mapping: one module per provider, `lib/jobs/sources/{greenhouse,lever}.ts`
+Each module exports `fetch<Provider>Board(token, signal)` and
+`map<Provider>Job(raw, company)`. The mapper returns `ExternalJobDescriptionUpsert | null`
+(the existing type in `lib/supabase/queries/jobDescriptions.ts`) and returns `null`
+when:
+- there's no `id` (missing, or a blank string);
+- there's no title or no description;
+- the posting URL isn't an absolute http(s) URL, **or is longer than
+  `JOB_DESCRIPTION_SOURCE_URL_MAX_LENGTH`** (a truncated URL would be a broken link,
+  so it's rejected rather than clamped);
+- the student or US filter rejects the listing.
+
+**Shared plumbing: `lib/jobs/sources/common.ts`.** Both providers use:
+- `fetchBoardJson(provider, token, url, signal)`, the single-attempt fetch wrapper that
+  sets the User-Agent (7.7.5);
+- `JobBoardFetchError` (`provider`, `token`, `status`, plus a fixed failure kind of
+  http, network, timeout, or invalid body). Its message carries only the provider,
+  token, and status, never the body, URL, or underlying error text;
+- helpers so both mappers behave identically: `jobBoardUserAgent`,
+  `boardExternalId` (`${token}:${id}`, null for a missing id), `clampText`,
+  `httpUrlOrNull` (http(s) and within the length cap), and `isoDateOrNull`.
+
+| Upsert field | Greenhouse | Lever |
+|---|---|---|
+| `externalId` | `` `${token}:${id}` `` | `` `${token}:${id}` `` |
+| `title` | `title` | `text` |
+| `company` | `company.displayName` | `company.displayName` |
+| `description` | `stripHtml(decodeHtmlEntities(content))` | `descriptionPlain` + each `lists[i]`: `text` heading + `stripHtml(content)` + `additionalPlain`, joined by blank lines |
+| `sourceUrl` | `absolute_url` | `hostedUrl` |
+| `level` | `classifyStudentLevel(title)` | same |
+| `location` | `location.name` | `categories.allLocations.join(", ")`, else `categories.location` |
+| `postedAt` | `first_published ?? null` | `createdAt` → ISO, else null |
+
+- The `${token}:` prefix on `externalId` is the §13.6.2 convention. It also lets the
+  removal step (7.7.6) find one company's rows.
+- Greenhouse's `updated_at` is **not** used as `postedAt`: it changes on every edit and
+  would make old listings look freshly posted. When `postedAt` is null, the UI already
+  falls back to `created_at`, the date we first ingested the listing.
+- Text fields (title, company, description, location) are clamped to
+  `JOB_DESCRIPTION_*_MAX_LENGTH`, as in §7.3. `sourceUrl` is the exception: an
+  over-long URL drops the listing (see above).
+- Greenhouse `offices[]` is read only for the US check (7.7.3 amendment). The stored
+  `location` is still `location.name`.
+
+**HTML handling (`lib/jobs/html.ts`, new).** `stripHtml` moves here unchanged from
+`lib/jobs/themuse.ts`, together with its tests. A new `decodeHtmlEntities(s)` decodes
+named entities (`&lt; &gt; &amp; &quot; &#39; &apos; &nbsp;`) and numeric ones
+(`&#NNN;`, `&#xHH;`). Decoding runs *before* `stripHtml` for Greenhouse because its
+markup arrives escaped. Neither function's output is ever rendered as HTML (React text
+nodes only, §2), so a regex stripper remains acceptable.
+
+#### 7.7.5 Runtime budget (one Vercel Hobby cron invocation per day)
+- The route sets `export const maxDuration = 60`.
+- `lib/jobs/sync.ts` runs companies through a fixed-size pool of
+  `SYNC_CONCURRENCY = 4` workers.
+- Each fetch gets `AbortSignal.timeout(REQUEST_TIMEOUT_MS = 15_000)`.
+- Once `RUN_BUDGET_MS = 40_000` has passed since the run started, no new company fetch
+  is started. Companies not yet started are reported as `skipped_time_budget`.
+  Companies already in flight finish or hit their timeout.
+- **No retries.** Each company gets at most one request per run, and a failure waits
+  for tomorrow's run. A 429 is reported like any other error. This prevents retry
+  storms and keeps traffic to at most `JOB_BOARD_COMPANIES.length` requests per day,
+  one per board, which matches §13.6.7's "one sync per board per day".
+- Request header `User-Agent: Kalify/1.0 (+<APP_BASE_URL>)`, or just `Kalify/1.0` when
+  `APP_BASE_URL` is unset. No contact email (§13.6.7's `INGEST_CONTACT_EMAIL` stays a
+  v2 item that needs the user's input).
+- Every board fetch uses `cache: "no-store"`, so Next.js's fetch cache never serves a
+  stale snapshot. A stale snapshot would make the removal step (7.7.6) close or reopen
+  the wrong rows.
+- Sizing: 40 companies, 4 at a time, about 1–3 s each, comes to roughly 10–30 s.
+- **Worst case:** a fetch started just before the 40 s budget (say at 39.9 s) can run to
+  its 15 s timeout, ending around 55 s, and then do its DB steps. That is close to
+  `maxDuration = 60`. If the platform kills the function mid-company, the outcome is
+  still safe: the soft-delete step only ever runs *after* that company's upsert has
+  succeeded (7.7.6), so a kill can leave rows un-upserted or un-closed for a day, but
+  can never close rows wrongly. §7.8.4's facet backfill runs only while the run is
+  under 50 s and stops starting work after that.
+
+#### 7.7.6 Sync, upsert, and removal from boards
+`syncExternalJobs(supabase, opts?: { companies?: readonly JobBoardCompany[]; now?: () => number })`
+replaces `syncThemuseJobs`. For each company, independently:
+1. Fetch the board. A 404 gives `status: 'not_found'`; any other non-2xx, a network
+   error, a timeout, or a body that isn't the expected shape gives `status: 'error'`.
+   In both cases skip the remaining steps for this company.
+2. Map and filter. Deduplicate by `externalId` (one upsert statement can't touch the
+   same conflict key twice).
+3. Upsert with `upsertExternalJobDescriptions(supabase, provider, rows)`, which now also
+   writes `deleted_at: null` so a listing that reappears is shown again.
+4. **Removal (snapshot close).** This runs only after step 1 succeeded *and* step 3
+   didn't throw. Rows of this `(source, token)` whose ids are **not in the board's
+   unfiltered job-id set** are soft-deleted (`deleted_at = now()`) at once, with no
+   "missing N runs" counter:
+   - The step only runs on a complete 200 snapshot, never on 404, error, timeout, or
+     skip. That makes a single miss safe, and it avoids a new counter column.
+   - The comparison uses the *unfiltered* id set. A job that is still on the board but
+     no longer passes the filter stays as it is, so a filter bug can't mass-delete
+     rows.
+   - A board that returns 200 with zero jobs closes all of that company's rows. That's
+     correct, since the company has no open jobs.
+
+   Soft delete keeps every `matches` row resolving (§10.1). Hard delete is never used,
+   because `matches.job_description_id` is `on delete cascade`.
+
+New query in `lib/supabase/queries/jobDescriptions.ts` (admin client only):
+```ts
+export async function softDeleteMissingExternalJobDescriptions(
+  supabase: Client,
+  source: "greenhouse" | "lever",
+  token: string,
+  presentExternalIds: ReadonlySet<string>,
+): Promise<{ count: number }>
+```
+- First select the active rows: `id, external_id` where `source = $source`,
+  `external_id like '${token}:%'`, and `deleted_at is null`. The token is safe inside
+  `LIKE` because of the regex in 7.7.2.
+- Diff against `presentExternalIds` in JS, then update `deleted_at` with
+  `.in("id", chunk)` in chunks of 100. This avoids putting hundreds of ids into a
+  PostgREST filter URL.
+
+Result shape, returned as the route's JSON body:
+```ts
+export type SyncCompanyResult = {
+  provider: "greenhouse" | "lever"; token: string;
+  status: "ok" | "not_found" | "error" | "skipped_time_budget";
+  fetched: number; kept: number; upserted: number; softDeleted: number;
+  error: string | null;   // short, no response body, no stack (see below)
+};
+export type SyncExternalJobsResult = {
+  companies: SyncCompanyResult[]; totalUpserted: number; totalSoftDeleted: number; durationMs: number;
+};
+```
+**What goes into `error`:**
+- **Fetch failures:** the `JobBoardFetchError` message (provider, token, status or
+  failure kind).
+- **DB-step failures** (upsert or soft-delete): a **fixed string**, either
+  `` `${provider} board "${token}": saving listings failed` `` or
+  `` `…: closing removed listings failed` ``. The Postgres/PostgREST error message is
+  logged server-side only (`console.error`, name and message), never put in the
+  response.
+- **Unexpected throws:** anything thrown while processing one company (for example a
+  mapper bug) is caught in the worker pool, logged the same way, and turned into that
+  company's `status: 'error'` with the fixed `error` string
+  `` `${provider} board "${token}" failed` ``, so it never aborts the other companies.
+  A fetch-step throw that isn't a `JobBoardFetchError` gets the same string.
+
+**Route** (`app/api/cron/sync-jobs/route.ts`): the auth, fail-closed check, and admin
+client stay exactly as in §7.3. It returns `200` when every company is `ok` and `207`
+otherwise. A permanently dead token therefore shows up as a daily 207 until someone
+removes it from the list. The route returns `502` only if `syncExternalJobs` itself
+throws. No new env vars: both APIs need no key.
+
+#### 7.7.7 Schema: migration `0011_job_sources_greenhouse_lever.sql`
+```sql
+alter table public.job_descriptions drop constraint job_descriptions_source_check;
+alter table public.job_descriptions add constraint job_descriptions_source_check
+  check (source in ('user', 'themuse', 'greenhouse', 'lever'));
+comment on column public.job_descriptions.source is '…user | themuse (legacy, no longer synced) | greenhouse | lever…';
+```
+- Confirm the constraint name on the live DB first:
+  `select conname from pg_constraint where conrelid = 'public.job_descriptions'::regclass and contype = 'c'`.
+- The drop is deliberately written **without** `if exists`, so a wrong name fails
+  loudly instead of leaving the old constraint in place.
+- `'themuse'` stays valid: the existing rows remain, and old matches still resolve to
+  them.
+- No RLS change. `job_descriptions_update_own` already requires `source = 'user'`, and
+  the PATCH/DELETE route checks `source !== "user"`, so the new rows are read-only for
+  users automatically.
+- `JobDescriptionSource` in `types/database.ts` becomes
+  `"user" | "themuse" | "greenhouse" | "lever"`. That alias is hand-written, because
+  generated types don't capture check constraints.
+- Numbering is explained in §13.3.0.
+
+#### 7.7.8 The Muse: code and existing rows
+- **Code:** delete `lib/jobs/themuse.ts` and `lib/jobs/themuse.test.ts` (move
+  `stripHtml` and its tests to `lib/jobs/html.ts` first). Nothing else imports them.
+  Comments that point at themuse.ts are updated.
+- **Rows (200 with `source='themuse'`, stale since 2026-11-04):** leave them untouched
+  in this change. After the first production run that succeeds (200, at least 100
+  rows upserted), the orchestrator soft-deletes them **with the user's OK**:
+  `update public.job_descriptions set deleted_at = now() where source = 'themuse' and deleted_at is null`.
+  This can be undone, and matches keep resolving. Never hard-delete them (cascade).
+- `getJobSourceInfo("themuse")` stays, because old matches still link to these rows.
+
+#### 7.7.9 Attribution and UI
+Neither provider publishes display or attribution terms for these endpoints (none
+found 2026-11-20; see 7.7.10). The listing *is* the employer's own posting, so the
+honest framing is "posted by the company, apply on their site", not a third-party
+brand. `getJobSourceInfo` gains:
+
+| source | `label` (badge) | `description` | `attribution` | `applyLabel` |
+|---|---|---|---|---|
+| `greenhouse` | `Employer posting` | `From the company's careers site (via Greenhouse)` | `null` | `Apply on company site` |
+| `lever` | `Employer posting` | `From the company's careers site (via Lever)` | `null` | `Apply on company site` |
+
+`source_url` is always the posting URL (`absolute_url` or `hostedUrl`). The existing
+"Opens {host} in a new tab" line shows where it actually goes, which may be a
+`job-boards.greenhouse.io` or `jobs.lever.co` page. The board header copy changes from
+"from The Muse" to "from company career sites". No layout changes.
+
+#### 7.7.10 Terms and conduct (checked 2026-11-20; re-check if either vendor publishes terms)
+- Greenhouse's Job Board API docs and Lever's `postings-api` README contain no usage,
+  storage, redisplay, or commercial-use terms for public GETs. They describe feeds
+  meant for showing a company's jobs, and they don't forbid third-party display.
+- Lever's job sites reportedly declare an **AI-training opt-out**. Kalify does not
+  train on listings: Claude is called per user request to assess a match and does not
+  train on the data. So this doesn't conflict, but the point is recorded.
+- Nothing found requires deleting stored data on request, so nothing conflicts with
+  the `matches` cascade. If a vendor or company later asks us to stop, the response is
+  to remove their entry from `companies.ts` and **soft**-delete their rows, not
+  hard-delete them.
+- Conduct: §13.6.7 applies. One request per board per day, no fetching of individual
+  posting pages, link to the company's own posting.
+
+#### 7.7.11 Out of scope (left for M1.5/M1.6)
+- Cross-source dedupe with the stale Muse rows.
+- Expiry TTLs.
+- `job_source_runs` history.
+- Disabling a board automatically after repeated failures (v1 relies on the daily 207
+  plus a human removing the token).
+- EU Lever sites.
+- Ashby.
+- Salary and `workplaceType` columns.
+
+### 7.8 Jobs board filters: sort, location, field — 2026-11-20
+
+**Why.** The user asked for filters on `/jobs`: "most recent, location, job type (cs, hr,
+construction, etc.)". The board today has search (`q`) and a level filter only. It is
+ordered by `created_at`, which is the ingestion time. That's misleading: about 260
+Greenhouse/Lever rows were imported in one run, so they share almost the same
+`created_at` and come out in effectively random order.
+
+**Scope rule.** This is the smallest design that works on current main, like §7.7.
+It adds three derived columns, one generated column, one migration, and one new read
+endpoint. There is no Claude call and no new background infrastructure. "Job type" is
+called **field** in code and in the UI (`job_category`, label "Field"). The reason:
+§13.3.3 already reserves `employment_type` (full-time, part-time, internship), and two
+different things called "type" would be confusing.
+
+#### 7.8.1 Decisions
+| # | Decision | Reason |
+|---|---|---|
+| 1 | **"Most recent" means `coalesce(posted_at, created_at)`.** This is stored as the generated column `listed_at`, and the keyset cursor uses `(listed_at, id)`. It becomes the default order when there's no `q`. With `q`, the user can choose "Best match" (default, relevance) or "Most recent". | It's the date the UI already shows (`jobPostedAt`). A stored generated column keeps keyset pagination on real columns, which supabase-js `.or()` can express (§9.2). The `coalesce` handles the null `posted_at` rows. |
+| 2 | **Location means one choice: "Remote", or one US state (including DC).** It is backed by `location_states text[]` and `is_remote boolean`, derived in TS at write time. There is no city or metro filter. | Location text is free-form and often lists several places. States are the coarsest unit that's still useful, and they parse reliably. Metro names like "Bay Area" or "NYC" are mapped *into* states by the parser. A single choice means one URL param and one select. |
+| 3 | **Field means one category per job, from a fixed list of 15 (7.8.3).** It's assigned by **deterministic rules** (title, plus the source's department or team) at write time. "Other" is the fallback. | Rules are free, instant, deterministic, and unit-testable. Claude would cost little (about 260 listings × Haiku, well under $0.05 per full pass), but it would need the parked task infrastructure (M1.2/M1.5) or add latency on POST. It would also give nondeterministic labels and a new prompt-injection surface, all for a coarse label. One category per job (not several) keeps filters, counts, and the M2.1 mapping simple. |
+| 4 | **The field list *is* the M2.1 role-family group vocabulary.** §13.3.4 is amended so that `role_families.group_slug` takes exactly these 15 slugs. | That gives one taxonomy, not two. Every role family belongs to exactly one field. Once M2.2 extracts `role_family_id`, `job_category` is set from that family's `group_slug`, and the rules stay as the fallback for rows not yet extracted (7.8.3). |
+| 5 | **Facets: global counts only, used to avoid dead ends. No numbers are shown in v1.** | A count that ignores the other active filters would be misleading. A count per filter combination costs more than this pass is worth. The counts are used only to hide states with no listings and to mark fields with no listings (7.8.6). |
+| 6 | **Backfill runs as a step inside the existing daily cron route.** There's no script. | Agents have no DB connection, and the repo has no TS script runner (`tsx`). The cron already has the service-role client. Each daily sync recomputes the external rows anyway. |
+| 7 | **Query params for `GET /api/job-descriptions` are now validated with a zod schema** in `lib/validation/schemas.ts`. | There are now six params with enum rules and cross-field rules (`sort=relevance` requires `q`). This **supersedes** §3/§9.1's rule that query params are validated inline, for this route only. |
+
+#### 7.8.2 Location facets: `lib/jobs/location.ts` (pure, unit-tested)
+```ts
+export function parseLocationFacets(
+  location: string | null,
+  hints?: { remote?: boolean },
+): { states: UsStateCode[]; isRemote: boolean }
+```
+`US_STATES` (code → name, the 50 states plus `DC`) and `type UsStateCode` live in
+**`lib/jobs/usStates.ts`**. That file is a constant with no imports, so the client can
+import it for dropdown labels. `location.ts` imports `isStateCodeUsedAsCountry` and
+`isStateNameUsedAsCountry` from `lib/jobs/studentFilter.ts`, so both modules use the same
+country disambiguation (§7.7.3). `studentFilter.ts` still has its own state code and name
+lists; switching those to `usStates.ts` is a later cleanup.
+
+Rules (the output is deduped and sorted by code):
+1. **DC first:** `Washington,? D\.?C\.?`, `District of Columbia`, or a standalone `D.C.`
+   adds `DC`. The matched text is **removed** before step 3, so "Washington, D.C." does
+   not also add `WA`.
+2. **Two-letter codes, case-sensitive and uppercase only.** A code counts when it comes
+   right after `, `, ` - `, `(`, or the start of a `;`-separated segment, and is followed
+   by `,`, `;`, `)`, `/`, ` - `, a ZIP code, ` US`/` USA`, ` or`, ` and`, or the end of
+   the text.
+   - Before this rule runs, bullets (`•`), pipes (`|`), and newlines are turned into
+     `;` separators.
+   - A code that is really a country in context ("Toronto, CA") is skipped, using
+     `isStateCodeUsedAsCountry`.
+   - Examples that work: "San Francisco, CA", "Remote - ME", "New York, NY; Pittsburgh, PA".
+   - `US` is not a state.
+   - Case sensitivity avoids "in"/"or"/"me" false positives.
+   - "Remote - CA" is read as California, because the §7.7.3 US filter has already run.
+3. **Full state names**, case-insensitive on word boundaries ("New York" → NY,
+   "Texas" → TX). A name that is really a country in context ("Tbilisi, Georgia") is
+   skipped, using `isStateNameUsedAsCountry`.
+4. **City and metro aliases.** This is a small hard-coded table of unambiguous names,
+   about 34: San Francisco, Bay Area, Silicon Valley, Palo Alto, Mountain View, Menlo
+   Park, Sunnyvale, San Jose, San Mateo, Foster City, Los Angeles, San Diego, Irvine →
+   CA; NYC, New York City, Brooklyn, Manhattan → NY; Seattle, Bellevue, Redmond → WA;
+   Austin, Dallas, Houston → TX; Chicago → IL; Boston → MA; Denver, Boulder → CO;
+   Atlanta → GA; Pittsburgh, Philadelphia → PA; Miami → FL; Phoenix → AZ; Nashville →
+   TN; Salt Lake City → UT. `lib/jobs/location.ts` is the reference for the exact list.
+   - **Town exception (applies to rules 3 and 4):** if a state name or city alias is
+     followed, in the same location part, by a *different* bare state code (optionally
+     with a ZIP), it names a town, not that state, and is skipped. Examples:
+     "Delaware, OH", "Michigan City, IN", "Brooklyn Park, MN", "Austin, MN", "Kansas
+     City, MO". A following state *name* doesn't trigger this, because that's usually
+     the next location in a list.
+   - Ambiguous names stay out: Portland, Cambridge, Columbus, Washington (on its own,
+     "Washington" means the state, via rule 3).
+   - This rule matters because Greenhouse often stores just "San Francisco Bay Area" or
+     "Austin".
+5. **`isRemote`** is true when the text matches `\bremote\b`, `\banywhere\b`,
+   `work from home`, or `\bWFH\b` (case-insensitive), or when `hints.remote` is true.
+   "Hybrid" is **not** remote: a hybrid job counts as on-site in its state.
+6. **Remote with a state restriction keeps the states.** For example,
+   "Remote - ME; Remote - NH" gives `{ states: [ME, NH], isRemote: true }`, so the job
+   shows up under Maine.
+7. Anything else adds nothing. "North America" gives `{ [], false }`, and so do null or
+   empty text.
+
+Lever stores `allLocations` joined with ", " (§7.7.4). The rules above work on
+comma-joined text, so the stored format doesn't change.
+
+Required test cases include every example in this section, plus:
+- "Hybrid - San Francisco, CA" gives `[CA]` and not remote;
+- "San Francisco, CA, US; Remote, US" gives `[CA]` and remote;
+- "Remote - USA" gives `[]` and remote;
+- "Washington, D.C." gives `[DC]`;
+- "Seattle, WA or Remote" gives `[WA]` and remote;
+- "Toronto, ON" gives `[]`.
+
+#### 7.8.3 Field classification: `lib/jobs/categories.ts` + `lib/jobs/classifyCategory.ts`
+**`lib/jobs/categories.ts`** is pure constants with no imports, safe for the client
+bundle:
+```ts
+export const JOB_CATEGORIES = [
+  { slug: "software",        label: "Software Engineering" },
+  { slug: "data",            label: "Data & AI" },
+  { slug: "it-security",     label: "IT & Security" },
+  { slug: "hardware",        label: "Hardware & Physical Engineering" },
+  { slug: "product",         label: "Product Management" },
+  { slug: "design",          label: "Design" },
+  { slug: "science",         label: "Science & Research" },
+  { slug: "finance",         label: "Finance & Accounting" },
+  { slug: "business-ops",    label: "Business & Operations" },
+  { slug: "sales-marketing", label: "Sales & Marketing" },
+  { slug: "people-hr",       label: "People & HR" },
+  { slug: "legal",           label: "Legal & Policy" },
+  { slug: "healthcare",      label: "Healthcare" },
+  { slug: "trades",          label: "Skilled Trades & Construction" },
+  { slug: "other",           label: "Other" },
+] as const;
+export type JobCategory = (typeof JOB_CATEGORIES)[number]["slug"];
+export const JOB_CATEGORY_SLUGS: readonly JobCategory[];
+export function jobCategoryLabel(slug: string | null): string | null;
+```
+The list order is the display order. Changing the list requires a migration (the check
+constraint in 7.8.5) and a change to §13.3.4.
+
+**`classifyJobCategory({ title, department }: { title: string; department?: string | null }): JobCategory`**
+1. Normalize `title` and `department`: lowercase, collapse whitespace, and treat
+   `/ , - ( ) |` as spaces. Keep `&` and `+`. The one exception is the `IT` token,
+   which is matched case-sensitively on the original text (`\bIT\b`).
+2. Rules are an ordered array of `{ category, match: RegExp, unless?: RegExp, generic?: boolean }`.
+   Precedence is a 3-tier evaluation, and the first hit wins:
+   - **Tier A:** non-generic rules, tested against the **title**.
+   - **Tier B:** non-generic rules, tested against the **department**.
+   - **Tier C:** generic rules, tested against the **title**.
+   - Otherwise the result is **`other`**.
+
+   Why this order: a specific title ("Recruiting Coordinator") beats the department, and
+   the department beats a vague title ("Summer Intern", "Analyst", "Associate").
+3. Rule order inside tiers A and B, with the main patterns. Backend-dev refines the
+   exact regexes using the golden test below.
+
+   | order | category | match (word-bounded) | unless |
+   |---|---|---|---|
+   | 1 | people-hr | recruit\*, talent acquisition, human resources, `hr`, people operations/ops/partner, compensation, benefits | |
+   | 2 | legal | legal, counsel, paralegal, attorney, lawyer, compliance, policy, regulatory, government affairs | |
+   | 3 | it-security | security, cyber, infosec, `IT`, help desk, desktop support, sysadmin, systems administrator, network engineer/administrator/technician, data center | |
+   | 4 | design | design\*, ux, ui, user experience, user research, visual, graphic, illustrat\*, creative, motion, animation | engineer |
+   | 5 | data | machine learning, `ml`, `ai`, artificial intelligence, data scien\*, data analy\*, data engineer\*, analytics, business intelligence, `bi`, deep learning, computer vision, `nlp`, statistic\*, quantitative research\* | |
+   | 6 | product | product manag\*, product owner, `apm`, product analyst | marketing |
+   | 7 | sales-marketing | marketing, sales, account executive/manager, business development, `bdr`, `sdr`, go-to-market, communications, social media, content, brand, public relations, customer success, partnerships | engineer |
+   | 8 | finance | financ\*, accounting, accountant, audit, tax, treasury, payroll, investment, banking, trader/trading, actuar\*, fp&a, controller, credit, underwrit\*, equity research | |
+   | 9 | healthcare | nurs\*, clinical, medical, physician, pharmac\*, therap\*, healthcare, patient, dental, `rn`, `emt` | software, engineer, data |
+   | 10 | trades | construction, electrician, plumb\*, carpent\*, hvac, weld\*, mason, superintendent, foreman, journeyman, apprentice, mechanic, machinist, maintenance, installer, field service, technician, estimator | software, engineer, developer, data |
+   | 11 | hardware | mechanical, electrical, hardware, firmware, embedded, asic, fpga, silicon, circuit, `rf`, aerospace, avionics, propulsion, robotics, manufacturing, industrial, civil, structural, chemical, materials, mechatronics, test/validation/reliability engineer, controls, optical, photonics, battery, vehicle | software (except when firmware/embedded matched) |
+   | 12 | science | research\*, scientist, laborator\*, `lab`, biolog\*, chemist\*, physic\*, biotech, geolog\*, environmental | engineer, software, developer |
+   | 13 | software | software, developer, `swe`, frontend/backend/full stack, web, mobile, ios, android, devops, site reliability, `sre`, platform, infrastructure, cloud, programmer | |
+   | 14 | business-ops | operations, `ops`, strategy, consult\*, business analyst, program manag\*, project manag\*, supply chain, logistics, procurement, sourcing, customer support/service/experience, trust & safety, chief of staff, executive assistant, administrative | |
+
+   **Exceptions and terms added in the built rules (2026-11-26).** The table above
+   shows intent. **The exact regexes live in `lib/jobs/classifyCategory.ts`, and the
+   golden test `lib/jobs/classifyCategory.test.ts` is the source of truth for
+   expected behavior.** Changing a rule means changing the fixture first. Notable
+   additions:
+   - **people-hr and legal** yield to engineering titles: `unless` engineer, developer
+     (people-hr only), or software. "Forward Deployed Engineer (HR Technology)" and
+     "Privacy & Civil Liberties Engineer" are engineering roles.
+   - **it-security** also matches "(technical) support engineer", so a support engineer
+     is IT & Security. It yields to software, developer, dev, marketing, and sales.
+   - **sales-marketing** also matches retail and store associate titles. Pre-sales
+     titles (sales engineer, solutions engineer, solutions consultant) are sales even
+     though they contain "engineer".
+   - **hardware** also matches non-software engineering titles, such as commissioning,
+     project, field, manufacturing, process, and quality engineer, unless a software,
+     data, AI, ML, or cloud signal is present.
+   - Design and the other rules carry extra `unless` terms (for example design yields
+     to electrical, mechanical, circuit, PCB, structural, and civil). See the code.
+
+   **Tier C (generic, title only):**
+   - `engineer`/`engineering` → software, because the board is mostly software. Hardware
+     titles are caught earlier by rule 11.
+   - `analyst`, `associate`, `coordinator`, `specialist` → business-ops.
+4. Inputs by source:
+   - **Greenhouse** `department`: the names in `departments[]`, joined with " / ".
+   - **Lever** `department`: `categories.department` and `categories.team`, joined with
+     " / ".
+   - **User-submitted rows**: `department` is null, so only the title is used.
+   - The description is **never** used. It's too noisy: every posting mentions
+     "engineering", "data", and "sales".
+5. **Golden test (reviewer-blocking): `lib/jobs/classifyCategory.test.ts`.**
+   - The fixture holds at least 60 real titles (with department) taken from the current
+     active rows, each with a hand-assigned expected category.
+   - It must include tricky cases: "Internal Tools Engineer", "Product Designer",
+     "Product Marketing Manager", "Data Center Technician", "Software Engineering
+     Apprentice", "Security Engineer", "Research Scientist, Machine Learning",
+     "Mechanical Engineering Intern", "Embedded Software Engineer", "Recruiting
+     Coordinator", "Summer Intern" with department Finance, and "Analyst" with no
+     department.
+   - The test asserts exact matches. It also asserts that `other` is no more than 10% of
+     the fixture, so the rules can't quietly push everything into `other`.
+
+**Path to M2.1/M2.2.**
+- In M2.1, each entry in `role-families.json` declares a `group_slug` from
+  `JOB_CATEGORY_SLUGS`, and a unit test enforces this.
+- In M2.2, once `job_requirements.role_family_id` is set for a listing, the extraction
+  handler also writes `job_descriptions.job_category = role_family.group_slug`.
+  Rule-based values are kept only for listings with no extraction yet.
+- No column is renamed and the filter API doesn't change.
+
+#### 7.8.4 Shared derivation, write paths, and backfill
+**`lib/jobs/facets.ts`:**
+```ts
+export type JobFacets = { jobCategory: JobCategory; locationStates: UsStateCode[]; isRemote: boolean };
+export function deriveJobFacets(input: {
+  title: string; location: string | null; department?: string | null; remoteHint?: boolean;
+}): JobFacets
+```
+This is the only entry point that write paths call:
+- **Sync (`lib/jobs/sources/{greenhouse,lever}.ts`):**
+  - `ExternalJobDescriptionUpsert` gains `jobCategory`, `locationStates`, and `isRemote`.
+  - Greenhouse passes `department` from `departments[].name`.
+  - Lever passes `department` from `categories.department`/`team`, and sets
+    `remoteHint` to `workplaceType === "remote"`.
+  - `upsertExternalJobDescriptions` writes `job_category`, `location_states`, and
+    `is_remote`. Every daily sync recomputes these for every row still on a board.
+- **`POST /api/job-descriptions`:** compute from `title` and `location`, then pass to
+  `createJobDescription` (3 new params).
+- **`PATCH /api/job-descriptions/:id`:** whenever `title` or `location` (including an
+  explicit `null`) is in the patch, recompute **all three** facets with
+  `deriveJobFacets`, using the merged values: the patch value if present, otherwise
+  the existing row's value.
+  - The existing row comes from the read the route already does for its 404/403
+    check, so there's no extra query.
+  - For a row that already has facets, this gives the same result as recomputing only
+    what changed. It also keeps the invariant that all three are written together, so
+    a pre-0012 row that hasn't been backfilled gets all three at once.
+- **Users can't set these fields.** None of the three are accepted in a request body.
+  The RLS update policy technically lets a submitter write them on their own row
+  through direct PostgREST. The check constraints bound the damage to mislabeling their
+  own posting. v2's RPC-only writes (§13.3.3) close this.
+
+**Backfill: `backfillJobFacets(admin, { limit = 200, deadlineMs })`** in
+**`lib/jobs/backfillFacets.ts`**. It is a separate file so that `facets.ts` stays pure
+and has no supabase import. It's called by `app/api/cron/sync-jobs/route.ts` **after**
+`syncExternalJobs`:
+- It selects `id, title, location` where `job_category is null`, ordered by `id`,
+  with `limit`. This includes soft-deleted rows.
+- It derives facets from title and location only, and updates each row by `id` with a
+  pool of 4.
+- It stops starting new updates once `deadlineMs` has passed. The route passes run
+  start + 50 s.
+- The route's JSON gains `facetBackfill: { updated: number; remaining: boolean }`.
+  `remaining` is true when the update count reached `limit`, or when the deadline
+  stopped the run before every selected row was updated.
+- On failure (the select fails, or any row update fails), the error is logged and the
+  route returns `207`, the same as one company erroring. The response then reports
+  `remaining: true` with `updated` set to the rows already updated.
+- **Invariant:** `job_category is null` means "facets not computed yet". Every write
+  path above sets all three facets together.
+- The first sync after deploy recomputes the external rows that are still on boards,
+  this time with department. The backfill picks up the rest: user rows, The Muse rows,
+  and soft-deleted rows.
+- **To re-classify after a rule change:** external rows update on the next daily sync.
+  For other rows, the user runs
+  `update public.job_descriptions set job_category = null where source in ('user','themuse');`
+  in the SQL editor, and the next cron run (or a manual trigger) refills them.
+
+#### 7.8.5 Migration `0012_job_board_filters.sql`
+This takes the next free number. Planned migrations move up by one (§13.3.0). It depends
+only on 0004, 0005, and 0006, so it is independent of the parked 0009, and the
+application-order exception applies.
+```sql
+begin;
+
+alter table public.job_descriptions
+  add column job_category    text null,
+  add column location_states text[] not null default '{}',
+  add column is_remote       boolean not null default false,
+  add column listed_at       timestamptz generated always as (coalesce(posted_at, created_at)) stored;
+
+alter table public.job_descriptions add constraint job_descriptions_job_category_check
+  check (job_category in ('software','data','it-security','hardware','product','design','science',
+    'finance','business-ops','sales-marketing','people-hr','legal','healthcare','trades','other'));
+alter table public.job_descriptions add constraint job_descriptions_location_states_check
+  check (location_states <@ array['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID',
+    'IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM',
+    'NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY']::text[]);
+
+create index job_descriptions_listed_at_idx
+  on public.job_descriptions (listed_at desc, id desc) where deleted_at is null;
+create index job_descriptions_job_category_idx
+  on public.job_descriptions (job_category) where deleted_at is null;
+create index job_descriptions_location_states_idx
+  on public.job_descriptions using gin (location_states);
+
+drop function public.search_job_descriptions(text, text, int, int);
+create function public.search_job_descriptions(
+  search_query    text,
+  level_filter    text    default null,
+  category_filter text    default null,
+  state_filter    text    default null,
+  remote_only     boolean default false,
+  sort_mode       text    default 'relevance',   -- 'relevance' | 'recent'
+  limit_count     int     default 20,
+  offset_count    int     default 0
+)
+returns setof public.job_descriptions
+language sql stable security invoker set search_path = ''
+as $$
+  select *
+  from public.job_descriptions
+  where search_vector @@ websearch_to_tsquery('english', search_query)
+    and deleted_at is null
+    and (level_filter    is null or level = level_filter)
+    and (category_filter is null or job_category = category_filter)
+    and (state_filter    is null or location_states @> array[state_filter])
+    and (not remote_only or is_remote)
+  order by
+    case when sort_mode = 'recent' then listed_at end desc nulls last,
+    ts_rank(search_vector, websearch_to_tsquery('english', search_query)) desc,
+    listed_at desc,
+    id desc
+  limit limit_count
+  offset offset_count;
+$$;
+
+create function public.job_description_facets()
+returns table (facet text, value text, listing_count bigint)
+language sql stable security invoker set search_path = ''
+as $$
+  select 'category', job_category, count(*) from public.job_descriptions
+    where deleted_at is null and job_category is not null group by job_category
+  union all
+  select 'state', s, count(*) from public.job_descriptions, unnest(location_states) as s
+    where deleted_at is null group by s
+  union all
+  select 'remote', 'true', count(*) from public.job_descriptions
+    where deleted_at is null and is_remote;
+$$;
+revoke execute on function public.job_description_facets() from public, anon;
+grant execute on function public.job_description_facets() to authenticated, service_role;
+
+comment on column public.job_descriptions.job_category is '§7.8.3 field slug; null = facets not computed yet (backfilled by the sync cron). Set only by server code via lib/jobs/facets.ts.';
+comment on column public.job_descriptions.location_states is '§7.8.2 USPS codes parsed from location; set with job_category.';
+comment on column public.job_descriptions.is_remote is '§7.8.2 explicit remote signal parsed from location / source workplace type.';
+comment on column public.job_descriptions.listed_at is '§7.8.1 coalesce(posted_at, created_at); "Most recent" order and keyset cursor.';
+
+commit;
+```
+- A check of `job_category in (...)` passes for `null` (it evaluates to unknown), which
+  is intended.
+- Both functions are `security invoker`, so RLS applies exactly as for a plain select
+  (§9.1). `search_job_descriptions` keeps Postgres's default grants, as it has since
+  0005.
+- **Deploy order: migration first, then code.**
+  - Code from before the migration keeps working afterwards: the new columns are
+    nullable or have defaults, and the new RPC parameters all have defaults, so the old
+    4-argument named call still resolves.
+  - New code before the migration would fail, because `listed_at` and the new columns
+    wouldn't exist yet.
+  - The user applies the migration in the Supabase SQL editor. The `begin`/`commit`
+    wrapper keeps the drop and re-create of the search function atomic.
+- `types/database.ts`: add the 4 columns to `job_descriptions`' Row/Insert/Update
+  (`listed_at` goes in Row only, since it's generated). Update `search_job_descriptions`
+  Args and add `job_description_facets` under `Functions`. Regenerate per §13.3.0 if
+  the CLI is authenticated; otherwise hand-edit. `JobCategory` and `UsStateCode` are
+  hand-written TS unions in `lib/jobs/`, since generated types don't capture check
+  constraints.
+- `job_descriptions_created_at_idx` (0001) is kept, because nothing is gained by
+  dropping it.
+
+#### 7.8.6 API contract
+**`GET /api/job-descriptions`**: all params are optional. An empty string means the
+param is absent.
+
+| param | values | meaning |
+|---|---|---|
+| `q` | trimmed, ≤ 200 | unchanged (§9) |
+| `level` | one of `JOB_DESCRIPTION_LEVELS` | exact match. **Now validated:** an unknown value returns `400`. Before, it was passed straight through. |
+| `category` | one of `JOB_CATEGORY_SLUGS` | `job_category = category` |
+| `location` | `remote`, or a US state/DC code (case-insensitive, normalized to uppercase) | `remote` → `is_remote`. A state code → `location_states @> {code}`. |
+| `sort` | `relevance` \| `recent` | Default is `relevance` with `q` and `recent` without. `relevance` without `q` → `400`. |
+| `limit` | integer ≥ 1 | unchanged; capped at 100 |
+| `cursor` | opaque | see below |
+
+- All filters combine with AND, and each one works with or without `q`.
+- **Validation:** `jobDescriptionListQuerySchema` in `lib/validation/schemas.ts` (zod)
+  parses `Object.fromEntries(url.searchParams)`.
+  - On failure it returns `400 { error }` with the first issue's message, the same
+    style as the POST route.
+  - `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` and the limit constants stay where they
+    are and are imported by the schema.
+- **Without `q` (keyset mode):**
+  - `listJobDescriptions` orders by `listed_at desc, id desc`.
+  - The cursor is `<listed_at>_<id>`, the same string shape as before.
+    `JobDescriptionCursor` becomes `{ listedAt, id }`, encoded from `row.listed_at`.
+  - The filter is `.or("listed_at.lt.X,and(listed_at.eq.X,id.lt.Y)")`.
+  - A cursor issued before deploy (from `created_at`) decodes and is read as
+    `listed_at`. At worst one page seam is off, once.
+- **With `q` (offset mode, unchanged per §9.2):** `searchJobDescriptions` passes the
+  `category_filter`, `state_filter`, `remote_only`, and `sort_mode` RPC args. Offset
+  pagination stays even for `sort=recent`, so there's one search code path.
+- **Response:** the shape is unchanged. Each `JobDescription` (`types/domain.ts`) gains
+  `job_category: JobCategory | null`. `location_states`, `is_remote`, and `listed_at`
+  are **not** exposed, because the UI doesn't need them.
+- `app/dashboard/page.tsx`'s "Latest job listings" now sorts by `listed_at` with no
+  code change, because it uses the default order.
+
+**`GET /api/job-descriptions/facets`** (new). The static segment takes precedence over
+`[id]`.
+- Auth is required, and a missing session gets the same `401` as the list route.
+- It calls `rpc("job_description_facets")` on the session client.
+- Response `200`:
+  `{ "categories": { [slug]: number }, "states": { [code]: number }, "remote": number }`.
+  Slugs or codes with zero listings are absent.
+- It is read-only and runs over all active rows. It does **not** depend on other
+  filters.
+- Header: `Cache-Control: private, max-age=300`.
+- Errors: `401`, `500 { error: "Failed to load job filters." }`.
+- Query function: `getJobDescriptionFacets(supabase)` in
+  `lib/supabase/queries/jobDescriptions.ts`.
+
+#### 7.8.7 URL state and UI
+**URL:** `/jobs?q=&level=&category=&location=&sort=`, parsed by `parseJobsSearchParams`
+in `lib/client/jobsBoard.ts`.
+- Parsing is lenient: unknown or invalid values are dropped, so a bad link never shows
+  an error.
+- `location` is normalized to `remote` or an uppercase state code.
+- `sort` is kept only when `q` is present and the value is `recent`, since that's the
+  only non-default case. `buildJobsHref` writes params only when they're non-default.
+- `JobsBoardQuery` becomes `{ q, level, category, location, sort }`.
+- `jobsQueryKey`, `buildJobsApiPath`, and `formatResultSummary` cover all five.
+- `JOB_CATEGORIES` and `US_STATES` are imported from `lib/jobs/categories.ts` and
+  `lib/jobs/usStates.ts`. Both have no imports, so they are safe for the client.
+
+**Layout (`components/jobs/JobsSearchControls.tsx`):**
+- **Row 1:** the search form, unchanged.
+- **Row 2, the filter bar:**
+  - the Level pills, unchanged;
+  - a **Field** select: "All fields", then `JOB_CATEGORIES` in list order;
+  - a **Location** select: "Any location", "Remote", then the states that have at least
+    one listing, sorted by name;
+  - with `q` only, a **Sort** select: "Best match" or "Most recent";
+  - "Clear all", shown when any filter or `q` is active.
+- **Without `q`**, there's no sort control. The results summary line ends with
+  "· Newest first" whenever the order is by date, which is with no `q` or with `q` and
+  `sort=recent`, so the order is always visible.
+- **Search input:** the client component `components/jobs/JobsSearchInput.tsx`, inside
+  the `next/form`. It is controlled, and it re-syncs to the URL's `q` when that changes
+  ("Clear all", a chip, back/forward) by adjusting state during render rather than
+  remounting, so focus and the caret stay put.
+- **Selects:**
+  - They are native `<select>`s with visible `<label>`s, in a small client component
+    `JobsFilterSelect`.
+  - On change, it does `router.push(buildJobsHref({ ...query, [key]: value }))`, which
+    keeps every other param.
+  - The search form carries `level`, `category`, `location`, and `sort` as hidden
+    inputs, so a new search keeps the filters.
+  - Changing `q` to empty drops `sort`.
+- **Facet use:**
+  - The page fetches `/api/job-descriptions/facets` in parallel with the first results
+    page, server-side via `serverFetch`, outside the results Suspense boundary.
+  - States with zero listings aren't offered. A selected state that has zero listings
+    (from a deep link) is still shown, so the select reflects the URL.
+  - Fields with zero listings stay in the list, disabled, with the label suffix
+    " (no listings yet)". The list stays stable, and the user can see that the field
+    exists but the board doesn't cover it yet. The **currently selected** field is
+    never disabled, even with zero listings, so a deep link still shows and works.
+  - If the facets request fails, the board shows all fields enabled and **no** state
+    options, only "Any location" and "Remote". Filtering still works.
+- **Mobile (< sm):** the search is on its own row. The level pills wrap. Field and
+  Location sit in a 2-column grid, and Sort spans full width under them. There's no
+  drawer or modal, because the controls are few.
+- **Cards and detail:** `JobBadges` shows the field label as a neutral tag, next to the
+  level and location tags, when `job_category` isn't null or `other`.
+- **Empty state (`JobsBoardStates`):**
+  - Heading: "No jobs match these filters".
+  - Below it, each active filter is shown as a removable chip, a link to the same URL
+    without that param, followed by "Clear all".
+  - The existing no-results copy is kept for an empty `q` with no filters.
+- **Pagination:** `JobDescriptionList` takes `query: JobsBoardQuery` instead of `q` and
+  `level`, and builds "Load more" paths with `buildJobsApiPath(query, cursor)`. It is
+  remounted per `jobsQueryKey`, as before.
+
+#### 7.8.8 Out of scope (follow-ups, not v1)
+- "State **or** remote" as one combined choice, such as an "Include remote" checkbox.
+- City or metro radius filtering.
+- Counts in the UI that respect the other active filters.
+- Multiple fields per job.
+- Users picking or overriding the field when they share a posting.
+- Claude-based classification. That's superseded by M2.2's role-family extraction
+  anyway.
+- `employment_type` and salary filters (§13.3.3).
+
+**Follow-ups recorded at review (2026-11-26):**
+- **Private listings and facets (M1.5).** `job_description_facets()` counts every
+  active row the caller can see. Today that is the same for everyone. Once 0009 adds
+  private listings, it would include the caller's own private rows in their counts.
+  0009 should add `visibility = 'shared'` to the function (binding rule (c) in
+  §13.3.0) if the facets must stay global.
+- **Client bundle hygiene.** `lib/validation/schemas.ts` imports
+  `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH`, `JOB_DESCRIPTIONS_DEFAULT_LIMIT`, and
+  `JOB_DESCRIPTIONS_MAX_LIMIT` from `lib/supabase/queries/jobDescriptions.ts`. Since
+  client code imports `schemas.ts`, that pulls the query module into the client
+  bundle. Move the three constants to a client-safe, import-free constants file
+  (e.g. `lib/jobs/listLimits.ts`), import them from there in both modules, and keep
+  the existing sync test with `JOBS_SEARCH_MAX_LENGTH`. This supersedes §9.1's choice
+  of where those constants live.
 
 ---
 
@@ -2123,16 +3015,46 @@ conventions are new:
 | 0007 | `0007_background_infra.sql` | M1.2 | `private` schema, `background_tasks`, `ai_usage_events`, `rate_limit_events`, `private.rate_limits`, task functions, `private.consume_rate_limit` |
 | 0008 | `0008_worker_schedule.sql` | M1.2 | `pg_cron`, `pg_net`; worker-tick + housekeeping cron jobs reading Vault secrets |
 | 0009 | `0009_job_ingestion_v2.sql` | M1.5 | `job_descriptions` v2 columns, visibility/owner, column grants, RLS rewrite, guard trigger, listing RPCs, `job_sources`, `job_source_boards`, `job_source_runs`, `search_job_descriptions` v2, expiry/dedupe functions, ingest cron |
-| 0010 | `0010_resume_critiques.sql` | V1 (§13.20) | `resume_critiques` (created early, `report_id`/`profile_id` FKs deferred to 0016), same-owner trigger, `request_resume_critique` |
-| 0011 | `0011_taxonomy.sql` | M2.1 | `skills`, `skill_aliases`, `role_families` |
-| 0012 | `0012_taxonomy_seed.sql` | M2.1 | Generated from `data/taxonomy/*.json` (§13.7) |
-| 0013 | `0013_resume_profiles.sql` | M2.3 | `resume_profiles`, `resume_profile_skills` |
-| 0014 | `0014_job_requirements.sql` | M2.2 | `job_requirements`, `job_requirement_skills`, `claude_batches`, `claude_batch_items`, user-listing extraction trigger |
-| 0015 | `0015_embeddings.sql` | M2.4 | `vector` extension, `resume_embeddings`, `job_embeddings` (HNSW), close/delete trigger, `match_candidates` |
-| 0016 | `0016_reports.sql` | M3.1 | `resume_reports`, **alter** `resume_critiques` (add the `report_id` and `profile_id` FKs; §13.20.2), `report_roles`, `report_job_recommendations`, `matches` v2 columns, `request_resume_report`, `request_fit_check`, `retry_report` |
-| 0017 | `0017_market_stats.sql` | M4.1 | `private.role_skill_demand` MV, `get_role_market_stats`, refresh function |
-| 0018 | `0018_listing_imports.sql` | M4.4 | `job_listing_imports`, `request_url_import` |
-| 0019 | `0019_digests_and_revisions.sql` | M5.1/M5.2 | `resumes.previous_resume_id`, `notification_preferences`, `digest_runs`, weekly cron |
+| 0010 | `0010_resume_critiques.sql` | V1 (§13.20) | `resume_critiques` (created early, `report_id`/`profile_id` FKs deferred to 0018) — note: the applied file's comments say "0016", stale from an earlier numbering; this table is authoritative, same-owner trigger, `request_resume_critique` |
+| 0011 | `0011_job_sources_greenhouse_lever.sql` | §7.7 (Muse replacement) | widens `job_descriptions_source_check` to `('user','themuse','greenhouse','lever')` |
+| 0012 | `0012_job_board_filters.sql` | §7.8 (board filters) | `job_descriptions.job_category`, `location_states`, `is_remote`, generated `listed_at`, their checks/indexes, `search_job_descriptions` with filter/sort params, `job_description_facets()` |
+| 0013 | `0013_taxonomy.sql` | M2.1 | `skills`, `skill_aliases`, `role_families` |
+| 0014 | `0014_taxonomy_seed.sql` | M2.1 | Generated from `data/taxonomy/*.json` (§13.7) |
+| 0015 | `0015_resume_profiles.sql` | M2.3 | `resume_profiles`, `resume_profile_skills` |
+| 0016 | `0016_job_requirements.sql` | M2.2 | `job_requirements`, `job_requirement_skills`, `claude_batches`, `claude_batch_items`, user-listing extraction trigger |
+| 0017 | `0017_embeddings.sql` | M2.4 | `vector` extension, `resume_embeddings`, `job_embeddings` (HNSW), close/delete trigger, `match_candidates` |
+| 0018 | `0018_reports.sql` | M3.1 | `resume_reports`, **alter** `resume_critiques` (add the `report_id` and `profile_id` FKs; §13.20.2), `report_roles`, `report_job_recommendations`, `matches` v2 columns, `request_resume_report`, `request_fit_check`, `retry_report` |
+| 0019 | `0019_market_stats.sql` | M4.1 | `private.role_skill_demand` MV, `get_role_market_stats`, refresh function |
+| 0020 | `0020_listing_imports.sql` | M4.4 | `job_listing_imports`, `request_url_import` |
+| 0021 | `0021_digests_and_revisions.sql` | M5.1/M5.2 | `resumes.previous_resume_id`, `notification_preferences`, `digest_runs`, weekly cron |
+
+**Renumbered a third time 2026-11-20 (§7.8).** `0012_job_board_filters.sql` takes the
+next free number, and every *planned* migration from taxonomy onward moves up by one
+(taxonomy is now 0013/0014, and so on through digests at 0021). None of them exist yet.
+In-text references in §13 and `docs/ROADMAP.md` were updated in the same change. 0012
+depends only on 0004–0006, and neither 0009 nor 0010 depends on it, so the
+application-order exception below applies again. **Binding rules for the parked 0009**
+(branch `wip/m1.5-ingestion`), whichever order the two are applied in:
+- (a) `search_job_descriptions` v2 must keep 0012's `category_filter`, `state_filter`,
+  `remote_only`, and `sort_mode` parameters and their semantics, and add `scope` next to
+  them. It must also `drop function` using 0012's **8-argument** signature.
+- (b) The browse index `job_descriptions_active_shared_idx` is defined on
+  `(listed_at desc, id desc)`, not `created_at`.
+- (c) If 0009 is rebased after 0012 is applied, its "active" predicate is added to
+  `job_description_facets()` as well. So is `visibility = 'shared'`, if the global
+  counts must exclude the caller's own private listings. With 0009's RLS, a
+  `security invoker` function would otherwise count them for their owner (§7.8.8).
+
+**Renumbered again 2026-11-20 (§7.7).** `0011_job_sources_greenhouse_lever.sql` takes
+the next free number, and every *planned* migration from taxonomy onward moves up by
+one. None of them exist yet. All in-text references in §13 and `docs/ROADMAP.md` were
+updated in the same change. This follows the 2026-11-17 precedent and was chosen over
+inventing an out-of-sequence name. 0011 depends only on 0004, and the parked 0009
+doesn't depend on it, so the same application-order exception as 0010 applies.
+**Binding rule for the parked 0009** (branch `wip/m1.5-ingestion`): its "replace the
+`source` check" step must `drop constraint job_descriptions_source_check` (the name 0011
+uses) and re-add a list that is a superset of 0011's. §13.3.3 already lists
+`greenhouse`/`lever`, so either application order gives the same schema.
 
 **Renumbered 2026-11-17 (§13.20).** `0010_resume_critiques.sql` was inserted for the
 visible-first critique, and every *planned* migration after it moved up by one. None of
@@ -2421,15 +3343,16 @@ If either Vault secret is missing, the tick command runs `raise warning` and ski
 | `source_metadata` | jsonb not null default `'{}'` | raw source fields worth keeping (department, team, schedule) |
 
 Constraints:
-- Replace the `source` check (find the generated name; likely
-  `job_descriptions_source_check`) with
-  `check (source in ('user','themuse','usajobs','greenhouse','lever','adzuna'))`.
+- Replace the `source` check with
+  `check (source in ('user','themuse','usajobs','greenhouse','lever','adzuna'))`. The
+  constraint is named exactly `job_descriptions_source_check`, because 0011 (§7.7.7)
+  re-created it under that name. Drop it by that name.
 - `check ((visibility = 'private') = (owner_user_id is not null))`
 - `check (visibility = 'shared' or source = 'user')`
 - `check (closed_at is null or closed_reason is not null)`
 
 Indexes:
-- `job_descriptions_active_shared_idx (created_at desc, id desc) where visibility='shared'
+- `job_descriptions_active_shared_idx (listed_at desc, id desc) where visibility='shared'
   and deleted_at is null and closed_at is null and duplicate_of is null` (browse).
 - `(dedupe_key) where dedupe_key is not null and closed_at is null`
 - `(owner_user_id) where owner_user_id is not null`
@@ -2455,7 +3378,7 @@ revoke insert, update, delete on public.job_descriptions from anon, authenticate
 ```
 All authenticated writes go through security-definer RPCs that enforce ownership,
 visibility rules, and rate limits. This is needed because a user insert or content
-update triggers a paid Claude extraction (0014 trigger), and a direct PostgREST write
+update triggers a paid Claude extraction (0016 trigger), and a direct PostgREST write
 would bypass the rate limit:
 - `create_job_listing(p_title, p_company, p_description, p_source_url, p_location,
   p_level, p_visibility) returns job_descriptions`: requires `auth.uid()`, consumes
@@ -2476,9 +3399,12 @@ would bypass the rate limit:
 - `before update` trigger `job_descriptions_guard` (defense in depth for service-role
   code paths): raises if `old.visibility='shared' and new.visibility='private'`.
 
-**`search_job_descriptions` v2**: `drop function` the §10 version and create
+**`search_job_descriptions` v2**: `drop function` the §7.8.5 version (0012, 8 args) and create
 `search_job_descriptions(search_query text, level_filter text default null,
-scope text default 'shared', limit_count int default 20, offset_count int default 0)`.
+category_filter text default null, state_filter text default null, remote_only boolean
+default false, sort_mode text default 'relevance', scope text default 'shared',
+limit_count int default 20, offset_count int default 0)`. The §7.8 filter and sort
+semantics stay unchanged (binding rule in §13.3.0).
 It is `security invoker` (RLS applies), keeps the §9 ranking, and adds the active
 predicate. `scope='shared'` → `visibility='shared'`. `scope='mine'` →
 `submitted_by = auth.uid()`, which includes the caller's private rows and their
@@ -2491,7 +3417,7 @@ closed/soft-deleted rows; for this scope the active predicate is relaxed to
 |---|---|---|
 | `slug` | text pk | `themuse`, `usajobs`, `greenhouse`, `lever`, `adzuna` |
 | `display_name` | text not null | |
-| `enabled` | boolean not null default false | seeded: `themuse` true, others false until configured |
+| `enabled` | boolean not null default false | seeded (revised 2026-11-20, §7.7): `greenhouse` and `lever` true, with `job_source_boards` seeded from `lib/jobs/sources/companies.ts`; `themuse` **false** (blocked by Cloudflare, dropped); others false until configured |
 | `sync_mode` | text not null | `'snapshot'` (board returns all open jobs) \| `'incremental'` |
 | `dedupe_priority` | smallint not null | lower wins canonical: greenhouse/lever 10, usajobs 20, themuse 30, adzuna 40 |
 | `default_ttl_days` | int not null | themuse 60, adzuna 45, usajobs (uses close date) 60, greenhouse/lever 90 (backstop only) |
@@ -2532,7 +3458,7 @@ rows, then calls `resolve_job_duplicates`. `content_hash` is filled for existing
 by `update job_descriptions set title = title` in the migration, which fires the
 trigger.
 
-#### 13.3.4 Taxonomy (0011/0012)
+#### 13.3.4 Taxonomy (0013/0014)
 **`skills`**: readable by authenticated, written only by the service role.
 
 | column | type | notes |
@@ -2549,9 +3475,13 @@ trigger.
 delete cascade`, `created_at`. Readable by authenticated.
 
 **`role_families`**: `id uuid pk`, `slug text unique`, `name`, `description`,
-`group_slug text` (`engineering, data, product, design, marketing, sales,
-business-ops, finance, consulting, healthcare, science, education, government,
-creative, other`), `sort_order int`, `status ('canonical','deprecated')`. Readable by
+`group_slug text not null`, with `check` in exactly the §7.8.3 field slugs (`software, data,
+it-security, hardware, product, design, science, finance, business-ops, sales-marketing,
+people-hr, legal, healthcare, trades, other`). *Amended 2026-11-20 (§7.8):* the earlier
+draft group list is replaced so the board's field filter and role families share one
+vocabulary (consulting → business-ops, creative → design, government → by function or
+legal, education → other). Each role family belongs to exactly one field, and
+`role-families.json` is unit-tested against `JOB_CATEGORY_SLUGS`. `sort_order int`, `status ('canonical','deprecated')`. Readable by
 authenticated.
 
 **Level enum** (used by `job_requirements.level_normalized`,
@@ -2560,7 +3490,7 @@ management | unknown`. **Student seniority enum** (`resume_profiles.seniority`):
 `student_no_experience | student_with_experience | new_grad | early_career |
 experienced`.
 
-#### 13.3.5 Resume profiles (0013)
+#### 13.3.5 Resume profiles (0015)
 **`resume_profiles`**: owner-select only.
 
 | column | type | notes |
@@ -2589,7 +3519,7 @@ not null` (array of `{quote, section}`; every quote verified to occur in the res
 text, §13.5.6), `created_at`. Indexes: `(profile_id)`, `(skill_id)`; unique
 `(profile_id, skill_id) where skill_id is not null`.
 
-#### 13.3.6 Job requirements and batches (0014)
+#### 13.3.6 Job requirements and batches (0016)
 **`job_requirements`**: one current row per listing; re-extraction replaces it.
 
 | column | type | notes |
@@ -2648,7 +3578,7 @@ content_hash`, `security definer`, `search_path=''`): when `new.source = 'user'`
 `user_id = coalesce(new.owner_user_id, new.submitted_by)`. External rows are picked up
 by the batch submitter instead (§13.6.6).
 
-#### 13.3.7 Embeddings (0015)
+#### 13.3.7 Embeddings (0017)
 `create extension if not exists vector with schema extensions;` (pgvector 0.8.2). The
 dimension is fixed at **1024** (§13.8.1). Switching to a model with a different
 dimension means a new column plus a re-embed, documented as a migration path, not
@@ -2712,7 +3642,7 @@ of order) and limits to `p_limit`. `similarity = 1 - distance`. RLS does not app
 under the service role, so **the explicit owner predicate is the privacy guarantee
 here**. pgTAP tests it directly (§13.16).
 
-#### 13.3.8 Reports, critiques, recommendations, fit checks (0016; `resume_critiques` itself is created by 0010)
+#### 13.3.8 Reports, critiques, recommendations, fit checks (0018; `resume_critiques` itself is created by 0010)
 **`resume_reports`**: owner-select only.
 
 | column | type | notes |
@@ -2737,7 +3667,7 @@ Indexes: `(resume_id, created_at desc)`, `(user_id, created_at desc)`. Partial u
 `(resume_id) where status in ('queued','running')`: one in-flight report per resume.
 
 **`resume_critiques`**: owner-select only. **Created early by 0010 (§13.20.2), which
-is the authoritative DDL.** 0016 only adds the two deferred FKs. Columns: `id`,
+is the authoritative DDL.** 0018 only adds the two deferred FKs. Columns: `id`,
 `report_id uuid null unique → resume_reports cascade` (null for standalone V1
 critiques), `resume_id → resumes cascade`, `user_id`, `profile_id uuid null →
 resume_profiles set null`, `prompt_version`, `model`, `overall_score int` (mean of the
@@ -2810,7 +3740,7 @@ starts with `if auth.uid() is null then raise exception 'unauthenticated'`):
   tasks (`status='queued', attempts=0, run_after=now()`), resets failed stages to
   `pending`, increments `retry_count`. No rate-limit charge.
 
-#### 13.3.9 Market stats (0017)
+#### 13.3.9 Market stats (0019)
 - `private.role_skill_demand` materialized view:
   ```sql
   with live as (
@@ -2854,7 +3784,7 @@ starts with `if auth.uid() is null then raise exception 'unauthenticated'`):
   Ordered by `posting_count desc`. Safe to expose because it reads only aggregates of
   shared external data.
 
-#### 13.3.10 Listing imports (0018)
+#### 13.3.10 Listing imports (0020)
 **`job_listing_imports`**: owner-select only. Columns: `id`, `user_id → auth.users
 cascade`, `url text not null` (≤ 2048), `final_url text null`, `host text not null`,
 `visibility text not null check ('shared','private')`, `fit_check_resume_id uuid
@@ -2869,7 +3799,7 @@ default null) returns job_listing_imports`: requires auth, checks basic shape
 resume is owned if given, consumes `url_import`, inserts, and enqueues
 `import.fetch_listing`.
 
-#### 13.3.11 Digests and revisions (0019)
+#### 13.3.11 Digests and revisions (0021)
 - `resumes.previous_resume_id uuid null → resumes(id) on delete set null`, plus trigger
   `resumes_previous_same_owner` that raises unless the referenced resume has the same
   `user_id`.
@@ -3315,21 +4245,44 @@ Behavior, in order:
    function. See the "Decision on `enum`" block below (M1.1b).
    **Never** send `tool_choice` (forced `tool_choice` returns 400 on Opus 5.5),
    `temperature`, `top_p`, `top_k`, or an assistant prefill.
-2. **As built (M1.1):** call the beta *create* endpoint with server-side refusal
-   fallback, and keep the raw response:
-   `client.beta.messages.create({ ...params, betas: ['server-side-fallback-2026-07-01'],
-   fallbacks: 'default' }, { signal, timeout: config.timeoutMs }).withResponse()`.
-   - This gives `data` (the message) and `request_id`.
+2. **As built (streaming since 2026-11-26; was non-streaming `create` in M1.1):**
+   stream the beta Messages endpoint with server-side refusal fallback, and take the
+   accumulated final message:
+   `const stream = client.beta.messages.stream({ ...params, betas: ['server-side-fallback-2026-07-01'],
+   fallbacks: 'default' }, { signal, timeout: config.timeoutMs });`
+   `const message = await stream.finalMessage();` request id from `stream.request_id`.
+   - **Why streaming:** a non-streaming request is silent until the response is
+     complete, and some networks (VPNs, proxies) close a connection idle for ~60 s.
+     Long calls (`critiqueResume`, effort high) failed with `APIConnectionError`
+     (`UND_ERR_SOCKET: other side closed`) at ~60 s. A stream keeps bytes flowing. It
+     is also the SDK's recommended pattern for long requests. Nothing is consumed
+     incrementally.
+   - **Verified on SDK 1.8.0** (`lib/BetaMessageStream.js`, `lib/beta-parser.js`,
+     `core/streaming.js`, `client.js`): `stream()` sends the same `beta.messages.create`
+     with `stream: true`, so `betas`/`fallbacks`/`output_config`, the SDK retry and
+     `timeout` apply unchanged (but see Timeout: our whole-attempt timer bounds SDK
+     retries too); `request_id` is the `request-id` header, set when
+     headers arrive; the accumulated message pushes `fallback` blocks as-is and
+     relabels `model` to the fallback's `to.model` (same as `create`), with
+     `stop_reason`/`stop_details`/`usage` from `message_delta`; the SDK parses the
+     final message only if `output_config.format` has a `parse` function, and ours
+     has none.
+   - **Timeout:** the SDK's `timeout` covers only the wait for response headers on a
+     stream, so `callStructured` (`raceAbort`) also enforces `timeoutMs` over the whole
+     attempt (rejects as a timeout and calls `stream.abort()`), alongside the caller's
+     `signal`.
    - **`beta.messages.parse` is deliberately not used.** The reasons are in the
      Verified block below: it throws on invalid output, which loses usage and the
-     stop_reason; it loses the request id; and it would parse the declined model's
-     text.
-   - No `structured-outputs-*` beta header is sent; it isn't needed with `create`.
+     stop_reason; and it would parse the declined model's text. (Its loss of the
+     request id no longer matters: the stream exposes it.)
+   - No `structured-outputs-*` beta header is sent; it isn't needed.
    - Constraints the helper strips from the wire schema (numeric ranges, string
      lengths, array sizes) are **re-checked client-side** by the zod schema and
      `validateX`.
 3. Record usage (`recordUsage`) **before** inspecting the result, so failed-but-billed
    calls are counted. Price by `response.model`, not the requested model.
+   Mid-stream failures record no usage, so partially billed tokens aren't tracked
+   (follow-up: record `stream.currentMessage?.usage` on failure).
 4. `stop_reason === 'refusal'` → `ClaudeRefusalError` (non-retryable).
    `'max_tokens'` → `ClaudeTruncatedError` (non-retryable). Anything other than
    `end_turn` → `ClaudeInvalidOutputError`.
@@ -3343,17 +4296,20 @@ Behavior, in order:
    - The error message names only the failure kind and the zod issue *paths*. It
      never includes values, and the `JSON.parse` message (which can quote the output)
      is dropped.
-6. HTTP 400 → `ClaudeBadRequestError`; 429/5xx/529/network/abort → `ClaudeApiError`
-   with `retryable: true`. SDK `maxRetries: 1`; task-level retries handle the rest.
+6. HTTP 400 → `ClaudeBadRequestError`; 429/5xx/529/network/timeout/abort → `ClaudeApiError`
+   with `retryable: true`. Mid-stream failures are also retryable `ai_unavailable`: an
+   SSE `error` event (plain `APIError`, no status), and the plain `AnthropicError` the
+   SDK throws when the body read fails (e.g. undici `terminated` on a dropped socket)
+   or the stream ends before `message_stop`. They carry the stream's request id. SDK
+   `maxRetries: 1` (it retries only before the stream starts); task-level retries
+   handle the rest.
 7. Never log prompt or response content. Log only `task`, `model`, `stop_reason`,
    token counts, `request_id`.
 
 **Non-streaming size guard:** the SDK refuses non-streaming requests whose
-`max_tokens` implies a very long expected duration. No task here exceeds
-`max_tokens: 20_000`. If the installed SDK still raises the "streaming is strongly
-recommended" error at these values, pass an explicit `timeout` (which bypasses the
-estimate) or switch that task to `client.beta.messages.stream(...).finalMessage()`.
-Verify in M1.1.
+`max_tokens` implies a very long expected duration. Since `callStructured` streams,
+the guard no longer applies to sync calls (it still matters to anything calling
+`create` directly). No task exceeds `max_tokens: 20_000`, kept as a cost/latency cap.
 
 **Client construction and SDK telemetry (binding; architect 2026-11-12; implemented in
 M1.1c).** SDK 1.8.0 traces every API call through `@opentelemetry/api` by default
@@ -3384,12 +4340,22 @@ asserted, not assumed:
    (§13.2.1 rule 5). This exposure predates the 1.8.0 upgrade. An explicit
    `logLevel` option overrides the env var, so with `"warn"` no value of
    `ANTHROPIC_LOG` can enable request/response logging on this client. `"warn"`
-   (not `"off"`) keeps the SDK's own warnings (deprecations, misconfiguration),
-   which carry no request content.
+   (not `"off"`) keeps the SDK's own warnings (deprecations, misconfiguration).
+   - **`logger: CLAUDE_SDK_LOGGER` (added 2026-11-26 with streaming).** `warn`
+     still lets `error`/`warn` calls through, and the SDK passes data after the
+     message string. On the streaming path that data can be response content
+     (resume-derived): on a malformed SSE event, 1.8.0's `core/streaming.js`
+     (~l.65-66) logs `("Could not parse message into JSON:", sse.data)` and
+     `("From chunk:", sse.raw)` through the client's logger. `getClaudeClient()`
+     therefore passes `CLAUDE_SDK_LOGGER` (`lib/claude/client.ts`), which forwards
+     only the first argument (the SDK's fixed message string) to
+     `console.error`/`console.warn` and makes `info`/`debug` no-ops. It is the
+     **only** allowed custom logger. Any other custom logger, or one that forwards
+     later arguments, is forbidden. The construction-site guard test enforces it.
    - **Forbidden:** passing `logLevel: "debug"` or `logLevel: "info"` to any
      Anthropic client (app code or `scripts/evals/`), calling
-     `client.withOptions({ logLevel: ... })` with either, or passing a custom
-     `logger` that writes request details. Scripts under `scripts/evals/` that build
+     `client.withOptions({ logLevel: ... })` with either, or passing any custom
+     `logger` other than `CLAUDE_SDK_LOGGER`. Scripts under `scripts/evals/` that build
      their own client pass `logLevel: "warn"` alongside `openTelemetry: false`.
    - To debug a request locally, log our own redacted metadata (task, model, token
      counts, `request_id`), never turn SDK debug logging on.
@@ -4231,10 +5197,10 @@ already capped at `JOB_DESCRIPTION_DESCRIPTION_MAX_LENGTH = 20_000` (§7.3).
 
 | Source | Auth | Data quality for us | Terms / obligations | Decision |
 |---|---|---|---|---|
-| **The Muse** (existing) | none, 500 req/h | full HTML descriptions, explicit Internship/Entry levels | must link back to The Muse; can't replicate Muse's service (§7.1) | **Keep** (incremental) |
+| **The Muse** (legacy) | none, 500 req/h | full HTML descriptions, explicit Internship/Entry levels | must link back to The Muse; can't replicate Muse's service (§7.1) | **Dropped 2026-11-20**: every automated request gets a Cloudflare bot challenge (403). Existing rows remain (§7.7.8). No adapter in v2. |
 | **USAJOBS Search API** | free API key requested from developer.usajobs.gov; headers `Authorization-Key`, `User-Agent: <contact email>`, `Host: data.usajobs.gov` | full duties/qualifications; explicit **student/recent-graduate hiring paths** (Pathways), close dates | US government data; don't imply endorsement; no published hard rate limit, so stay ≤ 1 req/s | **Add in Phase 1** (needs a key; §13.19 Q4) |
-| **Greenhouse Job Board API** (`boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true`) | none for GET | full descriptions, direct company apply links; one board per company, **returns all open jobs** (snapshot) | public job-board data meant for embedding company careers pages; link to the company's posting for apply; poll ≤ 1×/day/board; respect 429/`Retry-After` | **Add in Phase 1** with a curated board list |
-| **Lever Postings API** (`api.lever.co/v0/postings/{site}?mode=json`; EU: `api.eu.lever.co`) | none for GET | `descriptionPlain` + lists, `hostedUrl`/`applyUrl`, `workplaceType`; snapshot per company | public postings API; same conduct as Greenhouse | **Add in Phase 1** with a curated list |
+| **Greenhouse Job Board API** (`boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true`) | none for GET | full descriptions, direct company apply links; one board per company, **returns all open jobs** (snapshot) | public job-board data meant for embedding company careers pages; link to the company's posting for apply; poll ≤ 1×/day/board; respect 429/`Retry-After` | **Live since 2026-11-20** in the v1 pipeline (§7.7) with a curated list in `lib/jobs/sources/companies.ts`; M1.5 moves it behind the adapter interface |
+| **Lever Postings API** (`api.lever.co/v0/postings/{site}?mode=json`; EU: `api.eu.lever.co`) | none for GET | `descriptionPlain` + lists, `hostedUrl`/`applyUrl`, `workplaceType`; snapshot per company | public postings API; same conduct as Greenhouse | **Live since 2026-11-20** (§7.7), same as Greenhouse |
 | **Ashby** public job board API | none | similar to Greenhouse | similar | Later (adapter pattern makes it ~1 file) |
 | **Adzuna** | free key (signup); per-key daily/monthly limits | **descriptions are snippets** (verify; historically truncated), which weakens requirement extraction; redirect URLs | must attribute Adzuna on every page showing its data; commercial use is a 14-day trial, then needs a licence | **Defer** (§13.19 Q4) |
 | LinkedIn, Indeed, Glassdoor, Handshake | no public API | — | ToS prohibit scraping | **Excluded** (also deny-listed for URL import, §13.11.2) |
@@ -4275,11 +5241,13 @@ export interface JobSourceAdapter {
   fetchPage(args: { board: string | null; cursor: string | null; config: unknown; signal: AbortSignal }): Promise<FetchPageResult>;
 }
 ```
-`lib/jobs/sources/registry.ts` maps slug to adapter. `lib/jobs/sources/themuse.ts` is the
-existing `lib/jobs/themuse.ts` refactored behind this interface (same mapping, same
-newest-first sort, `MAX_PAGES_PER_LEVEL` moves to `job_sources.config`).
-`lib/jobs/html.ts` holds the shared `stripHtml` (moved from themuse.ts) plus
-`decodeHtmlEntities` (Greenhouse returns entity-escaped HTML).
+`lib/jobs/sources/registry.ts` maps slug to adapter. *(Revised 2026-11-20.)* There is
+no Muse adapter: `lib/jobs/themuse.ts` is deleted by §7.7.8. Instead, the
+`lib/jobs/sources/greenhouse.ts` and `lever.ts` modules that §7.7.4 ships on main are
+refactored behind this interface. Their mappings stay the same, and
+`JOB_BOARD_COMPANIES` from `companies.ts` becomes the `job_source_boards` seed.
+`lib/jobs/html.ts` (`stripHtml`, `decodeHtmlEntities`) and `lib/jobs/studentFilter.ts`
+already exist from §7.7.
 
 Per-source mapping highlights (full field maps live in each adapter's docstring and
 test fixtures):
@@ -4297,6 +5265,11 @@ test fixtures):
   `applyUrl`, `createdAt` (ms) → postedAt, `workplaceType` → remoteType.
 
 #### 13.6.3 Student-relevance filter (`lib/jobs/studentFilter.ts`)
+**§7.7.3 is the source of truth for the exact title patterns and the US-location
+rule.** It widens the student spellings and adds `counsel` to SENIOR. The
+patterns below are the original v2 draft, kept for the `include_unlabeled_titles`
+logic. M1.5 uses §7.7.3's patterns.
+
 Board sources return every job a company has, so filter before upsert to bound cost:
 - `STUDENT_TITLE_PATTERN` (case-insensitive word-boundary): `intern|internship|co-op|
   coop|new grad|new graduate|graduate program|entry[- ]level|junior|jr\.?|associate|
@@ -4306,8 +5279,11 @@ Board sources return every job a company has, so filter before upsert to bound c
   vp|vice president|chief|architect|distinguished`.
 - Keep when the title matches STUDENT. Also keep when the board has
   `include_unlabeled_titles = true` and the title matches neither pattern. Drop when
-  SENIOR matches, even if STUDENT also matches (e.g. "Senior Associate"). Muse (level
-  filter at source) and USAJOBS (hiring-path filter at source) skip this filter.
+  SENIOR matches, even if STUDENT also matches (e.g. "Senior Associate"). USAJOBS
+  (hiring-path filter at source) skips this filter. *(2026-11-20.)* The filter already
+  exists on main as `classifyStudentLevel` + `isUsLocation` (§7.7.3), without
+  `include_unlabeled_titles`. M1.5 adds that flag and keeps the level split and the
+  US-location policy.
 
 #### 13.6.4 Cross-source dedupe (`lib/jobs/normalize.ts`)
 - `normalizeCompany`: NFKC → lowercase → strip punctuation → drop trailing legal
@@ -4397,8 +5373,9 @@ listing inline.
 User-Agent `Kalify/2.0 (+${APP_BASE_URL}; ${INGEST_CONTACT_EMAIL})`. One sync per
 board per day. No fetching of individual posting HTML pages for ingestion (the API
 payloads are sufficient). Attribution and link-back rendered from
-`adapter.attribution` + `source_url` on cards and detail pages. The Muse's link-back
-obligation (§7.1) is unchanged.
+`adapter.attribution` + `source_url` on cards and detail pages. Greenhouse and Lever
+use `attribution: null` plus the "Employer posting" framing (§7.7.9). The Muse's
+link-back (§7.1) still applies to the legacy Muse rows wherever they are shown.
 
 ### 13.7 Skills taxonomy and normalization
 
@@ -4407,9 +5384,9 @@ obligation (§7.1) is unchanged.
 skills, ~1,200 aliases) and `data/taxonomy/role-families.json` (~35 families). Both
 are authored by backend-dev in M2.1 and reviewed for coverage of student-relevant
 fields, not only tech. `scripts/taxonomy/build-seed.ts` generates
-`0011_taxonomy_seed.sql` (`insert … on conflict (slug) do update set name, category`;
+`0014_taxonomy_seed.sql` (`insert … on conflict (slug) do update set name, category`;
 aliases `on conflict do nothing`). Later additions mean regenerating into a **new**
-migration file (`00NN_taxonomy_update_<date>.sql`), never editing 0012.
+migration file (`00NN_taxonomy_update_<date>.sql`), never editing 0014.
 
 #### 13.7.2 `normalizeSkillLabel(label)` (`lib/taxonomy/normalize.ts`)
 NFKC → lowercase → trim → `&` → `and` → remove every character except `[a-z0-9+#]`.
@@ -5265,6 +6242,7 @@ the same semantics for RFC 8058 one-click.
               RoleCard, RoleMarketFit, RecommendedJobList, RetryReportButton, NewMatchesBanner
   /fitcheck/  FitCheckStatus, RequirementTable, TailoringSuggestions
   /jobs/      (+) VisibilityChoice, ImportUrlForm, ListingImportStatus, ClosedBadge, SourceAttribution
+              (§7.8, already on main: JobsSearchInput, JobsFilterSelect)
   /settings/  DeleteAccountForm, UsageLimits, AccountStatusNotice (the `?account=` banner on /),
               NotificationPrefs
 /lib
@@ -5278,8 +6256,11 @@ the same semantics for RFC 8058 one-click.
   /claude/    (see §13.5.1)
   /embeddings/provider.ts, voyage.ts, text.ts, usage.ts
   /matching/  scoring.ts, constants.ts, roleDiscovery.ts, candidates.ts (match_candidates wrapper)
-  /jobs/      sources/{types,registry,themuse,usajobs,greenhouse,lever}.ts, html.ts, normalize.ts,
-              studentFilter.ts, sync.ts (generic, adapter-driven; replaces syncThemuseJobs)
+  /jobs/      sources/{types,registry,usajobs,greenhouse,lever,companies,common}.ts, html.ts, normalize.ts,
+              studentFilter.ts, sync.ts (generic, adapter-driven; replaces §7.7's syncExternalJobs).
+              greenhouse/lever/companies/common/html/studentFilter already exist from §7.7; no themuse adapter.
+              §7.8 adds: categories.ts, usStates.ts (both import-free, client-safe), classifyCategory.ts,
+              location.ts, facets.ts (pure deriveJobFacets), backfillFacets.ts (service-role backfill).
   /taxonomy/  normalize.ts, vocabulary.ts (loads canonical skills/roles for prompts; cached per invocation)
   /market/    stats.ts
   /net/       safeFetch.ts, ipPolicy.ts, extractListingText.ts
@@ -5575,9 +6556,11 @@ rely on it for debugging and don't add it to any environment. Passing a raw
    - USAJOBS: *recommend yes.* The user requests a free key at developer.usajobs.gov
      (an email address is required) and sets `USAJOBS_API_KEY` and
      `USAJOBS_USER_AGENT_EMAIL`.
-   - Greenhouse and Lever: no keys. *Recommend* that backend-dev seed ~50–100
-     well-known intern-hiring company boards and the user approves the list (or
-     supplies target companies).
+   - Greenhouse and Lever: no keys. **Adopted 2026-11-20** as the replacement for The
+     Muse (§7.7). There's a starter list of about 30 boards in
+     `lib/jobs/sources/companies.ts`, each token checked live by backend-dev. The user
+     may still review the list or supply target companies, and M1.6 can grow it toward
+     50–100.
    - Adzuna: *recommend defer.* Descriptions are snippets, commercial use is a trial,
      and attribution is mandatory.
 5. **URL-import deny-list.** *Recommend* refusing LinkedIn, Indeed, Glassdoor, and
@@ -5646,10 +6629,10 @@ merging its hand-edited `types/database.ts`.
 ```sql
 create table public.resume_critiques (
   id uuid primary key default gen_random_uuid(),
-  report_id uuid null unique,          -- FK -> resume_reports(id) on delete cascade: added by 0016
+  report_id uuid null unique,          -- FK -> resume_reports(id) on delete cascade: added by 0018
   resume_id uuid not null references public.resumes(id) on delete cascade,
   user_id uuid not null references auth.users(id) on delete cascade,
-  profile_id uuid null,                -- FK -> resume_profiles(id) on delete set null: added by 0016
+  profile_id uuid null,                -- FK -> resume_profiles(id) on delete set null: added by 0018
   prompt_version text not null,
   model text not null,                 -- served model (response.model)
   overall_score integer not null check (overall_score between 0 and 100),
@@ -5899,7 +6882,7 @@ shared with §13.13.2):
   `lib/marketing/sampleCritique.ts`. It renders through the real `CritiqueSection`, using
   the optional `lineFeedbackPreview` and `showDate` props. It has no API or Claude
   calls.
-- The `report_id`/`profile_id` FKs (0016).
+- The `report_id`/`profile_id` FKs (0018).
 - **Retirement:**
   - M3.6 puts the same components on `/reports/[id]`.
   - M3.7 removes `RunCritiqueButton`.

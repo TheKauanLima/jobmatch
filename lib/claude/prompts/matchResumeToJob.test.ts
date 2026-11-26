@@ -110,19 +110,18 @@ describe("buildMatchResumeToJobRequest", () => {
 
 // ---------------------------------------------------------------------------
 
-let create: ReturnType<typeof vi.fn>;
+let streamCall: ReturnType<typeof vi.fn>;
 
 function reply(payload: unknown) {
-  create.mockReturnValueOnce({
-    withResponse: async () => ({
-      data: {
-        model: "claude-opus-5-5",
-        stop_reason: "end_turn",
-        stop_details: null,
-        content: [{ type: "text", text: JSON.stringify(payload) }],
-        usage: { input_tokens: 10, output_tokens: 10 },
-      },
-      request_id: "req_m",
+  streamCall.mockReturnValueOnce({
+    request_id: "req_m",
+    abort: () => {},
+    finalMessage: async () => ({
+      model: "claude-opus-5-5",
+      stop_reason: "end_turn",
+      stop_details: null,
+      content: [{ type: "text", text: JSON.stringify(payload) }],
+      usage: { input_tokens: 10, output_tokens: 10 },
     }),
   });
 }
@@ -130,8 +129,8 @@ function reply(payload: unknown) {
 const validMatch = { score: 72, rationale: "Good fit.", matched_strengths: ["Node.js", " "], gaps: [] };
 
 beforeEach(() => {
-  create = vi.fn();
-  __setClaudeClientForTests({ beta: { messages: { create } } } as unknown as Anthropic);
+  streamCall = vi.fn();
+  __setClaudeClientForTests({ beta: { messages: { stream: streamCall } } } as unknown as Anthropic);
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -148,7 +147,7 @@ describe("matchResumeToJob (run)", () => {
     expect(out.value).toEqual({ score: 72, rationale: "Good fit.", matched_strengths: ["Node.js"], gaps: [] });
     expect(out.dropped).toBe(1);
     expect(out.model).toBe("claude-opus-5-5");
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
   });
 
   it("retries once on an out-of-range score, then succeeds", async () => {
@@ -157,7 +156,7 @@ describe("matchResumeToJob (run)", () => {
     await expect(matchResumeToJob("r", "j", { userId: null })).resolves.toMatchObject({
       value: { score: 72 },
     });
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("fails with ClaudeInvalidOutputError after two out-of-range scores (never clamps)", async () => {
@@ -166,26 +165,25 @@ describe("matchResumeToJob (run)", () => {
     await expect(matchResumeToJob("r", "j", { userId: null })).rejects.toBeInstanceOf(
       ClaudeInvalidOutputError,
     );
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("a max_tokens stop makes exactly one API call (truncation is not retried)", async () => {
-    create.mockReturnValueOnce({
-      withResponse: async () => ({
-        data: {
-          model: "claude-opus-5-5",
-          stop_reason: "max_tokens",
-          stop_details: null,
-          content: [{ type: "text", text: '{"score": 7' }],
-          usage: { input_tokens: 10, output_tokens: 16_000 },
-        },
-        request_id: "req_m",
+    streamCall.mockReturnValueOnce({
+      request_id: "req_m",
+      abort: () => {},
+      finalMessage: async () => ({
+        model: "claude-opus-5-5",
+        stop_reason: "max_tokens",
+        stop_details: null,
+        content: [{ type: "text", text: '{"score": 7' }],
+        usage: { input_tokens: 10, output_tokens: 16_000 },
       }),
     });
     await expect(matchResumeToJob("r", "j", { userId: null })).rejects.toBeInstanceOf(
       ClaudeTruncatedError,
     );
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
   });
 
   it("an expired deadline (ctx.signal) fails fast as ClaudeApiError without calling the API", async () => {
@@ -194,7 +192,7 @@ describe("matchResumeToJob (run)", () => {
     await expect(
       matchResumeToJob("r", "j", { userId: null, signal: controller.signal }),
     ).rejects.toMatchObject({ name: "ClaudeApiError", code: "ai_unavailable" });
-    expect(create).not.toHaveBeenCalled();
+    expect(streamCall).not.toHaveBeenCalled();
   });
 
   it("treats a non-integer score as invalid output (schema level)", async () => {

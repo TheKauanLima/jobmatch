@@ -50,6 +50,7 @@ export function MatchList({ matches }: MatchListProps) {
                 <div className="flex min-w-0 items-center gap-2">
                   <Link
                     href={`/jobs/${match.job_description.id}`}
+                    title={match.job_description.title}
                     className="truncate text-sm font-medium text-fg hover:underline"
                   >
                     {match.job_description.title}
@@ -63,7 +64,7 @@ export function MatchList({ matches }: MatchListProps) {
                 )}
               </div>
             </div>
-            <span className="shrink-0 text-xs text-fg-subtle">
+            <span className="text-xs text-fg-subtle sm:shrink-0">
               {new Date(match.created_at).toLocaleString()}
             </span>
           </div>

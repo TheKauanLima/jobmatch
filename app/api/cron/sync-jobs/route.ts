@@ -1,12 +1,28 @@
 import { NextResponse } from "next/server";
 
 import { createAdminClient } from "@/lib/supabase/admin";
-import { syncThemuseJobs } from "@/lib/jobs/sync";
+import {
+  backfillJobFacets,
+  FacetBackfillError,
+  type FacetBackfillResult,
+} from "@/lib/jobs/backfillFacets";
+import { syncExternalJobs } from "@/lib/jobs/sync";
 
 /**
- * GET /api/cron/sync-jobs — pulls the latest Internship/Entry Level listings
- * from The Muse and upserts them into the shared `job_descriptions` board.
- * See docs/ARCHITECTURE.md §7 for the full design rationale.
+ * Vercel Hobby functions get at most 60 s; the sync itself stops starting new
+ * board fetches after 40 s (docs/ARCHITECTURE.md §7.7.5).
+ */
+export const maxDuration = 60;
+
+/** The facet backfill starts no new update after run start + this (§7.8.4). */
+export const FACET_BACKFILL_DEADLINE_MS = 50_000;
+
+/**
+ * GET /api/cron/sync-jobs — polls the curated Greenhouse and Lever company
+ * job boards (`lib/jobs/sources/companies.ts`), upserts student-relevant US
+ * listings into the shared `job_descriptions` board, and soft-deletes
+ * listings that have left their board. See docs/ARCHITECTURE.md §7.7 (this
+ * replaced The Muse) and §7.3 for the trigger/auth design.
  *
  * Not a user-facing endpoint — there is no session to check, since this is
  * meant to be called by a scheduler with no logged-in user (Vercel Cron per
@@ -22,6 +38,16 @@ import { syncThemuseJobs } from "@/lib/jobs/sync";
  * request is rejected (500) rather than allowing unauthenticated access —
  * an unset secret must never silently become "no auth required" for an
  * endpoint that writes to the shared job board using the service-role key.
+ *
+ * After the sync, `backfillJobFacets` fills the board-filter facets on rows
+ * that don't have them yet (docs/ARCHITECTURE.md §7.8.4), starting no new
+ * update after run start + `FACET_BACKFILL_DEADLINE_MS`. The body gains
+ * `facetBackfill: { updated, remaining }`.
+ *
+ * Responses: 200 when every company synced `ok` and the backfill succeeded;
+ * 207 (body = the full per-company result) when any company was
+ * `not_found`, `error`, or `skipped_time_budget`, or the backfill failed;
+ * 502 only if `syncExternalJobs` itself throws.
  */
 export async function GET(request: Request) {
   const expectedSecret = process.env.CRON_SECRET;
@@ -41,16 +67,42 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const runStartedAt = Date.now();
   try {
     const supabase = createAdminClient();
-    const result = await syncThemuseJobs(supabase);
+    const result = await syncExternalJobs(supabase);
 
-    const hadError = result.levels.some((level) => level.error !== null);
-    if (hadError) {
-      console.error("GET /api/cron/sync-jobs: partial failure:", result);
+    let facetBackfill: FacetBackfillResult;
+    let facetBackfillFailed = false;
+    try {
+      facetBackfill = await backfillJobFacets(supabase, {
+        deadlineMs: runStartedAt + FACET_BACKFILL_DEADLINE_MS,
+      });
+    } catch (err) {
+      facetBackfillFailed = true;
+      facetBackfill = {
+        updated: err instanceof FacetBackfillError ? err.updated : 0,
+        remaining: true,
+      };
+      console.error(
+        "GET /api/cron/sync-jobs: facet backfill failed:",
+        err instanceof Error ? err.message : "unknown error",
+      );
     }
 
-    return NextResponse.json(result, { status: hadError ? 207 : 200 });
+    const notOk = result.companies.filter((c) => c.status !== "ok");
+    if (notOk.length > 0) {
+      // Per-company errors are already short (provider/token/status only).
+      console.error(
+        "GET /api/cron/sync-jobs: partial failure:",
+        notOk.map((c) => `${c.provider}:${c.token}=${c.status}`).join(", "),
+      );
+    }
+
+    return NextResponse.json(
+      { ...result, facetBackfill },
+      { status: notOk.length > 0 || facetBackfillFailed ? 207 : 200 },
+    );
   } catch (err) {
     console.error(
       "GET /api/cron/sync-jobs failed:",

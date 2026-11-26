@@ -11,6 +11,7 @@ import {
   toDescriptionBlocks,
 } from "@/lib/client/jobsBoard";
 import {
+  JobFieldBadge,
   JobLevelBadge,
   JobSourceBadge,
   OwnPostingBadge,
@@ -32,7 +33,7 @@ export function BackToJobsLink() {
   return (
     <Link
       href="/jobs"
-      className="inline-flex items-center gap-1.5 rounded text-sm font-medium text-fg-muted transition-colors hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+      className="inline-flex min-h-11 items-center gap-1.5 rounded text-sm font-medium text-fg-muted transition-colors hover:text-fg sm:min-h-0 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
     >
       <ArrowLeftIcon className="h-4 w-4" />
       All jobs
@@ -67,6 +68,7 @@ export function JobDetailHeader({ job }: { job: JobDescription }) {
       )}
       <div className="mt-3 flex flex-wrap items-center gap-2">
         {job.level && <JobLevelBadge level={job.level} />}
+        <JobFieldBadge category={job.job_category} />
         <JobSourceBadge source={job.source} />
         {job.is_own && <OwnPostingBadge />}
       </div>
@@ -86,8 +88,9 @@ function Fact({ term, children }: { term: string; children: ReactNode }) {
 }
 
 /**
- * Key facts and actions: posted date, level, location, source (with the
- * attribution link-back The Muse's terms require, docs/ARCHITECTURE.md §7.1),
+ * Key facts and actions: posted date, level, location, source (plain label
+ * for employer postings and community submissions, docs/ARCHITECTURE.md
+ * §7.7.9; an attribution link-back only for legacy The Muse rows, §7.1),
  * an "apply / view original" link to `source_url`, and, when the caller has
  * an analyzed resume, a jump to the match section.
  *
@@ -141,7 +144,7 @@ export function JobKeyFacts({
               href={source.attribution.href}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 rounded underline underline-offset-4 hover:text-fg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              className="inline-flex min-h-11 items-center gap-1 rounded underline underline-offset-4 hover:text-fg-muted sm:min-h-0 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             >
               {source.attribution.text}
               <ExternalLinkIcon className="h-3.5 w-3.5" />
@@ -268,7 +271,7 @@ export function JobDetailErrorState({ id }: { id: string }) {
         </p>
         <a
           href={`/jobs/${encodeURIComponent(id)}`}
-          className="mt-4 inline-flex items-center justify-center rounded-md border border-danger-border bg-surface px-4 py-2 text-sm font-medium text-danger-fg shadow-sm transition-colors hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          className="mt-4 inline-flex min-h-11 items-center justify-center rounded-md border border-danger-border bg-surface px-4 py-2 text-sm sm:min-h-0 font-medium text-danger-fg shadow-sm transition-colors hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           Try again
         </a>

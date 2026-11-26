@@ -6,7 +6,7 @@ export default function JobNotFound() {
   return (
     <div className="mx-auto w-full max-w-5xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
       <BackToJobsLink />
-      <div className="mt-6 rounded-lg border border-dashed border-border-strong bg-surface px-6 py-12 text-center">
+      <div className="mt-6 rounded-lg border border-dashed border-border-strong bg-surface px-4 py-10 text-center sm:px-6 sm:py-12">
         <h1 className="text-lg font-semibold text-fg">
           This job isn&apos;t available
         </h1>

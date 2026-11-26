@@ -350,7 +350,8 @@ Depends on: M1.2.
    `search_job_descriptions` v2, `job_sources`/`job_source_boards`/`job_source_runs`
    with the seed, `enqueue_source_syncs`, `expire_stale_job_descriptions`,
    `resolve_job_duplicates`, and the ingest/expiry cron jobs.
-2. [BE] `lib/jobs/sources/{types,registry,themuse}.ts`, `html.ts`, `normalize.ts`,
+2. [BE] `lib/jobs/sources/{types,registry}.ts`, refactoring §7.7's existing
+   `greenhouse.ts`/`lever.ts`/`html.ts`/`studentFilter.ts` behind the adapter interface, `normalize.ts`,
    `studentFilter.ts`, and a generic `sync.ts`. Handler `ingest.sync_source` with
    continuation cursors. Handler `maintenance.backfill_job_keys`.
 3. [BE] Switch `POST/PATCH/DELETE /api/job-descriptions` to the RPCs (visibility
@@ -359,7 +360,8 @@ Depends on: M1.2.
    `vercel.json` cron entry.
 
 **Acceptance:**
-- A daily run via pg_cron enqueues and completes the Muse sync.
+- A daily run via pg_cron enqueues and completes the Greenhouse/Lever board syncs
+  (the Muse was dropped 2026-11-20, ARCHITECTURE §7.7; no Muse adapter).
 - Existing rows are backfilled (`dedupe_key`, `expires_at`, `content_hash`).
 - Expired rows disappear from browse and search but resolve by id.
 - Direct PostgREST insert/update on `job_descriptions` as an authenticated user is
@@ -379,7 +381,7 @@ Greenhouse/Lever board list needs the user's approval (Q4).
 
 **Acceptance:**
 - One full daily cycle ingests from all enabled sources.
-- A listing present on both the Muse and Greenhouse appears once, canonical =
+- A listing present on both USAJOBS and Greenhouse appears once, canonical =
   Greenhouse.
 - A Greenhouse job removed from its board is closed on the next successful sync, but
   not after a failed one.
@@ -393,7 +395,8 @@ Implements §13.13.4 (display), §13.6.5/13.6.7 (badges/attribution). Depends on
    their visibility and state.
 
 **Acceptance:**
-- Muse link-back is preserved.
+- Muse link-back is preserved on the legacy Muse rows. Greenhouse/Lever rows keep the
+  §7.7.9 "Employer posting" framing.
 - Closed and soft-deleted states are visually distinct.
 - No hardcoded colors.
 
@@ -428,12 +431,12 @@ the orchestrator.
 ## Phase 2 — Structure
 
 ### M2.1 Skills and role-family taxonomy [BE]
-Implements §13.3.4, §13.7. Depends on: M1.5, for **migration ordering only** (0011
+Implements §13.3.4, §13.7. Depends on: M1.5, for **migration ordering only** (0013
 must apply after 0009). Authoring the JSON data (task 1) can start any time,
 including during Phase 1.
 1. [BE] Author `data/taxonomy/skills.json` (~400 skills, ~1,200 aliases, covering
    non-tech fields too) and `role-families.json` (~35).
-2. [BE] `scripts/taxonomy/build-seed.ts` generates `0012`. Migration `0011_taxonomy.sql`.
+2. [BE] `scripts/taxonomy/build-seed.ts` generates `0014`. Migration `0013_taxonomy.sql`. `role-families.json`'s `group_slug` values must be §7.8.3 field slugs (unit test against `JOB_CATEGORY_SLUGS`).
 3. [BE] `lib/taxonomy/normalize.ts` and `vocabulary.ts` (prompt rendering, cached).
    Add `GET /api/taxonomy/role-families`.
 
@@ -446,7 +449,7 @@ including during Phase 1.
 ### M2.2 Job requirement extraction (batch + sync) [BE]
 Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.5.4(2),
 13.6.6 (batch/poll/sync), 13.7.3. Depends on: M2.1, M1.5, M1.1, M1.1b.
-1. [BE] Migration `0014_job_requirements.sql`, including the user-listing extraction
+1. [BE] Migration `0016_job_requirements.sql`, including the user-listing extraction
    trigger.
 2. [BE] `lib/claude/tasks/extractJobRequirements.ts` (schema, prompt with
    vocabulary, validate) and `lib/claude/batches.ts`.
@@ -463,7 +466,7 @@ Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.
 4. [BE] Batch item outcomes and refusals (§13.5.3 "Per-item outcome" and "Batch
    refusals", 2026-11-12):
    - Batch requests send no `betas` and no `fallbacks`.
-   - The `claude_batch_items.error_code` check constraint in 0014, and the poll
+   - The `claude_batch_items.error_code` check constraint in 0016, and the poll
      handler's outcome → `error_code` mapping.
    - The `jobs.retry_refused_requirement` kind (§13.4.3 registry row): its no-op
      guards, the ingest-budget snooze, a sync `runExtractJobRequirements`, and
@@ -496,7 +499,7 @@ Implements §13.3.6, 13.5.3 (batch path, per-item outcomes, batch refusals), 13.
 
 ### M2.3 Resume profile extraction [BE]
 Implements §13.3.5, 13.5.4(1), 13.10.3. Depends on: M2.1, M1.2, M1.1.
-1. [BE] Migration `0013_resume_profiles.sql`.
+1. [BE] Migration `0015_resume_profiles.sql`.
 2. [BE] `lib/claude/tasks/extractResumeProfile.ts` with evidence-quote validation.
    Replace `extractResumeProfile`'s `null` in `OUTPUT_SCHEMAS` with its schema and
    add its wire snapshot (§13.5.2 enum decision, item 6: `null` means "not
@@ -512,7 +515,7 @@ Implements §13.3.5, 13.5.4(1), 13.10.3. Depends on: M2.1, M1.2, M1.1.
 
 ### M2.4 Embeddings ⛔ Q1 [BE]
 Implements §13.3.7, 13.8.1, 13.8.2. Depends on: M2.2, M2.3, and the Q1 decision.
-1. [BE] Migration `0015_embeddings.sql`: extension, tables, the HNSW index, the
+1. [BE] Migration `0017_embeddings.sql`: extension, tables, the HNSW index, the
    inactive-listing trigger, and `match_candidates` (service-only, explicit owner
    predicate).
 2. [BE] `lib/embeddings/{provider,voyage,text,usage}.ts`. Handlers `jobs.embed_pending`
@@ -556,7 +559,7 @@ Depends on: M2.1–M2.4.
 ### M3.1 Reports schema and pipeline orchestration [BE]
 Implements §13.3.8, 13.10, 13.13.1 (upload change), 13.13.2 (GET/retry). Depends on:
 M2.3, M2.4.
-1. [BE] Migration `0016_reports.sql`: tables (`resume_critiques` already exists from
+1. [BE] Migration `0018_reports.sql`: tables (`resume_critiques` already exists from
    0010; only add its `report_id` → `resume_reports` cascade and `profile_id` →
    `resume_profiles` set-null FKs, §13.20.2), `matches` v2 columns, the RPCs
    `request_resume_report`, `request_fit_check`, `retry_report`, and the refund logic
@@ -713,7 +716,7 @@ Depends on: M3.7.
 ### M4.1 Market statistics [BE]
 Implements §13.3.9, 13.9.1, 13.13.6, 13.8.5 (narration inputs). Depends on: M2.2,
 M3.4.
-1. [BE] Migration `0017_market_stats.sql` with the MVs, the refresh function, and
+1. [BE] Migration `0019_market_stats.sql` with the MVs, the refresh function, and
    `get_role_market_stats`. Add the `market.refresh_stats` handler and schedule it.
 2. [BE] `GET /api/market/roles/:slug`. `resume.narrate_roles` now builds
    `market_snapshot` (level-bucket fallback, `MARKET_MIN_SAMPLE`).
@@ -750,7 +753,7 @@ Implements §13.2.1(2), 13.11.1, 13.13.4. Depends on: M1.5, M3.5.
 ### M4.4 URL import with SSRF protection [BE]
 Implements §13.3.10, 13.11.2, 13.11.3. Depends on: M4.3. Deny-list ⛔ Q5 (default
 per §13.11.2 until answered).
-1. [BE] Migration `0018_listing_imports.sql` and `request_url_import`.
+1. [BE] Migration `0020_listing_imports.sql` and `request_url_import`.
 2. [BE] `lib/net/{ipPolicy,safeFetch,extractListingText}.ts` (new deps listed in
    §13.11.3). Handler `import.fetch_listing` (fetch → extract → requirements →
    create listing → optional fit check).
@@ -787,7 +790,7 @@ Depends on: M4.1–M4.5.
 ### M5.1 Email provider and weekly digest ⛔ Q6 [BE]
 Implements §13.3.11 (prefs/digest_runs), 13.12.1, 13.13.7 (notifications/unsubscribe).
 Depends on: M3.3 and the Q6 decision.
-1. [BE] Migration `0019_digests_and_revisions.sql` (the digest parts and the weekly
+1. [BE] Migration `0021_digests_and_revisions.sql` (the digest parts and the weekly
    cron).
 2. [BE] `lib/email/{provider,resend}.ts` and the template. Handlers `digest.plan` and
    `digest.send_user` (idempotency key, record before send).
@@ -802,7 +805,7 @@ Depends on: M3.3 and the Q6 decision.
 
 ### M5.2 Resume revisions and comparison [BE]
 Implements §13.3.11 (`previous_resume_id`), 13.12.2, 13.13.2 (compare). Depends on:
-M3.2, M3.4. The migration part shares 0019 with M5.1; if M5.1 hasn't landed, put it
+M3.2, M3.4. The migration part shares 0021 with M5.1; if M5.1 hasn't landed, put it
 in its own next-numbered migration.
 1. [BE] `previous_resume_id` and its trigger. Upload accepts the field. Add
    `GET /api/reports/compare`.

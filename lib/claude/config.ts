@@ -9,10 +9,9 @@
  * Opus 5.5 constraints this table relies on: no sampling parameters, no
  * forced tool choice, and no assistant prefill. Thinking can't
  * be disabled, so depth is controlled only by `effort`. Every `maxTokens`
- * here is <= 20 000, which stays under the SDK's non-streaming size guard
- * (it throws above ~21 333 tokens when no explicit timeout is passed). We
- * also always pass an explicit `timeout`, which bypasses that estimate
- * entirely. See the "Verified" note in §13.5.2.
+ * here is <= 20 000. `callStructured` streams (§13.5.2), so the SDK's
+ * non-streaming size guard doesn't apply to sync calls; the cap is kept as a
+ * cost/latency bound. See the "Verified" note in §13.5.2.
  */
 
 import type { ReservedTagWord } from "@/lib/claude/promptEscaping";
@@ -36,12 +35,14 @@ export const CLAUDE_DEFAULT_MODEL = "claude-opus-5-5";
  *   fired). On expiry the call fails as `ClaudeApiError` (`ai_unavailable`),
  *   which the route turns into a JSON 502 and marks the resume `failed`. The
  *   remaining 30 s of `maxDuration` cover the DB writes after it.
- * - `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` (120 s): the per-request SDK timeout for
- *   the v1 tasks. Two complete attempts (an invalid output, then the single
+ * - `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` (120 s): the per-attempt bound for the v1
+ *   tasks (SDK retries and the whole stream included; `callStructured`
+ *   enforces it). Two complete attempts (an invalid output, then the single
  *   retry) take at most 240 s, so the common failure path finishes inside the
- *   deadline. Live calls took 5-9 s, so 120 s is ample headroom. Only the
- *   pathological path (a timeout, then the SDK's timeout retry, then more)
- *   reaches the deadline, and that ends as a clean 502.
+ *   deadline. Live calls took 5-9 s, so 120 s is ample headroom. The
+ *   pathological path is now a slow first attempt followed by the
+ *   invalid-output retry being cut off by the 270 s deadline, which ends as a
+ *   clean 502.
  */
 export const SYNC_ROUTE_CLAUDE_DEADLINE_MS = 270_000;
 export const SYNC_ROUTE_ATTEMPT_TIMEOUT_MS = 120_000;
@@ -68,7 +69,11 @@ export type ClaudeTaskConfig = {
   readonly model: string;
   readonly effort: ClaudeEffort;
   readonly maxTokens: number;
-  /** Per-request timeout passed to the SDK (also bypasses its non-streaming guard). */
+  /**
+   * Bound on one `callStructured` attempt. Passed to the SDK (which applies it
+   * to the wait for response headers) and enforced by `callStructured` over
+   * the whole streamed response.
+   */
   readonly timeoutMs: number;
   readonly mode: ClaudeTaskMode;
   /** Persisted alongside outputs so prompt regressions can be traced in data. */

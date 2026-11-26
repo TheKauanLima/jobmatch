@@ -78,7 +78,7 @@ export function DeleteJobDescriptionButton({
         type="button"
         onClick={handleDelete}
         disabled={deleting}
-        className="shrink-0 rounded-md border border-danger-border px-3 py-1.5 text-sm font-medium text-danger-fg transition-colors hover:bg-danger-bg disabled:cursor-not-allowed disabled:opacity-60"
+        className="inline-flex min-h-11 shrink-0 items-center rounded-md border border-danger-border px-3 py-1.5 text-sm font-medium sm:min-h-0 text-danger-fg transition-colors hover:bg-danger-bg disabled:cursor-not-allowed disabled:opacity-60"
       >
         {deleting ? "Removing…" : "Remove posting"}
       </button>

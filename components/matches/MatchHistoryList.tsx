@@ -109,6 +109,7 @@ export function MatchHistoryList({
                 <div className="flex min-w-0 items-center gap-2">
                   <Link
                     href={`/jobs/${match.job_description.id}`}
+                    title={match.job_description.title}
                     className="truncate text-sm font-medium text-fg hover:underline"
                   >
                     {match.job_description.title}
@@ -122,7 +123,8 @@ export function MatchHistoryList({
                 )}
                 <Link
                   href={`/resumes/${match.resume.id}`}
-                  className="truncate text-xs text-fg-subtle hover:text-fg-muted hover:underline"
+                  title={match.resume.file_name}
+                  className="block truncate text-xs text-fg-subtle hover:text-fg-muted hover:underline"
                 >
                   {match.resume.file_name}
                 </Link>

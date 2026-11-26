@@ -53,7 +53,7 @@ export function LineFeedbackList({ items }: LineFeedbackListProps) {
           aria-expanded={expanded}
           aria-controls={listId}
           onClick={() => setExpanded((value) => !value)}
-          className="self-start rounded-md text-sm font-medium text-fg underline underline-offset-4 hover:text-fg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          className="inline-flex min-h-11 items-center self-start rounded-md text-sm font-medium sm:min-h-0 text-fg underline underline-offset-4 hover:text-fg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           {expanded ? "Show fewer" : `Show all ${items.length} suggestions`}
         </button>

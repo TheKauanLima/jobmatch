@@ -70,7 +70,7 @@ export function DashboardView({ data }: DashboardViewProps) {
                 <li key={link.href}>
                   <Link
                     href={link.href}
-                    className="-mx-2 flex items-center justify-between rounded-md px-2 py-2 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                    className="-mx-2 flex min-h-11 items-center justify-between rounded-md px-2 py-2 text-sm sm:min-h-0 text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
                   >
                     {link.label}
                     <span aria-hidden="true">&rarr;</span>

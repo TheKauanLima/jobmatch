@@ -86,7 +86,7 @@ export function LineFeedbackItem({ item }: LineFeedbackItemProps) {
             type="button"
             onClick={handleCopy}
             aria-describedby={`${rewriteId}-label`}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border-strong bg-surface px-2.5 py-1 text-xs font-medium text-fg transition-colors hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-border-strong bg-surface px-3 py-1 text-xs font-medium sm:min-h-0 sm:px-2.5 text-fg transition-colors hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             <svg aria-hidden="true" viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
               <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />

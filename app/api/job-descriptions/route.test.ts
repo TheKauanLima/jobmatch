@@ -56,6 +56,11 @@ const row = {
   level: null,
   location: null,
   posted_at: null,
+  deleted_at: null,
+  job_category: null,
+  location_states: [],
+  is_remote: false,
+  listed_at: "2026-01-01T00:00:00.000Z",
 };
 
 function makeRequest(url: string, init?: RequestInit) {
@@ -88,14 +93,14 @@ describe("GET /api/job-descriptions", () => {
     expect(body.next_cursor).toBeNull();
   });
 
-  it("returns next_cursor as the encoded (created_at, id) cursor of the last item when hasMore is true", async () => {
+  it("returns next_cursor as the encoded (listed_at, id) cursor of the last item when hasMore is true", async () => {
     mockRequireSession.mockResolvedValue({ user: fakeUser });
     mockListJobDescriptions.mockResolvedValue({ items: [row], hasMore: true });
 
     const res = await GET(makeRequest("http://localhost/api/job-descriptions"));
     const body = await res.json();
 
-    expect(body.next_cursor).toBe(`${row.created_at}_${row.id}`);
+    expect(body.next_cursor).toBe(`${row.listed_at}_${row.id}`);
   });
 
   it("passes limit and cursor query params through to the query layer", async () => {
@@ -112,6 +117,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 5,
       cursor: "2026-01-01T00:00:00.000Z",
       level: null,
+      category: null,
+      location: null,
     });
   });
 
@@ -127,6 +134,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 20,
       cursor: null,
       level: "Internship",
+      category: null,
+      location: null,
     });
   });
 
@@ -140,6 +149,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 20,
       cursor: null,
       level: null,
+      category: null,
+      location: null,
     });
   });
 
@@ -195,6 +206,8 @@ describe("GET /api/job-descriptions", () => {
       limit: 100,
       cursor: null,
       level: null,
+      category: null,
+      location: null,
     });
   });
 
@@ -223,6 +236,9 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       offset: 0,
       level: null,
+      sort: "relevance",
+      category: null,
+      location: null,
     });
     expect(mockListJobDescriptions).not.toHaveBeenCalled();
     expect(body.job_descriptions).toHaveLength(1);
@@ -244,6 +260,9 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       offset: 0,
       level: "Internship",
+      sort: "relevance",
+      category: null,
+      location: null,
     });
   });
 
@@ -287,6 +306,8 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       cursor: null,
       level: null,
+      category: null,
+      location: null,
     });
   });
 
@@ -387,6 +408,8 @@ describe("GET /api/job-descriptions with ?q= (search mode, per docs/ARCHITECTURE
       limit: 20,
       cursor: "offset_40",
       level: null,
+      category: null,
+      location: null,
     });
   });
 

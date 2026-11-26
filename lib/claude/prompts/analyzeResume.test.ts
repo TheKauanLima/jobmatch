@@ -82,20 +82,19 @@ describe("buildAnalyzeResumeRequest", () => {
 
 // ---------------------------------------------------------------------------
 
-let create: ReturnType<typeof vi.fn>;
+let streamCall: ReturnType<typeof vi.fn>;
 
 function reply(payload: unknown, overrides: Record<string, unknown> = {}) {
-  create.mockReturnValueOnce({
-    withResponse: async () => ({
-      data: {
-        model: "claude-opus-5-5",
-        stop_reason: "end_turn",
-        stop_details: null,
-        content: [{ type: "text", text: JSON.stringify(payload) }],
-        usage: { input_tokens: 10, output_tokens: 10 },
-        ...overrides,
-      },
-      request_id: "req_a",
+  streamCall.mockReturnValueOnce({
+    request_id: "req_a",
+    abort: () => {},
+    finalMessage: async () => ({
+      model: "claude-opus-5-5",
+      stop_reason: "end_turn",
+      stop_details: null,
+      content: [{ type: "text", text: JSON.stringify(payload) }],
+      usage: { input_tokens: 10, output_tokens: 10 },
+      ...overrides,
     }),
   });
 }
@@ -108,8 +107,8 @@ const validAnalysis = {
 };
 
 beforeEach(() => {
-  create = vi.fn();
-  __setClaudeClientForTests({ beta: { messages: { create } } } as unknown as Anthropic);
+  streamCall = vi.fn();
+  __setClaudeClientForTests({ beta: { messages: { stream: streamCall } } } as unknown as Anthropic);
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -133,7 +132,7 @@ describe("analyzeResume (run)", () => {
     expect(out.dropped).toBe(1);
     expect(out.model).toBe("claude-opus-5-5");
     expect(out.requestId).toBe("req_a");
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
   });
 
   it("passes the user id into the usage event", async () => {
@@ -152,7 +151,7 @@ describe("analyzeResume (run)", () => {
     await expect(analyzeResume("resume", { userId: null })).resolves.toMatchObject({
       value: { summary: "Solid." },
     });
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("gives up after two invalid outputs", async () => {
@@ -161,7 +160,7 @@ describe("analyzeResume (run)", () => {
     await expect(analyzeResume("resume", { userId: null })).rejects.toBeInstanceOf(
       ClaudeInvalidOutputError,
     );
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("a max_tokens stop makes exactly one API call (truncation is not retried)", async () => {
@@ -169,7 +168,7 @@ describe("analyzeResume (run)", () => {
     await expect(analyzeResume("resume", { userId: null })).rejects.toBeInstanceOf(
       ClaudeTruncatedError,
     );
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
   });
 
   it("an expired deadline (ctx.signal) fails fast as ClaudeApiError without calling the API", async () => {
@@ -180,14 +179,14 @@ describe("analyzeResume (run)", () => {
     );
     expect(err).toBeInstanceOf(ClaudeApiError);
     expect(err).toMatchObject({ code: "ai_unavailable" });
-    expect(create).not.toHaveBeenCalled();
+    expect(streamCall).not.toHaveBeenCalled();
   });
 
   it("forwards ctx.signal to the SDK request", async () => {
     reply(validAnalysis);
     const signal = new AbortController().signal;
     await analyzeResume("resume", { userId: null, signal });
-    expect(create).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ signal }));
+    expect(streamCall).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ signal }));
   });
 
   it("does not retry a refusal", async () => {
@@ -195,6 +194,6 @@ describe("analyzeResume (run)", () => {
     await expect(analyzeResume("resume", { userId: null })).rejects.toBeInstanceOf(
       ClaudeRefusalError,
     );
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
   });
 });

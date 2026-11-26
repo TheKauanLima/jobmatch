@@ -94,7 +94,7 @@ export function ResumeUploadForm() {
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-6"
+      className="flex flex-col gap-3 rounded-lg border border-border bg-surface shadow-sm p-4 sm:p-6"
     >
       <div>
         <h2 className="text-base font-semibold text-fg">
@@ -121,10 +121,10 @@ export function ResumeUploadForm() {
           accept={ACCEPT_ATTR}
           onChange={handleFileChange}
           disabled={uploading}
-          className="rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg file:mr-3 file:rounded-md file:border-0 file:bg-neutral-bg file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-neutral-fg hover:file:bg-border-strong disabled:cursor-not-allowed disabled:opacity-60"
+          className="w-full min-w-0 rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-fg file:mr-3 file:rounded-md file:border-0 file:bg-neutral-bg file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-neutral-fg hover:file:bg-border-strong disabled:cursor-not-allowed disabled:opacity-60"
         />
         {fileName && (
-          <p className="text-xs text-fg-subtle">Selected: {fileName}</p>
+          <p className="break-all text-xs text-fg-subtle">Selected: {fileName}</p>
         )}
       </div>
 

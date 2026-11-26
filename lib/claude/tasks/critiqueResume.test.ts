@@ -420,27 +420,26 @@ describe("countBulletLikeLines", () => {
 
 // ---------------------------------------------------------------------------
 
-let create: ReturnType<typeof vi.fn>;
+let streamCall: ReturnType<typeof vi.fn>;
 
 function reply(payload: unknown, overrides: Record<string, unknown> = {}) {
-  create.mockReturnValueOnce({
-    withResponse: async () => ({
-      data: {
-        model: "claude-opus-5-5",
-        stop_reason: "end_turn",
-        stop_details: null,
-        content: [{ type: "text", text: JSON.stringify(payload) }],
-        usage: { input_tokens: 5000, output_tokens: 9000 },
-        ...overrides,
-      },
-      request_id: "req_c",
+  streamCall.mockReturnValueOnce({
+    request_id: "req_c",
+    abort: () => {},
+    finalMessage: async () => ({
+      model: "claude-opus-5-5",
+      stop_reason: "end_turn",
+      stop_details: null,
+      content: [{ type: "text", text: JSON.stringify(payload) }],
+      usage: { input_tokens: 5000, output_tokens: 9000 },
+      ...overrides,
     }),
   });
 }
 
 beforeEach(() => {
-  create = vi.fn();
-  __setClaudeClientForTests({ beta: { messages: { create } } } as unknown as Anthropic);
+  streamCall = vi.fn();
+  __setClaudeClientForTests({ beta: { messages: { stream: streamCall } } } as unknown as Anthropic);
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -464,8 +463,8 @@ describe("runCritiqueResume", () => {
     expect(out.requestId).toBe("req_c");
     expect(out.dropped).toBe(0);
     expect(out.usage.costUsd).toBeCloseTo(5000 * 4e-6 + 9000 * 20e-6, 6);
-    expect(create).toHaveBeenCalledTimes(1);
-    const [params, options] = create.mock.calls[0];
+    expect(streamCall).toHaveBeenCalledTimes(1);
+    const [params, options] = streamCall.mock.calls[0];
     expect(params.model).toBe("claude-opus-5-5");
     expect(options).toMatchObject({ timeout: 190_000 });
   });
@@ -488,7 +487,7 @@ describe("runCritiqueResume", () => {
     await expect(
       runCritiqueResume({ resumeText: UNICODE_RESUME, sourceText: UNICODE_RESUME }, { userId: null }),
     ).resolves.toMatchObject({ value: { overall_score: 71 } });
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("gives up after two invalid outputs", async () => {
@@ -497,7 +496,7 @@ describe("runCritiqueResume", () => {
     await expect(
       runCritiqueResume({ resumeText: UNICODE_RESUME, sourceText: UNICODE_RESUME }, { userId: null }),
     ).rejects.toBeInstanceOf(ClaudeInvalidOutputError);
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry a refusal or a truncation", async () => {
@@ -509,7 +508,7 @@ describe("runCritiqueResume", () => {
     await expect(
       runCritiqueResume({ resumeText: "r", sourceText: "r" }, { userId: null }),
     ).rejects.toBeInstanceOf(ClaudeTruncatedError);
-    expect(create).toHaveBeenCalledTimes(2);
+    expect(streamCall).toHaveBeenCalledTimes(2);
   });
 
   it("an expired deadline fails fast as ai_unavailable without calling the API", async () => {
@@ -521,7 +520,7 @@ describe("runCritiqueResume", () => {
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ClaudeApiError);
     expect(err).toMatchObject({ code: "ai_unavailable" });
-    expect(create).not.toHaveBeenCalled();
+    expect(streamCall).not.toHaveBeenCalled();
   });
 
   it("logs the drop count without any resume or response text", async () => {

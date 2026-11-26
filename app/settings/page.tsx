@@ -22,20 +22,20 @@ export default async function SettingsPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
+    <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-12">
       <h1 className="text-2xl font-semibold tracking-tight text-fg">
         Settings
       </h1>
       {session.user.email && (
         <p className="mt-2 text-sm text-fg-muted">
           Signed in as{" "}
-          <span className="font-medium text-fg">{session.user.email}</span>
+          <span className="break-all font-medium text-fg">{session.user.email}</span>
         </p>
       )}
 
       <section
         aria-labelledby="usage-limits-heading"
-        className="mt-8 rounded-lg border border-border bg-surface p-6"
+        className="mt-8 rounded-lg border border-border bg-surface p-4 sm:p-6"
       >
         <h2
           id="usage-limits-heading"
@@ -54,7 +54,7 @@ export default async function SettingsPage() {
 
       <section
         aria-labelledby="delete-account-heading"
-        className="mt-8 rounded-lg border border-danger-border bg-surface p-6"
+        className="mt-8 rounded-lg border border-danger-border bg-surface p-4 sm:p-6"
       >
         <h2
           id="delete-account-heading"

@@ -5,8 +5,8 @@ import type { Database } from "@/types/database";
 /**
  * Service-role Supabase client — bypasses Row Level Security entirely.
  * Server-only, and only for trusted maintenance code with no per-request
- * user session to scope queries by (e.g. the external job-listing sync in
- * `lib/jobs/`, triggered by a cron route rather than a signed-in user). Per
+ * user session to scope queries by (e.g. the Greenhouse/Lever job-listing
+ * sync in `lib/jobs/sync.ts`, triggered by a cron route rather than a signed-in user). Per
  * docs/ARCHITECTURE.md §3, this must never be imported by a route handler
  * that echoes user-supplied filters — every caller of this client is
  * responsible for its own authorization check before using it (see

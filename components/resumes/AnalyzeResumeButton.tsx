@@ -68,7 +68,7 @@ export function AnalyzeResumeButton({
   }
 
   return (
-    <div className="flex flex-col items-end gap-1.5">
+    <div className="flex flex-col items-start gap-1.5 sm:items-end">
       <Button
         type="button"
         variant="secondary"
@@ -83,14 +83,14 @@ export function AnalyzeResumeButton({
             : "Analyze resume"}
       </Button>
       {analyzing && (
-        <p className="max-w-[16rem] text-right text-xs text-fg-subtle">
+        <p className="max-w-[16rem] text-xs text-fg-subtle sm:text-right">
           This can take up to a minute — the AI is reading your resume.
         </p>
       )}
       {error && (
         <p
           role="alert"
-          className="max-w-[16rem] text-right text-xs text-danger-fg"
+          className="max-w-[16rem] text-xs text-danger-fg sm:text-right"
         >
           {error}
         </p>

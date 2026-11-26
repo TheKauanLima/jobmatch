@@ -33,6 +33,7 @@ function job(overrides: Partial<JobDescription> = {}): JobDescription {
     posted_at: "2026-11-04T00:00:00.000Z",
     is_own: false,
     deleted_at: null,
+    job_category: null,
     ...overrides,
   };
 }
@@ -92,6 +93,41 @@ describe("JobKeyFacts", () => {
     expect(html).toContain("Not specified");
     expect(html).not.toContain('href="https://www.themuse.com"');
   });
+
+  it.each([
+    [
+      "greenhouse",
+      "Greenhouse",
+      "https://job-boards.greenhouse.io/fabrikam/jobs/4012345",
+      "job-boards.greenhouse.io",
+    ],
+    [
+      "lever",
+      "Lever",
+      "https://jobs.lever.co/fabrikam/0b1c2d3e-aaaa-bbbb-cccc-1234567890ab",
+      "jobs.lever.co",
+    ],
+  ] as const)(
+    "%s posting: plain 'Employer posting' source, no attribution link, apply on company site",
+    (source, provider, sourceUrl, host) => {
+      const html = renderToStaticMarkup(
+        <JobKeyFacts job={job({ source, source_url: sourceUrl })} canMatch={false} now={NOW} />,
+      );
+      expect(html).toContain("Employer posting");
+      expect(html).toContain(`From the company&#x27;s careers site (via ${provider})`);
+      // Exactly one outbound link (the apply link); no empty attribution anchor.
+      expect(html.match(/<a /g)).toHaveLength(1);
+      expect(html).toMatch(
+        new RegExp(
+          `<a href="${sourceUrl.replace(/[.?]/g, "\\$&")}" target="_blank" rel="noopener noreferrer"`,
+        ),
+      );
+      expect(html).toContain("Apply on company site");
+      expect(html).toContain(`Opens ${host} in a new tab`);
+      expect(html).not.toContain("The Muse");
+      expect(html).not.toContain("themuse.com");
+    },
+  );
 
   it("never turns an unsafe source_url into a link", () => {
     const html = renderToStaticMarkup(
@@ -159,6 +195,19 @@ describe("JobDetailView", () => {
     expect(html).toContain("stay private");
     expect(html).toContain("MATCH-SLOT");
     expect(html).not.toContain("Manage your posting");
+    // job_category null: no field tag.
+    expect(html).not.toContain("Field:");
+  });
+
+  it("shows the field tag in the header, except for 'other'", () => {
+    const withField = renderToStaticMarkup(
+      <JobDetailView job={job({ job_category: "data" })} canMatch={false} matchSection={null} now={NOW} />,
+    );
+    expect(withField).toContain("Field: </span>Data &amp; AI");
+    const other = renderToStaticMarkup(
+      <JobDetailView job={job({ job_category: "other" })} canMatch={false} matchSection={null} now={NOW} />,
+    );
+    expect(other).not.toContain("Field:");
   });
 
   it("removed posting: notice, no match section", () => {

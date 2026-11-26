@@ -124,7 +124,7 @@ export function Nav({ userEmail }: NavProps) {
         aria-expanded={menuOpen}
         aria-controls="mobile-nav-menu"
         onClick={() => setMenuOpen((open) => !open)}
-        className="inline-flex items-center justify-center rounded-md border border-border-strong p-2 text-fg-muted hover:bg-surface-hover sm:hidden"
+        className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-border-strong p-2 text-fg-muted hover:bg-surface-hover sm:hidden"
       >
         <svg
           aria-hidden="true"
@@ -153,7 +153,7 @@ export function Nav({ userEmail }: NavProps) {
       {menuOpen && (
         <div
           id="mobile-nav-menu"
-          className="absolute right-0 top-full z-10 mt-2 flex w-48 flex-col gap-1 rounded-md border border-border bg-surface p-2 shadow-lg sm:hidden"
+          className="absolute right-0 top-full z-20 mt-2 flex max-h-[calc(100dvh-5rem)] w-56 max-w-[calc(100vw-2rem)] flex-col overflow-y-auto gap-1 rounded-md border border-border bg-surface p-2 shadow-lg sm:hidden"
         >
           {navLinks.map((link) => {
             const isActive =
@@ -164,7 +164,7 @@ export function Nav({ userEmail }: NavProps) {
                 href={link.href}
                 onClick={() => setMenuOpen(false)}
                 aria-current={isActive ? "page" : undefined}
-                className={`rounded-md px-3 py-2 transition-colors hover:bg-surface-hover hover:text-fg ${
+                className={`rounded-md px-3 py-3 transition-colors hover:bg-surface-hover hover:text-fg ${
                   isActive ? "bg-surface-hover text-fg" : ""
                 }`}
               >
@@ -180,7 +180,7 @@ export function Nav({ userEmail }: NavProps) {
                 handleSignOut();
               }}
               disabled={signingOut}
-              className="rounded-md px-3 py-2 text-left hover:bg-surface-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-60"
+              className="rounded-md px-3 py-3 text-left hover:bg-surface-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-60"
             >
               {signingOut ? "Signing out…" : "Sign out"}
             </button>
@@ -188,7 +188,7 @@ export function Nav({ userEmail }: NavProps) {
             <Link
               href="/signup"
               onClick={() => setMenuOpen(false)}
-              className="rounded-md bg-accent px-3 py-2 text-center text-accent-fg hover:bg-accent-hover"
+              className="rounded-md bg-accent px-3 py-3 text-center text-accent-fg hover:bg-accent-hover"
             >
               Sign up
             </Link>
