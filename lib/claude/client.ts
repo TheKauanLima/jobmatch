@@ -20,7 +20,9 @@
  *     the request id from `stream.request_id`.
  *  3. Records usage (`recordUsage`) BEFORE looking at the result, so
  *     refused/truncated/invalid-but-billed calls are still counted. Priced by
- *     `response.model`.
+ *     `response.model`. A stream that fails after `message_start` records the
+ *     partial snapshot's usage with stop_reason `stream_failed`
+ *     (`recordPartialUsage`) before the classified error is thrown.
  *  4. Classifies `stop_reason`: `refusal` -> ClaudeRefusalError, `max_tokens`
  *     -> ClaudeTruncatedError, anything but `end_turn` ->
  *     ClaudeInvalidOutputError.
@@ -526,6 +528,91 @@ function raceAbort<R>(
 }
 
 /**
+ * `ai_usage_events.stop_reason` for a usage row recorded from a stream that
+ * failed after it started (§13.5.2 step 3). Not an API stop_reason, so it can't
+ * be confused with one. The column is free text, max 100 chars (0007).
+ */
+export const PARTIAL_USAGE_STOP_REASON = "stream_failed";
+
+/**
+ * Records usage for a streamed call that failed AFTER the stream started
+ * (§13.5.2 step 3): a dropped socket, an SSE `error` event, our whole-attempt
+ * timeout, or the caller's deadline. Tokens may already be billed by then.
+ *
+ * Source: `stream.currentMessage`, the SDK's in-progress snapshot. Verified in
+ * @anthropic-ai/sdk 1.8.0 (lib/BetaMessageStream.js): it is set on
+ * `message_start`, updated by `message_delta`, cleared only when the request
+ * ends successfully, and left alone by errors and `abort()`. So it is defined
+ * exactly when `message_start` arrived and the call didn't complete. No
+ * `message_start` (an HTTP error, a connection failure, an abort before the
+ * body) means no snapshot and nothing is recorded.
+ *
+ * Known under-count: the API sends cumulative `output_tokens` only in
+ * `message_start` (a small initial count) and `message_delta` (just before
+ * `message_stop`). A stream cut off mid-answer therefore records the full
+ * input/cache counts but only the initial output count. Recorded as-is: the
+ * row is marked with `PARTIAL_USAGE_STOP_REASON` so spend reporting knows it
+ * is a lower bound.
+ *
+ * Priced by the snapshot's `model`, which the SDK relabels to the serving
+ * model when a `fallback` block arrives (same rule as a complete response).
+ * Reads only `model` and `usage` from the snapshot, never its content.
+ *
+ * Never throws. The caller rethrows the classified error afterwards, and a
+ * failure here must not replace it, so any error is caught and logged as a
+ * fixed string.
+ */
+async function recordPartialUsage(
+  stream: { readonly currentMessage?: Anthropic.Beta.Messages.BetaMessage | undefined; readonly request_id?: string | null | undefined } | null,
+  args: Pick<CallStructuredArgs<unknown>, "task" | "usageContext">,
+  fallbackRequestId: string | null,
+): Promise<void> {
+  try {
+    const partial = stream?.currentMessage;
+    if (!partial?.usage) {
+      return;
+    }
+    const model =
+      typeof partial.model === "string" && partial.model.length > 0
+        ? partial.model
+        : getTaskConfig(args.task).model;
+    const usage = summarizeUsage(model, partial.usage);
+    const requestId = stream?.request_id ?? fallbackRequestId;
+    logCall(
+      {
+        task: args.task,
+        model,
+        stop_reason: PARTIAL_USAGE_STOP_REASON,
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cache_read_tokens: usage.cacheReadTokens,
+        cache_write_tokens: usage.cacheWriteTokens,
+        request_id: requestId,
+      },
+      "warn",
+    );
+    await recordUsage({
+      provider: "anthropic",
+      operation: args.task,
+      model,
+      isBatch: false,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      costUsd: usage.costUsd,
+      stopReason: PARTIAL_USAGE_STOP_REASON,
+      requestId,
+      userId: args.usageContext.userId,
+      taskId: args.usageContext.taskId,
+      taskAttempt: args.usageContext.taskAttempt,
+    });
+  } catch {
+    console.error("[claude] recording partial usage after a stream failure failed");
+  }
+}
+
+/**
  * The single choke point for synchronous Claude calls (§13.5.2). See the
  * module docstring for the exact behavior. Always resolves to a
  * schema-validated `value` or throws a `ClaudeApiError` subclass.
@@ -578,6 +665,9 @@ export async function callStructured<T>(
       },
       "warn",
     );
+    // Step 3 for a stream that failed after it started (tokens may be billed).
+    // Never throws, so it can't mask `classified`.
+    await recordPartialUsage(stream, args, classified.requestId);
     throw classified;
   }
 

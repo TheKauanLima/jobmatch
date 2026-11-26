@@ -19,6 +19,11 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database, JobDescriptionSource } from "@/types/database";
 import type { JobCategory } from "@/lib/jobs/categories";
 import type { UsStateCode } from "@/lib/jobs/usStates";
+import {
+  JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
+  JOB_DESCRIPTIONS_DEFAULT_LIMIT,
+  JOB_DESCRIPTIONS_MAX_LIMIT,
+} from "@/lib/jobs/listLimits";
 import { isInvalidInputSyntaxError } from "@/lib/supabase/postgresErrors";
 
 type Client = SupabaseClient<Database>;
@@ -33,21 +38,17 @@ export class JobDescriptionQueryError extends Error {
   }
 }
 
-/** Default/maximum page size for `listJobDescriptions`, per docs/ARCHITECTURE.md §2. */
-export const JOB_DESCRIPTIONS_DEFAULT_LIMIT = 20;
-export const JOB_DESCRIPTIONS_MAX_LIMIT = 100;
-
 /**
- * Maximum length (characters) accepted for `?q=` on
- * `GET /api/job-descriptions`, per docs/ARCHITECTURE.md §9.1/§9.3. A
- * query-param bound, same category as `JOB_DESCRIPTIONS_DEFAULT_LIMIT`/
- * `JOB_DESCRIPTIONS_MAX_LIMIT` above, not a POST-body field — so it lives
- * here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
- * `lib/validation/schemas.ts`. Since §7.8.6 the route validates its query
- * params with `jobDescriptionListQuerySchema`, which imports this and the
- * limit constants from here.
+ * Page-size and `?q=` bounds (docs/ARCHITECTURE.md §2/§9.1/§9.3). They live
+ * in the import-free `lib/jobs/listLimits.ts` so `lib/validation/schemas.ts`
+ * (imported by client components) doesn't pull this query module into the
+ * client bundle (§7.8.8). Re-exported here for existing callers.
  */
-export const JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH = 200;
+export {
+  JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH,
+  JOB_DESCRIPTIONS_DEFAULT_LIMIT,
+  JOB_DESCRIPTIONS_MAX_LIMIT,
+};
 
 /**
  * A decoded pagination cursor: the `(listed_at, id)` position of the last

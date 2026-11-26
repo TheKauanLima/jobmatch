@@ -23,7 +23,7 @@ export const CLAUDE_DEFAULT_MODEL = "claude-opus-5-5";
  * POST /api/matches, and the V1 POST /api/resumes/:id/critique, §13.20.4),
  * which export `maxDuration = 300`. The critique route uses the same 270 s
  * deadline, but its per-attempt timeout is the critiqueResume task's own
- * 190 s (see CLAUDE_TASKS), so a slow first attempt leaves no room for the
+ * 250 s (see CLAUDE_TASKS), so a slow first attempt leaves no room for the
  * invalid-output retry and ends as a refunded 502.
  *
  * - `SYNC_ROUTE_CLAUDE_DEADLINE_MS` (270 s): the route creates
@@ -99,7 +99,16 @@ export const CLAUDE_TASKS = {
     model: CLAUDE_DEFAULT_MODEL,
     effort: "high",
     maxTokens: 20_000,
-    timeoutMs: 190_000,
+    // 250 s (was 190 s until 2026-11-26), §13.20.3. Streamed output runs at
+    // about 100 tokens/s: a 16.7k-token call took 168 s, so a valid answer
+    // near the 20k cap needs ~200 s plus time to first token, which 190 s cut
+    // off (refunded 502, tokens still billed). Typical critiques (~4k tokens)
+    // take ~42 s and are unaffected. This timer bounds the whole attempt, SDK
+    // retries included (callStructured's raceAbort). It sits under the route's
+    // 270 s SYNC_ROUTE_CLAUDE_DEADLINE_MS, which still caps the whole Claude
+    // step (and wins when pre-Claude steps took > 20 s), leaving the 30 s of
+    // maxDuration 300 for the DB writes and refund.
+    timeoutMs: 250_000,
     mode: "sync",
     // V1 standalone critique (§13.20.3): no profile input. M3.2 adds
     // "candidate_profile" together with the critique-v2 prompt.

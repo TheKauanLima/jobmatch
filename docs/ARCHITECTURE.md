@@ -1860,8 +1860,9 @@ param is absent.
   parses `Object.fromEntries(url.searchParams)`.
   - On failure it returns `400 { error }` with the first issue's message, the same
     style as the POST route.
-  - `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` and the limit constants stay where they
-    are and are imported by the schema.
+  - `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH` and the limit constants are imported by
+    the schema. Since 2026-11-26 they live in `lib/jobs/listLimits.ts` (§7.8.8
+    follow-up, done).
 - **Without `q` (keyset mode):**
   - `listJobDescriptions` orders by `listed_at desc, id desc`.
   - The cursor is `<listed_at>_<id>`, the same string shape as before.
@@ -1970,7 +1971,12 @@ in `lib/client/jobsBoard.ts`.
   private listings, it would include the caller's own private rows in their counts.
   0009 should add `visibility = 'shared'` to the function (binding rule (c) in
   §13.3.0) if the facets must stay global.
-- **Client bundle hygiene.** `lib/validation/schemas.ts` imports
+- **Client bundle hygiene. Done 2026-11-26:** the constants are in
+  `lib/jobs/listLimits.ts` (no imports, enforced by `lib/jobs/listLimits.test.ts`).
+  `schemas.ts` and the query module both import from it, and the query module
+  re-exports them so existing callers and tests didn't change. The
+  `JOBS_SEARCH_MAX_LENGTH` sync test is unchanged. Original note:
+  `lib/validation/schemas.ts` imported
   `JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH`, `JOB_DESCRIPTIONS_DEFAULT_LIMIT`, and
   `JOB_DESCRIPTIONS_MAX_LIMIT` from `lib/supabase/queries/jobDescriptions.ts`. Since
   client code imports `schemas.ts`, that pulls the query module into the client
@@ -2202,6 +2208,15 @@ lives here rather than among the `JOB_DESCRIPTION_*_MAX_LENGTH` constants in
 `lib/validation/schemas.ts` (per §3's existing rule: `?level=`/`?limit=` are
 validated inline in the route handler today, not via a `zod` schema — `?q=`
 follows that same existing convention rather than introducing a new one).
+
+**Superseded (2026-11-26, §7.8.8 follow-up — done):** the three constants
+(`JOB_DESCRIPTION_SEARCH_QUERY_MAX_LENGTH`, `JOB_DESCRIPTIONS_DEFAULT_LIMIT`,
+`JOB_DESCRIPTIONS_MAX_LIMIT`) now live in the import-free
+`lib/jobs/listLimits.ts`. Both `lib/validation/schemas.ts` and
+`lib/supabase/queries/jobDescriptions.ts` import them from there; the query
+module re-exports them for existing callers. Reason: `schemas.ts` is imported by
+client components, so importing the query module put it in the client bundle.
+`lib/jobs/listLimits.test.ts` checks the file stays import-free.
 
 `types/database.ts` needs `search_vector` added to `job_descriptions`' `Row`
 type on the next hand-update (per its own regenerate-later TODO, §7.2).
@@ -4281,8 +4296,31 @@ Behavior, in order:
      `validateX`.
 3. Record usage (`recordUsage`) **before** inspecting the result, so failed-but-billed
    calls are counted. Price by `response.model`, not the requested model.
-   Mid-stream failures record no usage, so partially billed tokens aren't tracked
-   (follow-up: record `stream.currentMessage?.usage` on failure).
+   - **Mid-stream failures (done 2026-11-26).** When the streamed call fails after
+     the stream started (socket drop, SSE `error` event, our whole-attempt timeout, the
+     caller's deadline), `recordPartialUsage` records `stream.currentMessage.usage`
+     through the same `recordUsage`, then the classified error is thrown.
+     - Marker: `stop_reason = 'stream_failed'` (`PARTIAL_USAGE_STOP_REASON` in
+       `client.ts`). `ai_usage_events.stop_reason` is free text of at most 100 chars
+       (0007), so no migration is needed, and the value can't collide with an API
+       stop_reason.
+     - Priced by the snapshot's `model`. The SDK relabels it to the serving model when
+       a `fallback` block arrives, the same rule as a complete response.
+     - "Started" means `message_start` arrived. Verified on SDK 1.8.0
+       (`lib/BetaMessageStream.js`): `currentMessage` is set on `message_start`,
+       updated by `message_delta`, cleared only when the request ends successfully,
+       and untouched by errors and `abort()`. With no snapshot (HTTP error, connection
+       failure, abort before the body, deadline already passed), nothing is recorded.
+     - **Lower bound.** The API sends cumulative `output_tokens` only in
+       `message_start` (a small initial count) and in `message_delta` (just before
+       `message_stop`). A stream cut off mid-answer records full input/cache counts but
+       only the initial output count. Spend reports should read `stream_failed` rows
+       as lower bounds.
+     - Never masks the original error. A throw from the recording step is caught and
+       logged as a fixed string. Only `model` and `usage` are read from the snapshot,
+       never its content.
+     - Tests: `lib/claude/client.partialUsage.test.ts`, plus the real-SDK mid-stream
+       cases in `client.test.ts`.
 4. `stop_reason === 'refusal'` → `ClaudeRefusalError` (non-retryable).
    `'max_tokens'` → `ClaudeTruncatedError` (non-retryable). Anything other than
    `end_turn` → `ClaudeInvalidOutputError`.
@@ -4808,7 +4846,7 @@ reviewable change.
 | task | model (const) | effort | max_tokens | timeout | mode | prompt_version | untrusted inputs |
 |---|---|---|---|---|---|---|---|
 | `extractResumeProfile` | `CLAUDE_DEFAULT_MODEL` | `medium` | 16 000 | 160 s | sync | `profile-v1` | `resume_text` |
-| `critiqueResume` | default | `high` | 20 000 | 190 s | sync | `critique-v1` (V1 standalone, §13.20); M3.2 bumps to `critique-v2` | `resume_text` (V1); M3.2 adds `candidate_profile` |
+| `critiqueResume` | default | `high` | 20 000 | 250 s (190 s until 2026-11-26, §13.20.3) | sync | `critique-v1` (V1 standalone, §13.20); M3.2 bumps to `critique-v2` | `resume_text` (V1); M3.2 adds `candidate_profile` |
 | `extractJobRequirements` | default (**Q2 candidate for cheaper model**) | `low` | 8 000 | 140 s | **batch** for shared external; sync for user/private/imports/fit-check | `jobreq-v1` | `job_description_text` or `fetched_page_text` |
 | `rerankJobsForRole` | default | `medium` | 16 000 | 160 s | sync | `rerank-v1` | `candidate_profile`, `job_posting` ×≤5 |
 | `narrateRoleFit` | default | `medium` | 12 000 | 160 s | sync | `narrate-v1` | `candidate_profile`, `role_data` |
@@ -5809,7 +5847,11 @@ only where §13.20.4 says so (per-attempt timeout, budget gate, refunds).
   2. An attempt that timed out client-side at 120 s may still be billed by Anthropic
      even though no response, and so no usage, was received.
 
-  Both under-count; this is overshoot source 2 in §13.9.4.
+  Both under-count; this is overshoot source 2 in §13.9.4. Since 2026-11-26 both
+  gaps are narrower on the streaming path: if `message_start` had arrived when the
+  deadline, timeout, or a mid-stream error ended the attempt, its input/cache tokens
+  (and the initial output count) are recorded as a `stream_failed` row (§13.5.2
+  step 3). Output tokens generated after `message_start` are still not counted.
 - `POST /api/matches` becomes async (`202`) in M3.5, which removes its inline call;
   the analyze route is deleted in M3.9.
 
@@ -6698,11 +6740,27 @@ grant select on table public.resume_critiques to authenticated;
     `wrapUntrusted('resume_text', resumeText.slice(0, RESUME_PROMPT_MAX_CHARS))`.
   - No profile block.
 - **Config change:** `CLAUDE_TASKS.critiqueResume.untrustedInputs = ['resume_text']`.
-  Everything else stays as §13.5.3 (`high`, 20 000, 190 s, `critique-v1`). The 190 s
+  Everything else stays as §13.5.3 (`high`, 20 000, 250 s, `critique-v1`). The 250 s
   per-attempt timeout replaces `SYNC_ROUTE_ATTEMPT_TIMEOUT_MS` for this task, and the
   270 s overall signal still bounds the whole operation. A slow first attempt therefore
   leaves no room for the invalid-output retry. That case ends as a `502 ai_unavailable`
   that is **refunded**.
+- **Timeout raised from 190 s to 250 s (2026-11-26).**
+  - Why: streamed output runs at about 100 tokens/s. A 16.7k-output-token call took
+    168 s, so a valid answer near the 20 000 cap needs about 200 s plus time to first
+    token. 190 s cut those off as a refunded 502, but the tokens were still billed.
+    Typical critiques (about 4k tokens, about 42 s) are unaffected.
+  - Why it's safe:
+    - The per-attempt timer bounds the whole attempt, SDK retries included
+      (`raceAbort`, §13.5.2).
+    - The route's 270 s deadline signal is unchanged. It still caps the whole Claude
+      step, and it fires first when the steps before Claude took more than 20 s.
+    - So the ~30 s of `maxDuration = 300` left for the insert or refund (and, since
+      2026-11-26, the partial-usage row) is unchanged.
+  - Cost of the change: a call that is going to fail anyway now takes up to 60 s
+    longer before it returns 502.
+  - `assessJobFit` has the same effort and cap and keeps 190 s for now. It is a v2
+    worker task, not a sync route; revisit it when it ships.
 - **Validation** (§13.5.6 critique rows, all of them):
   - exactly one score per dimension, integers 0..100, else invalid;
   - drop items whose `original_text` can't be located;

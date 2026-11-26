@@ -18,6 +18,7 @@ import {
   CLAUDE_SDK_LOGGER,
   getClaudeClient,
   OTEL_CONTENT_MODE_ENV,
+  PARTIAL_USAGE_STOP_REASON,
   retryOnceOnInvalidOutput,
   SERVER_SIDE_FALLBACK_BETA,
 } from "@/lib/claude/client";
@@ -544,7 +545,7 @@ describe("callStructured — parsed output", () => {
   });
 });
 
-describe("callStructured — SDK error classification (no usage recorded: nothing billed)", () => {
+describe("callStructured — SDK error classification (no usage recorded: no message_start, so nothing to price)", () => {
   it("400 -> ClaudeBadRequestError (not retryable), message without upstream text", async () => {
     rejectWith(apiError(400, "invalid_request_error"));
     const err = await callStructured(baseArgs()).catch((e: unknown) => e);
@@ -882,7 +883,17 @@ describe("callStructured — real SDK stream (fake fetch)", () => {
     // The SDK wraps the body-read failure in a plain AnthropicError.
     expect((err as Error).cause).toBeInstanceOf(Anthropic.AnthropicError);
     expect((err as Error).cause).not.toBeInstanceOf(Anthropic.APIError);
-    expect(usageEvents).toHaveLength(0);
+    // message_start had arrived, so the partial snapshot's usage is recorded
+    // (§13.5.2 step 3): full input count, only the initial output count.
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      stopReason: PARTIAL_USAGE_STOP_REASON,
+      model: "claude-opus-5-5",
+      inputTokens: 100,
+      outputTokens: 1,
+      requestId: "req_drop",
+      userId: "user-1",
+    });
     expectNoContentLogged();
   });
 
@@ -949,7 +960,13 @@ describe("callStructured — real SDK stream (fake fetch)", () => {
     expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_abort" });
     expect((err as Error).message).toContain("aborted");
     expect(((fetchMock.mock.calls[0][1] as RequestInit).signal as AbortSignal).aborted).toBe(true);
-    expect(usageEvents).toHaveLength(0);
+    // The abort came after message_start: the partial usage is still recorded.
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      stopReason: PARTIAL_USAGE_STOP_REASON,
+      inputTokens: 100,
+      requestId: "req_abort",
+    });
   });
 
   it("HTTP errors before the stream starts keep their classes (400 bad request; network failure retryable)", async () => {
