@@ -15,6 +15,7 @@ import {
   callStructured,
   classifySdkError,
   CLAUDE_SDK_LOG_LEVEL,
+  CLAUDE_SDK_LOGGER,
   getClaudeClient,
   OTEL_CONTENT_MODE_ENV,
   retryOnceOnInvalidOutput,
@@ -92,22 +93,136 @@ function message(overrides: Partial<FakeMessage> = {}): FakeMessage {
   };
 }
 
-let create: ReturnType<typeof vi.fn>;
-let usageEvents: UsageEvent[];
-let logLines: string[];
+/** One server-sent event, as the Messages streaming API frames it. */
+function sse(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
 
-function respondWith(msg: FakeMessage, requestId: string | null = "req_test") {
-  create.mockReturnValueOnce({
-    withResponse: async () => ({ data: msg, request_id: requestId }),
+/**
+ * The SSE event sequence the API would stream for `msg`: message_start (with
+ * the ORIGINAL model when a fallback fired, as the API does), each block as
+ * content_block_start (+ deltas for text/thinking, split in two to exercise
+ * accumulation), message_delta (stop_reason / stop_details / output tokens),
+ * message_stop.
+ */
+function sseEventsFor(msg: FakeMessage): string[] {
+  const fallback = msg.content.find((b) => b.type === "fallback") as
+    | { from: { model: string } }
+    | undefined;
+  const { output_tokens, ...startUsage } = msg.usage;
+  const events = [
+    sse("message_start", {
+      type: "message_start",
+      message: {
+        id: "msg_test",
+        type: "message",
+        role: "assistant",
+        model: fallback ? fallback.from.model : msg.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { ...startUsage, output_tokens: 1 },
+      },
+    }),
+    sse("ping", { type: "ping" }),
+  ];
+  msg.content.forEach((block, index) => {
+    if (block.type === "text") {
+      const text = String(block.text);
+      const mid = Math.floor(text.length / 2);
+      events.push(sse("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } }));
+      for (const part of [text.slice(0, mid), text.slice(mid)]) {
+        events.push(sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: part } }));
+      }
+    } else if (block.type === "thinking") {
+      events.push(sse("content_block_start", { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } }));
+      events.push(sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: String(block.thinking) } }));
+      events.push(sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: String(block.signature) } }));
+    } else {
+      events.push(sse("content_block_start", { type: "content_block_start", index, content_block: block }));
+    }
+    events.push(sse("content_block_stop", { type: "content_block_stop", index }));
+  });
+  events.push(
+    sse("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: msg.stop_reason, stop_sequence: null, stop_details: msg.stop_details ?? null },
+      usage: { output_tokens },
+    }),
+    sse("message_stop", { type: "message_stop" }),
+  );
+  return events;
+}
+
+type SseScript = {
+  events: string[];
+  requestId?: string;
+  /** After the events: "end" (default) closes the body, "hang" keeps it open, or an error to fail the body read with. */
+  then?: "end" | "hang" | Error;
+};
+
+/**
+ * A fetch that answers 200 text/event-stream with `script`. Like undici, an
+ * abort of the request signal errors the body with an AbortError.
+ */
+function sseFetch(script: SseScript): ReturnType<typeof vi.fn> {
+  return vi.fn(async (_url: unknown, init?: RequestInit) => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        init?.signal?.addEventListener("abort", () => {
+          try {
+            controller.error(new DOMException("This operation was aborted", "AbortError"));
+          } catch {
+            // already closed
+          }
+        });
+        for (const e of script.events) controller.enqueue(encoder.encode(e));
+        const then = script.then ?? "end";
+        if (then === "end") controller.close();
+        else if (then instanceof Error) setTimeout(() => controller.error(then), 0);
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "request-id": script.requestId ?? "req_sse_fake" },
+    });
   });
 }
 
+/**
+ * `streamCall` stands in for `client.beta.messages.stream`. It returns the
+ * subset of the SDK's `BetaMessageStream` that callStructured uses:
+ * `finalMessage()`, `request_id` (the `request-id` header; undefined until
+ * headers arrive) and `abort()`. The "real SDK stream" block below drives the
+ * actual SDK over a fake fetch instead, to pin the SDK behavior these fakes
+ * assume.
+ */
+let streamCall: ReturnType<typeof vi.fn>;
+let usageEvents: UsageEvent[];
+let logLines: string[];
+
+type FakeStream = {
+  request_id: string | null | undefined;
+  finalMessage: () => Promise<unknown>;
+  abort: ReturnType<typeof vi.fn>;
+};
+
+function fakeStream(finalMessage: () => Promise<unknown>, requestId?: string | null): FakeStream {
+  return { request_id: requestId, finalMessage, abort: vi.fn() };
+}
+
+function respondWith(msg: FakeMessage, requestId: string | null = "req_test") {
+  streamCall.mockReturnValueOnce(fakeStream(async () => msg, requestId));
+}
+
+/** An error before any response headers (so no stream request id). */
 function rejectWith(err: unknown) {
-  create.mockReturnValueOnce({
-    withResponse: async () => {
+  streamCall.mockReturnValueOnce(
+    fakeStream(async () => {
       throw err;
-    },
-  });
+    }),
+  );
 }
 
 function apiError(status: number, type = "api_error") {
@@ -120,8 +235,9 @@ function apiError(status: number, type = "api_error") {
 }
 
 beforeEach(() => {
-  create = vi.fn();
-  __setClaudeClientForTests({ beta: { messages: { create } } } as unknown as Anthropic);
+  streamCall = vi.fn();
+  // No `create`: callStructured must only ever stream.
+  __setClaudeClientForTests({ beta: { messages: { stream: streamCall } } } as unknown as Anthropic);
   usageEvents = [];
   setUsageSink((e) => {
     usageEvents.push(e);
@@ -250,14 +366,22 @@ describe("callStructured — success", () => {
     });
   });
 
-  it("passes the abort signal and the task timeout to the SDK", async () => {
+  it("streams the built params with the abort signal and the task timeout", async () => {
     respondWith(message());
     const controller = new AbortController();
     await callStructured({ ...baseArgs(), signal: controller.signal });
-    expect(create).toHaveBeenCalledWith(expect.any(Object), {
+    expect(streamCall).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledWith(buildStructuredParams(baseArgs()), {
       signal: controller.signal,
       timeout: CLAUDE_TASKS.matchResumeToJob.timeoutMs,
     });
+  });
+
+  it("captures the request id from the stream (null when the header is missing)", async () => {
+    respondWith(message(), "req_streamed");
+    await expect(callStructured(baseArgs())).resolves.toMatchObject({ requestId: "req_streamed" });
+    respondWith(message(), null);
+    await expect(callStructured(baseArgs())).resolves.toMatchObject({ requestId: null });
   });
 
   it("records one usage event with the full context, priced by the served model", async () => {
@@ -491,9 +615,42 @@ describe("callStructured — SDK error classification (no usage recorded: nothin
     expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, status: 408 });
   });
 
-  it("an SDK-side refusal to send (e.g. the non-streaming guard) -> ClaudeBadRequestError", async () => {
-    rejectWith(new Anthropic.AnthropicError("Streaming is required for operations that may take longer than 10 minutes."));
-    await expect(callStructured(baseArgs())).rejects.toBeInstanceOf(ClaudeBadRequestError);
+  it.each([
+    // What the SDK emits when the body read throws mid-stream (it wraps the cause).
+    ["wrapped socket drop", Object.assign(new Anthropic.AnthropicError("terminated"), { cause: new TypeError("terminated") })],
+    ["premature end", new Anthropic.AnthropicError("stream ended without producing a Message with role=assistant")],
+    ["no chunks", new Anthropic.AnthropicError("request ended without sending any chunks")],
+  ])("a plain AnthropicError from the stream (%s) -> retryable ai_unavailable, not a bad request", async (_n, sdkErr) => {
+    streamCall.mockReturnValueOnce(
+      fakeStream(async () => {
+        throw sdkErr;
+      }, "req_mid"),
+    );
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeApiError);
+    expect(err).not.toBeInstanceOf(ClaudeBadRequestError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_mid" });
+    expect((err as Error).message).not.toContain("terminated");
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  it("a mid-stream SSE error event (plain APIError, no status) -> retryable ai_unavailable with its request id", async () => {
+    const sseError = new Anthropic.APIError(
+      undefined,
+      { type: "error", error: { type: "overloaded_error", message: `upstream said ${SECRET_RESUME}` } },
+      undefined,
+      new Headers({ "request-id": "req_sse" }),
+    );
+    streamCall.mockReturnValueOnce(
+      fakeStream(async () => {
+        throw sseError;
+      }, "req_sse"),
+    );
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(ClaudeBadRequestError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_sse" });
+    expect((err as Error).message).not.toContain("SECRET");
+    expectNoContentLogged();
   });
 
   it("an unknown thrown value -> retryable ai_unavailable", async () => {
@@ -534,19 +691,18 @@ describe("callStructured — caller deadline (ctx.signal) is hard", () => {
     );
     expect(err).toBeInstanceOf(ClaudeApiError);
     expect(err).toMatchObject({ code: "ai_unavailable", retryable: true });
-    expect(create).not.toHaveBeenCalled();
+    expect(streamCall).not.toHaveBeenCalled();
     expect(usageEvents).toHaveLength(0);
   });
 
   it("rejects as soon as the signal fires, even if the SDK promise never settles (e.g. its un-abortable Retry-After sleep)", async () => {
     let observed = false;
     const never = new Promise<never>(() => {});
-    create.mockReturnValueOnce({
-      withResponse: () => {
-        observed = true;
-        return never;
-      },
+    const fake = fakeStream(() => {
+      observed = true;
+      return never;
     });
+    streamCall.mockReturnValueOnce(fake);
     const started = Date.now();
     const err = await callStructured({ ...baseArgs(), signal: AbortSignal.timeout(30) }).catch(
       (e: unknown) => e,
@@ -556,6 +712,39 @@ describe("callStructured — caller deadline (ctx.signal) is hard", () => {
     expect(err).toBeInstanceOf(ClaudeApiError);
     expect(err).not.toBeInstanceOf(ClaudeInvalidOutputError);
     expect((err as Error).message).toContain("aborted");
+    expect(fake.abort).toHaveBeenCalledTimes(1); // the stream is torn down, not left running
+  });
+
+  it("an abort mid-stream (headers in, body still streaming) -> retryable ai_unavailable carrying the request id", async () => {
+    const fake = fakeStream(() => new Promise<never>(() => {}), "req_midabort");
+    streamCall.mockReturnValueOnce(fake);
+    const controller = new AbortController();
+    const pending = callStructured({ ...baseArgs(), signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 5));
+    controller.abort();
+    const err = await pending.catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_midabort" });
+    expect((err as Error).message).toContain("aborted");
+    expect(fake.abort).toHaveBeenCalledTimes(1);
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  it("the task timeout bounds the whole streamed attempt, not just the wait for headers", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const fake = fakeStream(() => new Promise<never>(() => {}), "req_slow");
+      streamCall.mockReturnValueOnce(fake);
+      const pending = callStructured(baseArgs()).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(CLAUDE_TASKS.matchResumeToJob.timeoutMs - 1);
+      expect(fake.abort).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const err = await pending;
+      expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_slow" });
+      expect((err as Error).message).toContain("timed out");
+      expect(fake.abort).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a late SDK rejection after the deadline does not become an unhandled rejection", async () => {
@@ -563,7 +752,7 @@ describe("callStructured — caller deadline (ctx.signal) is hard", () => {
     const late = new Promise<never>((_r, rej) => {
       rejectLate = rej;
     });
-    create.mockReturnValueOnce({ withResponse: () => late });
+    streamCall.mockReturnValueOnce(fakeStream(() => late));
     const controller = new AbortController();
     const pending = callStructured({ ...baseArgs(), signal: controller.signal });
     controller.abort();
@@ -582,7 +771,7 @@ describe("callStructured — caller deadline (ctx.signal) is hard", () => {
     await expect(
       retryOnceOnInvalidOutput(() => callStructured({ ...baseArgs(), signal: controller.signal })),
     ).rejects.toMatchObject({ code: "ai_unavailable" });
-    expect(create).not.toHaveBeenCalled();
+    expect(streamCall).not.toHaveBeenCalled();
   });
 
   it("a deadline that fires during the first attempt stops before the invalid-output retry", async () => {
@@ -595,8 +784,197 @@ describe("callStructured — caller deadline (ctx.signal) is hard", () => {
     await expect(
       retryOnceOnInvalidOutput(() => callStructured({ ...baseArgs(), signal: controller.signal })),
     ).rejects.toMatchObject({ code: "ai_unavailable" });
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(streamCall).toHaveBeenCalledTimes(1);
     expect(usageEvents).toHaveLength(1); // the billed first attempt is still recorded
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The real SDK stream over a fake fetch: pins what the fakes above assume about
+// @anthropic-ai/sdk 1.8.0's BetaMessageStream (accumulation, fallback
+// relabeling, request id, and which errors it throws mid-stream).
+// ---------------------------------------------------------------------------
+
+describe("callStructured — real SDK stream (fake fetch)", () => {
+  function useSdkClient(fetchMock: ReturnType<typeof vi.fn>): void {
+    __setClaudeClientForTests(
+      new Anthropic({
+        apiKey: "sk-ant-test-fake",
+        maxRetries: 0,
+        openTelemetry: false,
+        logLevel: CLAUDE_SDK_LOG_LEVEL,
+        fetch: fetchMock as unknown as typeof fetch,
+      }),
+    );
+  }
+
+  /** message_start plus half of the answer: what has arrived when a long call dies mid-way. */
+  function partialEvents(): string[] {
+    const all = sseEventsFor(message({ content: [{ type: "text", text: JSON.stringify({ score: 1, note: SECRET_OUTPUT }) }] }));
+    return all.slice(0, 4);
+  }
+
+  it("accumulates the streamed message: value, usage, stop reason, and the request-id header", async () => {
+    const fetchMock = sseFetch({ events: sseEventsFor(message()), requestId: "req_hdr" });
+    useSdkClient(fetchMock);
+    const result = await callStructured(baseArgs());
+    expect(result).toMatchObject({
+      value: { score: 70, note: "fine" },
+      model: "claude-opus-5-5",
+      stopReason: "end_turn",
+      requestId: "req_hdr",
+      usage: { inputTokens: 100, outputTokens: 50 },
+    });
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({ requestId: "req_hdr", outputTokens: 50 });
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(body.stream).toBe(true);
+    expect(body.fallbacks).toBe("default");
+    expect(body.output_config.effort).toBe("medium");
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("anthropic-beta")).toContain(SERVER_SIDE_FALLBACK_BETA);
+  });
+
+  it("streamed fallback blocks: reads only the answer after the boundary, and prices by the fallback model", async () => {
+    useSdkClient(
+      sseFetch({
+        events: sseEventsFor(
+          message({
+            model: "claude-sonnet-5-5",
+            content: [
+              { type: "text", text: '{"score": 1, "no' },
+              { type: "fallback", from: { model: "claude-opus-5-5" }, to: { model: "claude-sonnet-5-5" } },
+              { type: "text", text: JSON.stringify({ score: 55, note: "served by fallback" }) },
+            ],
+          }),
+        ),
+      }),
+    );
+    const result = await callStructured(baseArgs());
+    expect(result.value).toEqual({ score: 55, note: "served by fallback" });
+    expect(result.model).toBe("claude-sonnet-5-5");
+    expect(usageEvents[0].model).toBe("claude-sonnet-5-5");
+  });
+
+  it("streamed refusal keeps stop_details.category; streamed max_tokens is truncation (usage recorded)", async () => {
+    useSdkClient(
+      sseFetch({ events: sseEventsFor(message({ stop_reason: "refusal", stop_details: { category: "cyber" }, content: [] })) }),
+    );
+    await expect(callStructured(baseArgs())).rejects.toMatchObject({ code: "ai_refused", category: "cyber" });
+    useSdkClient(sseFetch({ events: sseEventsFor(message({ stop_reason: "max_tokens" })) }));
+    await expect(callStructured(baseArgs())).rejects.toBeInstanceOf(ClaudeTruncatedError);
+    expect(usageEvents.map((e) => e.stopReason)).toEqual(["refusal", "max_tokens"]);
+  });
+
+  it("a connection dropped mid-stream (undici 'terminated') -> retryable ai_unavailable with the request id, nothing logged", async () => {
+    const socketClosed = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+    useSdkClient(
+      sseFetch({
+        events: partialEvents(),
+        requestId: "req_drop",
+        then: new TypeError("terminated", { cause: socketClosed }),
+      }),
+    );
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeApiError);
+    expect(err).not.toBeInstanceOf(ClaudeBadRequestError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_drop" });
+    // The SDK wraps the body-read failure in a plain AnthropicError.
+    expect((err as Error).cause).toBeInstanceOf(Anthropic.AnthropicError);
+    expect((err as Error).cause).not.toBeInstanceOf(Anthropic.APIError);
+    expect(usageEvents).toHaveLength(0);
+    expectNoContentLogged();
+  });
+
+  it("a malformed SSE event: the SDK's error log goes through CLAUDE_SDK_LOGGER, and its data args (response content) are dropped", async () => {
+    __resetClaudeClientForTests();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-fake");
+    vi.stubGlobal(
+      "fetch",
+      sseFetch({
+        events: [
+          ...partialEvents(),
+          // One complete event whose data is not valid JSON (core/streaming.js ~l.65 logs it).
+          `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"${SECRET_OUTPUT}"\n\n`,
+        ],
+        requestId: "req_malformed",
+      }),
+    );
+    try {
+      const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+      expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_malformed" });
+      expect(console.error).toHaveBeenCalledWith("[anthropic-sdk] Could not parse message into JSON:");
+      expectNoContentLogged();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      __resetClaudeClientForTests();
+    }
+  });
+
+  it("a body that ends before message_stop -> retryable ai_unavailable", async () => {
+    useSdkClient(sseFetch({ events: partialEvents(), requestId: "req_short" }));
+    await expect(callStructured(baseArgs())).rejects.toMatchObject({
+      code: "ai_unavailable",
+      retryable: true,
+      requestId: "req_short",
+    });
+  });
+
+  it("an SSE error event mid-stream -> retryable ai_unavailable, upstream text not copied", async () => {
+    useSdkClient(
+      sseFetch({
+        events: [
+          ...partialEvents(),
+          sse("error", { type: "error", error: { type: "overloaded_error", message: `Overloaded ${SECRET_RESUME}` } }),
+        ],
+        requestId: "req_sse_err",
+      }),
+    );
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(ClaudeBadRequestError);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_sse_err" });
+    expect((err as Error).message).not.toContain("SECRET");
+    expectNoContentLogged();
+  });
+
+  it("an abort mid-stream rejects promptly and tears down the request", async () => {
+    const fetchMock = sseFetch({ events: partialEvents(), requestId: "req_abort", then: "hang" });
+    useSdkClient(fetchMock);
+    const controller = new AbortController();
+    const pending = callStructured({ ...baseArgs(), signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 20));
+    controller.abort();
+    const err = await pending.catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true, requestId: "req_abort" });
+    expect((err as Error).message).toContain("aborted");
+    expect(((fetchMock.mock.calls[0][1] as RequestInit).signal as AbortSignal).aborted).toBe(true);
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  it("HTTP errors before the stream starts keep their classes (400 bad request; network failure retryable)", async () => {
+    useSdkClient(
+      vi.fn(async () =>
+        new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "bad" } }), {
+          status: 400,
+          headers: { "content-type": "application/json", "request-id": "req_400" },
+        }),
+      ),
+    );
+    await expect(callStructured(baseArgs())).rejects.toMatchObject({
+      code: "ai_bad_request",
+      status: 400,
+      requestId: "req_400",
+    });
+
+    useSdkClient(
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
+    const err = await callStructured(baseArgs()).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "ai_unavailable", retryable: true });
+    expect((err as Error).message).toContain("connection failed");
   });
 });
 
@@ -707,7 +1085,7 @@ describe("getClaudeClient: SDK telemetry off", () => {
     await control.beta.messages.create(buildStructuredParams(baseArgs()), { timeout: 5_000 });
     expect(headersOf(controlFetch).get("traceparent")).toBe(`00-${TRACE_ID}-${SPAN_ID}-01`);
 
-    const appFetch = okFetch();
+    const appFetch = sseFetch({ events: sseEventsFor(message()) });
     vi.stubGlobal("fetch", appFetch);
     __resetClaudeClientForTests();
     const result = await callStructured(baseArgs());
@@ -762,6 +1140,21 @@ describe("getClaudeClient: SDK telemetry off", () => {
     expect(new Anthropic({ apiKey: "sk-ant-test-fake" }).logLevel).toBe("debug");
   });
 
+  it("uses CLAUDE_SDK_LOGGER, which forwards only the message string at error/warn", () => {
+    expect(getClaudeClient().logger).toBe(CLAUDE_SDK_LOGGER);
+    const errorSpy = vi.mocked(console.error);
+    const warnSpy = vi.mocked(console.warn);
+    errorSpy.mockClear();
+    warnSpy.mockClear();
+    CLAUDE_SDK_LOGGER.error("fixed message", SECRET_OUTPUT, { raw: SECRET_OUTPUT });
+    CLAUDE_SDK_LOGGER.warn("fixed warning", SECRET_OUTPUT);
+    CLAUDE_SDK_LOGGER.info("info", SECRET_OUTPUT);
+    CLAUDE_SDK_LOGGER.debug("debug", SECRET_OUTPUT);
+    expect(errorSpy.mock.calls).toEqual([["[anthropic-sdk] fixed message"]]);
+    expect(warnSpy.mock.calls).toEqual([["[anthropic-sdk] fixed warning"]]);
+    expectNoContentLogged();
+  });
+
   it("with ANTHROPIC_LOG=debug, no console.debug/console.info call carries request content (control client does)", async () => {
     vi.stubEnv("ANTHROPIC_LOG", "debug");
     const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
@@ -776,7 +1169,7 @@ describe("getClaudeClient: SDK telemetry off", () => {
     debugSpy.mockClear();
     infoSpy.mockClear();
 
-    const appFetch = okFetch();
+    const appFetch = sseFetch({ events: sseEventsFor(message()) });
     vi.stubGlobal("fetch", appFetch);
     __resetClaudeClientForTests();
     await callStructured(baseArgs());
@@ -856,13 +1249,14 @@ describe("SDK import guards", () => {
     expect(libImporters).toEqual(["lib/claude/client.ts", "lib/claude/outputFormat.ts"]);
   });
 
-  it("clients are constructed only at the allowed sites, with no custom logger and no debug/info logLevel", () => {
+  it("clients are constructed only at the allowed sites, with no custom logger (except CLAUDE_SDK_LOGGER) and no debug/info logLevel", () => {
     const sites: string[] = [];
     for (const { file, site } of imports) {
       const source = readFileSync(join(REPO_ROOT, file), "utf8");
       for (const call of constructorCalls(source, clientConstructorNames(site, source))) {
         sites.push(file);
-        expect(call, file).not.toMatch(/\blogger\s*:/);
+        // The only allowed custom logger is CLAUDE_SDK_LOGGER (§13.5.2 item 1b).
+        expect(call.replace(/\blogger\s*:\s*CLAUDE_SDK_LOGGER\b/g, ""), file).not.toMatch(/\blogger\b/);
         expect(call, file).not.toMatch(/\.\.\./); // no spread can smuggle in options
       }
     }

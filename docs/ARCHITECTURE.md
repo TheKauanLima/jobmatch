@@ -4245,21 +4245,44 @@ Behavior, in order:
    function. See the "Decision on `enum`" block below (M1.1b).
    **Never** send `tool_choice` (forced `tool_choice` returns 400 on Opus 5.5),
    `temperature`, `top_p`, `top_k`, or an assistant prefill.
-2. **As built (M1.1):** call the beta *create* endpoint with server-side refusal
-   fallback, and keep the raw response:
-   `client.beta.messages.create({ ...params, betas: ['server-side-fallback-2026-07-01'],
-   fallbacks: 'default' }, { signal, timeout: config.timeoutMs }).withResponse()`.
-   - This gives `data` (the message) and `request_id`.
+2. **As built (streaming since 2026-11-26; was non-streaming `create` in M1.1):**
+   stream the beta Messages endpoint with server-side refusal fallback, and take the
+   accumulated final message:
+   `const stream = client.beta.messages.stream({ ...params, betas: ['server-side-fallback-2026-07-01'],
+   fallbacks: 'default' }, { signal, timeout: config.timeoutMs });`
+   `const message = await stream.finalMessage();` request id from `stream.request_id`.
+   - **Why streaming:** a non-streaming request is silent until the response is
+     complete, and some networks (VPNs, proxies) close a connection idle for ~60 s.
+     Long calls (`critiqueResume`, effort high) failed with `APIConnectionError`
+     (`UND_ERR_SOCKET: other side closed`) at ~60 s. A stream keeps bytes flowing. It
+     is also the SDK's recommended pattern for long requests. Nothing is consumed
+     incrementally.
+   - **Verified on SDK 1.8.0** (`lib/BetaMessageStream.js`, `lib/beta-parser.js`,
+     `core/streaming.js`, `client.js`): `stream()` sends the same `beta.messages.create`
+     with `stream: true`, so `betas`/`fallbacks`/`output_config`, the SDK retry and
+     `timeout` apply unchanged (but see Timeout: our whole-attempt timer bounds SDK
+     retries too); `request_id` is the `request-id` header, set when
+     headers arrive; the accumulated message pushes `fallback` blocks as-is and
+     relabels `model` to the fallback's `to.model` (same as `create`), with
+     `stop_reason`/`stop_details`/`usage` from `message_delta`; the SDK parses the
+     final message only if `output_config.format` has a `parse` function, and ours
+     has none.
+   - **Timeout:** the SDK's `timeout` covers only the wait for response headers on a
+     stream, so `callStructured` (`raceAbort`) also enforces `timeoutMs` over the whole
+     attempt (rejects as a timeout and calls `stream.abort()`), alongside the caller's
+     `signal`.
    - **`beta.messages.parse` is deliberately not used.** The reasons are in the
      Verified block below: it throws on invalid output, which loses usage and the
-     stop_reason; it loses the request id; and it would parse the declined model's
-     text.
-   - No `structured-outputs-*` beta header is sent; it isn't needed with `create`.
+     stop_reason; and it would parse the declined model's text. (Its loss of the
+     request id no longer matters: the stream exposes it.)
+   - No `structured-outputs-*` beta header is sent; it isn't needed.
    - Constraints the helper strips from the wire schema (numeric ranges, string
      lengths, array sizes) are **re-checked client-side** by the zod schema and
      `validateX`.
 3. Record usage (`recordUsage`) **before** inspecting the result, so failed-but-billed
    calls are counted. Price by `response.model`, not the requested model.
+   Mid-stream failures record no usage, so partially billed tokens aren't tracked
+   (follow-up: record `stream.currentMessage?.usage` on failure).
 4. `stop_reason === 'refusal'` → `ClaudeRefusalError` (non-retryable).
    `'max_tokens'` → `ClaudeTruncatedError` (non-retryable). Anything other than
    `end_turn` → `ClaudeInvalidOutputError`.
@@ -4273,17 +4296,20 @@ Behavior, in order:
    - The error message names only the failure kind and the zod issue *paths*. It
      never includes values, and the `JSON.parse` message (which can quote the output)
      is dropped.
-6. HTTP 400 → `ClaudeBadRequestError`; 429/5xx/529/network/abort → `ClaudeApiError`
-   with `retryable: true`. SDK `maxRetries: 1`; task-level retries handle the rest.
+6. HTTP 400 → `ClaudeBadRequestError`; 429/5xx/529/network/timeout/abort → `ClaudeApiError`
+   with `retryable: true`. Mid-stream failures are also retryable `ai_unavailable`: an
+   SSE `error` event (plain `APIError`, no status), and the plain `AnthropicError` the
+   SDK throws when the body read fails (e.g. undici `terminated` on a dropped socket)
+   or the stream ends before `message_stop`. They carry the stream's request id. SDK
+   `maxRetries: 1` (it retries only before the stream starts); task-level retries
+   handle the rest.
 7. Never log prompt or response content. Log only `task`, `model`, `stop_reason`,
    token counts, `request_id`.
 
 **Non-streaming size guard:** the SDK refuses non-streaming requests whose
-`max_tokens` implies a very long expected duration. No task here exceeds
-`max_tokens: 20_000`. If the installed SDK still raises the "streaming is strongly
-recommended" error at these values, pass an explicit `timeout` (which bypasses the
-estimate) or switch that task to `client.beta.messages.stream(...).finalMessage()`.
-Verify in M1.1.
+`max_tokens` implies a very long expected duration. Since `callStructured` streams,
+the guard no longer applies to sync calls (it still matters to anything calling
+`create` directly). No task exceeds `max_tokens: 20_000`, kept as a cost/latency cap.
 
 **Client construction and SDK telemetry (binding; architect 2026-11-12; implemented in
 M1.1c).** SDK 1.8.0 traces every API call through `@opentelemetry/api` by default
@@ -4314,12 +4340,22 @@ asserted, not assumed:
    (§13.2.1 rule 5). This exposure predates the 1.8.0 upgrade. An explicit
    `logLevel` option overrides the env var, so with `"warn"` no value of
    `ANTHROPIC_LOG` can enable request/response logging on this client. `"warn"`
-   (not `"off"`) keeps the SDK's own warnings (deprecations, misconfiguration),
-   which carry no request content.
+   (not `"off"`) keeps the SDK's own warnings (deprecations, misconfiguration).
+   - **`logger: CLAUDE_SDK_LOGGER` (added 2026-11-26 with streaming).** `warn`
+     still lets `error`/`warn` calls through, and the SDK passes data after the
+     message string. On the streaming path that data can be response content
+     (resume-derived): on a malformed SSE event, 1.8.0's `core/streaming.js`
+     (~l.65-66) logs `("Could not parse message into JSON:", sse.data)` and
+     `("From chunk:", sse.raw)` through the client's logger. `getClaudeClient()`
+     therefore passes `CLAUDE_SDK_LOGGER` (`lib/claude/client.ts`), which forwards
+     only the first argument (the SDK's fixed message string) to
+     `console.error`/`console.warn` and makes `info`/`debug` no-ops. It is the
+     **only** allowed custom logger. Any other custom logger, or one that forwards
+     later arguments, is forbidden. The construction-site guard test enforces it.
    - **Forbidden:** passing `logLevel: "debug"` or `logLevel: "info"` to any
      Anthropic client (app code or `scripts/evals/`), calling
-     `client.withOptions({ logLevel: ... })` with either, or passing a custom
-     `logger` that writes request details. Scripts under `scripts/evals/` that build
+     `client.withOptions({ logLevel: ... })` with either, or passing any custom
+     `logger` other than `CLAUDE_SDK_LOGGER`. Scripts under `scripts/evals/` that build
      their own client pass `logLevel: "warn"` alongside `openTelemetry: false`.
    - To debug a request locally, log our own redacted metadata (task, model, token
      counts, `request_id`), never turn SDK debug logging on.

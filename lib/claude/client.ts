@@ -10,10 +10,14 @@
  *     assistant prefill. Opus 5.5 returns 400 for a forced tool choice and
  *     for sampling parameters (verified in M1.1). client.test.ts scans this
  *     directory to keep those parameter names out of lib/claude entirely.
- *  2. Sends it through the beta Messages API with the server-side refusal
+ *  2. Sends it through the STREAMING beta Messages API
+ *     (`client.beta.messages.stream(...)`) with the server-side refusal
  *     fallback (`betas: ['server-side-fallback-2026-07-01']`,
- *     `fallbacks: 'default'`), with an explicit timeout and the caller's
- *     abort signal.
+ *     `fallbacks: 'default'`), the caller's abort signal, and the task's
+ *     `timeoutMs` (passed to the SDK, and also enforced by us over the whole
+ *     streamed attempt, see `raceAbort`). Then awaits `stream.finalMessage()`,
+ *     the SDK-accumulated message (same shape `create` returns), and reads
+ *     the request id from `stream.request_id`.
  *  3. Records usage (`recordUsage`) BEFORE looking at the result, so
  *     refused/truncated/invalid-but-billed calls are still counted. Priced by
  *     `response.model`.
@@ -23,25 +27,62 @@
  *  5. Parses the JSON text and validates it with the zod schema. Failure ->
  *     ClaudeInvalidOutputError (retryable once).
  *  6. Maps SDK errors by class, most-specific first: 400 ->
- *     ClaudeBadRequestError; 429 / 5xx / 529 / connection / timeout / abort ->
- *     ClaudeApiError(retryable). The client is built with `maxRetries: 1`;
- *     task-level retries handle the rest.
+ *     ClaudeBadRequestError; 429 / 5xx / 529 / connection / timeout / abort /
+ *     mid-stream failures -> ClaudeApiError(retryable). The client is built
+ *     with `maxRetries: 1`; task-level retries handle the rest.
  *  7. Logs one line per call with task, model, stop_reason, token counts, and
  *     request_id only. Never prompt or response content.
  *
- * ---- Why `beta.messages.create` + our own parse, not `beta.messages.parse` ----
+ * ---- Why streaming ----
+ * A non-streaming request is silent until the whole response is ready. Some
+ * networks (VPNs, proxies, NATs) close a connection that has been idle for
+ * ~60 s, so long calls (critiqueResume at effort high runs well over a
+ * minute) died with `APIConnectionError` (cause `UND_ERR_SOCKET: other side
+ * closed`) at ~60 s. A stream sends events continuously, so the connection is
+ * never idle; it is also Anthropic's recommended pattern for long requests.
+ * Nothing is consumed incrementally: we only use the final message.
+ *
+ * Verified in the pinned @anthropic-ai/sdk 1.8.0 (lib/BetaMessageStream.js,
+ * lib/beta-parser.js, core/streaming.js, client.js):
+ *  - `beta.messages.stream()` is `BetaMessageStream.createMessage`, which
+ *    calls the same `beta.messages.create` with `stream: true` (so `betas`,
+ *    `fallbacks`, `output_config`, the timeout and the SDK retry all apply
+ *    unchanged) and links our signal to the stream's own AbortController.
+ *  - `stream.request_id` is the `request-id` response header, set when the
+ *    headers arrive (before any event).
+ *  - `finalMessage()` resolves with the snapshot accumulated from the events.
+ *    `content_block_start` pushes every block as-is, `fallback` blocks
+ *    included, and relabels `model` to the fallback block's `to.model`, so
+ *    `finalAnswerText` and "priced by the served model" behave as with
+ *    `create`. `stop_reason`, `stop_details` and `usage` come from
+ *    `message_delta`.
+ *  - The final message goes through `maybeParseBetaMessage`, which parses only
+ *    when `output_config.format` has a `parse` function. Ours has none
+ *    (lib/claude/outputFormat.ts), so the SDK never parses or throws on the
+ *    output; we parse it ourselves (step 5).
+ *  - The SDK's `timeout` covers only the wait for response headers (each HTTP
+ *    attempt's timer is cleared once `fetch` resolves), so on its own it no
+ *    longer bounds a streamed call. `raceAbort` adds a whole-attempt timer.
+ *  - Errors: HTTP errors before the stream starts are the usual `APIError`
+ *    subclasses; a pre-response network failure is `APIConnectionError`; an
+ *    SSE `error` event is a plain `APIError` with no status; an abort is
+ *    `APIUserAbortError`; any other mid-stream failure (e.g. undici's
+ *    "terminated" when the socket drops) is wrapped in a plain
+ *    `AnthropicError`, as are the stream's own "ended without producing a
+ *    Message" errors. `classifySdkError` maps all of these.
+ *
+ * ---- Why our own parse, not `beta.messages.parse` (or a parsing format) ----
  * Verified against @anthropic-ai/sdk 0.122 and re-checked on the pinned
- * 1.8.0 (details in the §13.5.2 "Verified" notes). `parse` works with `output_config.format` + `fallbacks`,
- * but (a) it throws a plain `AnthropicError` when the output fails JSON or
- * zod parsing, which discards the response (no usage, no stop_reason, so a
- * `max_tokens` truncation becomes indistinguishable from invalid output),
- * and its error message can quote model output; and (b) its result is a
- * plain Promise, so `.withResponse()` (the only way to read the request id)
- * isn't available. §13.5.2 names `create` + `schema.parse(JSON.parse(text))`
- * as the sanctioned alternative. Structured output is still enforced
- * server-side, because `buildOutputFormat(schema)` (lib/claude/outputFormat.ts,
- * a pass-through over the SDK's zod helper) is sent as
- * `output_config.format`.
+ * 1.8.0 (details in the §13.5.2 "Verified" notes). `parse` works with
+ * `output_config.format` + `fallbacks`, but it throws a plain `AnthropicError`
+ * when the output fails JSON or zod parsing, which discards the response (no
+ * usage, no stop_reason, so a `max_tokens` truncation becomes
+ * indistinguishable from invalid output), and its error message can quote
+ * model output. A stream whose format carries a `parse` function would do the
+ * same. §13.5.2 names `schema.parse(JSON.parse(text))` as the sanctioned
+ * approach. Structured output is still enforced server-side, because
+ * `buildOutputFormat(schema)` (lib/claude/outputFormat.ts, a pass-through over
+ * the SDK's zod helper) is sent as `output_config.format`.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -91,6 +132,17 @@ export const OTEL_CONTENT_MODE_ENV = "ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MO
  */
 export const CLAUDE_SDK_LOG_LEVEL = "warn" as const;
 
+type SdkLogger = NonNullable<NonNullable<ConstructorParameters<typeof Anthropic>[0]>["logger"]>;
+
+/** Forwards only the SDK's fixed message string; drops data args, which on the
+ *  streaming path can carry response content (core/streaming.js ~l.65). */
+export const CLAUDE_SDK_LOGGER: SdkLogger = {
+  error: (message: string) => console.error(`[anthropic-sdk] ${message}`),
+  warn: (message: string) => console.warn(`[anthropic-sdk] ${message}`),
+  info: () => {},
+  debug: () => {},
+};
+
 let cachedClient: Anthropic | null = null;
 
 /**
@@ -121,8 +173,16 @@ let cachedClient: Anthropic | null = null;
  * request body (prompts, i.e. resume text) to `console.debug`, which ends up in
  * the platform's logs. Verified in the 1.8.0 runtime (`client.js` constructor):
  * `parseLogLevel(options.logLevel) ?? parseLogLevel(env ANTHROPIC_LOG) ?? default`,
- * so a valid explicit option always wins. At `warn`, the SDK's messages on our
- * code paths are fixed strings with no request or response content.
+ * so a valid explicit option always wins.
+ *
+ * `logger: CLAUDE_SDK_LOGGER` covers what `warn` still lets through. The SDK
+ * calls `logger.error(message, ...data)`, and on the streaming path the data
+ * can be response content: on a malformed SSE event, 1.8.0's
+ * `core/streaming.js` (~l.65-66) logs `("Could not parse message into JSON:",
+ * sse.data)` and `("From chunk:", sse.raw)` via `loggerFor(client)`, i.e.
+ * this logger. The model output is resume-derived. `CLAUDE_SDK_LOGGER`
+ * forwards only the first argument (the SDK's fixed message string) at
+ * error/warn and drops every later argument; info/debug are no-ops.
  */
 export function getClaudeClient(): Anthropic {
   if (cachedClient) {
@@ -142,6 +202,7 @@ export function getClaudeClient(): Anthropic {
     maxRetries: CLAUDE_SDK_MAX_RETRIES,
     openTelemetry: false,
     logLevel: CLAUDE_SDK_LOG_LEVEL,
+    logger: CLAUDE_SDK_LOGGER,
   });
   return cachedClient;
 }
@@ -151,7 +212,7 @@ export function __resetClaudeClientForTests(): void {
   cachedClient = null;
 }
 
-/** Test-only: inject a fake client (e.g. one whose `beta.messages.create` is a mock). */
+/** Test-only: inject a fake client (e.g. one whose `beta.messages.stream` is a mock). */
 export function __setClaudeClientForTests(client: Anthropic | null): void {
   cachedClient = client;
 }
@@ -264,7 +325,12 @@ function logCall(entry: Record<string, unknown>, level: "info" | "warn" = "info"
  * Uses typed SDK classes, most specific first. Never string-matches messages,
  * and never copies the SDK message (it can echo API response text).
  */
-export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiError {
+export function classifySdkError(
+  err: unknown,
+  task: ClaudeTaskName,
+  /** The stream's request id, if headers had arrived. Used when the error carries none. */
+  streamRequestId: string | null = null,
+): ClaudeApiError {
   if (err instanceof ClaudeApiError) {
     return err;
   }
@@ -274,6 +340,7 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
     return new ClaudeApiError(`Claude call aborted (${task}).`, {
       code: "ai_unavailable",
       retryable: true,
+      requestId: streamRequestId,
       cause: err,
     });
   }
@@ -281,6 +348,7 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
     return new ClaudeApiError(`Claude call timed out (${task}).`, {
       code: "ai_unavailable",
       retryable: true,
+      requestId: streamRequestId,
       cause: err,
     });
   }
@@ -288,13 +356,16 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
     return new ClaudeApiError(`Claude connection failed (${task}).`, {
       code: "ai_unavailable",
       retryable: true,
+      requestId: streamRequestId,
       cause: err,
     });
   }
 
   if (err instanceof Anthropic.APIError) {
+    // Includes a mid-stream SSE `error` event: a plain APIError with no
+    // status, which falls through to the retryable default below.
     const status = typeof err.status === "number" ? err.status : undefined;
-    const requestId = err.requestID ?? null;
+    const requestId = err.requestID ?? streamRequestId;
     const where = `(${task}, status ${status ?? "none"}, request ${requestId ?? "unknown"})`;
 
     if (err instanceof Anthropic.BadRequestError) {
@@ -363,15 +434,26 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
     });
   }
 
-  // Thrown by the SDK before sending (e.g. its non-streaming size guard):
-  // a config bug, not transient.
+  // A plain AnthropicError on the streaming path is a stream failure: the
+  // SDK wraps any non-SDK error thrown while reading the body (e.g. undici's
+  // "terminated" when the socket drops mid-stream) in one, and throws its own
+  // for a stream that ends early ("stream ended without producing a
+  // Message", "request ended without sending any chunks"). Transient. (The
+  // SDK's pre-send non-streaming size guard, the old reason to treat this as
+  // a bad request, does not apply to streams.)
   if (err instanceof Anthropic.AnthropicError) {
-    return new ClaudeBadRequestError(`Claude SDK refused the request (${task}).`, { cause: err });
+    return new ClaudeApiError(`Claude stream failed (${task}, request ${streamRequestId ?? "unknown"}).`, {
+      code: "ai_unavailable",
+      retryable: true,
+      requestId: streamRequestId,
+      cause: err,
+    });
   }
 
   return new ClaudeApiError(`Claude call failed unexpectedly (${task}).`, {
     code: "ai_unavailable",
     retryable: true,
+    requestId: streamRequestId,
     cause: err,
   });
 }
@@ -393,26 +475,51 @@ export function classifySdkError(err: unknown, task: ClaudeTaskName): ClaudeApiE
  * that have already changed once, and the SDK still honors `Retry-After` with
  * no cap of its own (anything up to 2^31-1 ms). The abandoned SDK promise is
  * still observed, so it can't become an unhandled rejection.
+ *
+ * Streaming adds a second bound: `timeoutMs`. The SDK's own `timeout` only
+ * covers the wait for response headers, so after `timeoutMs` this rejects
+ * with `APIConnectionTimeoutError`, keeping the task timeout a bound on the
+ * whole attempt (as it was for a non-streaming call). On either expiry
+ * `onAbandon` runs (callStructured passes `stream.abort()`), so the socket is
+ * released rather than left streaming into nothing.
  */
-function raceAbort<R>(promise: Promise<R>, signal: AbortSignal | undefined): Promise<R> {
-  if (!signal) {
-    return promise;
-  }
+function raceAbort<R>(
+  promise: Promise<R>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  onAbandon: () => void,
+): Promise<R> {
   return new Promise<R>((resolve, reject) => {
-    const onAbort = () => reject(new Anthropic.APIUserAbortError());
-    if (signal.aborted) {
+    let settled = false;
+    const finish = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      return true;
+    };
+    const abandon = (err: Error) => {
+      if (!finish()) return;
+      try {
+        onAbandon();
+      } catch {
+        // Tearing down is best effort; the rejection below is what matters.
+      }
+      reject(err);
+    };
+    const onAbort = () => abandon(new Anthropic.APIUserAbortError());
+    const timer = setTimeout(() => abandon(new Anthropic.APIConnectionTimeoutError()), timeoutMs);
+    if (signal?.aborted) {
       onAbort();
     } else {
-      signal.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener("abort", onAbort, { once: true });
     }
     promise.then(
       (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
+        if (finish()) resolve(value);
       },
       (err: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
+        if (finish()) reject(err);
       },
     );
   });
@@ -443,22 +550,24 @@ export async function callStructured<T>(
 
   let response: Anthropic.Beta.Messages.BetaMessage;
   let requestId: string | null;
+  let stream: ReturnType<typeof client.beta.messages.stream> | null = null;
   try {
     // Deadline already passed (e.g. retryOnceOnInvalidOutput after the
     // deadline fired): don't start a call that can't finish.
     if (args.signal?.aborted) {
       throw new Anthropic.APIUserAbortError();
     }
-    const { data, request_id } = await raceAbort(
-      client.beta.messages
-        .create(params, { signal: args.signal, timeout: config.timeoutMs })
-        .withResponse(),
-      args.signal,
+    const started = client.beta.messages.stream(params, {
+      signal: args.signal,
+      timeout: config.timeoutMs,
+    });
+    stream = started;
+    response = await raceAbort(started.finalMessage(), args.signal, config.timeoutMs, () =>
+      started.abort(),
     );
-    response = data;
-    requestId = request_id ?? null;
+    requestId = started.request_id ?? null;
   } catch (err) {
-    const classified = classifySdkError(err, args.task);
+    const classified = classifySdkError(err, args.task, stream?.request_id ?? null);
     logCall(
       {
         task: args.task,
